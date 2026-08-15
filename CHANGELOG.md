@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+No changes yet.
+
+---
+
+## [v0.15.0] — 2026-08-16
+
 ### Added
 - Process-local `PipelineID` serialization across all drivers.
 - Per-kind `WorkerOpts.Concurrency`, worker/job timeouts, generated or configured
@@ -22,6 +28,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Reusable `driver/drivertest` conformance suite, enabled for every built-in driver.
 - Public injectable `clock` package with deterministic `Manual` timers and tickers.
 - OpenTelemetry worker/pipeline attributes and queue-time histogram.
+- Expanded `CLAUDE.md` guidance for PostgreSQL LISTEN/NOTIFY, polling fallback,
+  non-transactional backends, and idempotent worker design.
 
 ### Changed
 - SQL migrations are versioned in `goncordia_schema_migrations`; existing
@@ -47,19 +55,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Configurable unique-state exclusions, which were never implemented consistently.
   Terminal jobs never block a new unique insert on any driver.
 
----
-
-## [v0.15.0] — 2026-05-17
-
-### Added
-- **CLAUDE.md**: explicit documentation of LISTEN/NOTIFY mechanism for `driver/pgxv5`
-  - `Migrate()` creates a PostgreSQL trigger that calls `pg_notify('goncordia:{queue}', job_id)` after every INSERT
-  - WorkerPool automatically issues `LISTEN "goncordia:{queue}"` on a dedicated connection — no user code required
-  - Fallback to `PollInterval` when a notification is missed — no jobs are lost
-  - Push notification support table by backend (pgxv5, MongoDB, Redis vs polling-only)
-- **CLAUDE.md**: at-least-once delivery section for Redis, Cassandra, ClickHouse, DynamoDB
-  - Post-commit enqueue pattern with code example
-  - Idempotency requirement for workers on non-transactional backends
+### Upgrade notes
+- Go 1.26.6 or newer is required.
+- Run each SQL driver's `Migrate` method during deployment so the versioned
+  `pipeline_id` and cron-leader schema updates are applied before workers start.
+- `core.UniqueOpts.ExcludeStates` has been removed; delete that field from callers.
+- `PipelineID` ordering is process-local. Distributed serialization still requires
+  routing a pipeline to one worker-pool process or an application-level lock.
+- Mount the new admin handler behind application authentication; mutating queue and
+  job endpoints intentionally do not implement an authentication policy.
 
 ---
 

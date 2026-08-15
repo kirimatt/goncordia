@@ -85,8 +85,10 @@ tx.Commit(ctx)  // job and order appear atomically
 
 ## Installation
 
+Requires Go 1.26.6 or newer.
+
 ```bash
-go get github.com/kirimatt/goncordia
+go get github.com/kirimatt/goncordia@v0.15.0
 ```
 
 Pick a driver:
