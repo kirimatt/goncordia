@@ -9,7 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-No changes yet.
+### Added
+- Fenced worker state transitions using the expected worker ID and attempt
+  number, preventing a rescued stale worker from completing a newer claim.
+- Claim heartbeats on every built-in driver, driven by the injected clock.
+- `WorkerConfig.MaxPending` to bound prefetched jobs independently of active
+  execution concurrency.
+- `WorkerConfig.HeartbeatInterval`, defaulting to one third of
+  `StuckJobTimeout`.
+
+### Changed
+- Pipeline and per-kind waiters no longer occupy global execution slots.
+- Worker cancellation yields an interrupted claim without recording an error
+  or consuming an attempt.
+- Ready-job selection is standardized as `priority DESC, run_at ASC,
+  created_at ASC, id ASC` across built-in drivers.
+- Redis completion/retry/yield transitions now use `WATCH`/`MULTI` so claim
+  validation and state changes are atomic.
+
+### Testing
+- Driver conformance now covers stale-worker fencing, heartbeat protection, and
+  global priority selection beyond a storage-ordered candidate subset.
+- Added deterministic worker tests for heartbeat renewal, cancellation yield,
+  bounded pending work, and pipeline/global-concurrency isolation.
 
 ---
 

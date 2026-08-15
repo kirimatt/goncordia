@@ -3,6 +3,7 @@ package redisdriver
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strconv"
@@ -199,6 +200,22 @@ redis.call('ZADD', KEYS[2], score, ARGV[1])
 return 1
 `)
 
+var heartbeatScript = redis.NewScript(`
+local raw = redis.call('GET', KEYS[1])
+if not raw then return 0 end
+local ok, job = pcall(cjson.decode, raw)
+if not ok or job.state ~= 'running' then return 0 end
+if tostring(job.worker_id or '') ~= ARGV[1] then return 0 end
+if tonumber(job.attempt_num or 0) ~= tonumber(ARGV[2]) then return 0 end
+job.attempted_at_ms = tonumber(ARGV[3])
+if type(job.tags) == 'table' and next(job.tags) == nil then job.tags = cjson.empty_array end
+if type(job.errors) == 'table' and next(job.errors) == nil then job.errors = cjson.empty_array end
+cjson.encode_number_precision(14)
+redis.call('SET', KEYS[1], cjson.encode(job))
+redis.call('HSET', KEYS[2], ARGV[4], ARGV[3])
+return 1
+`)
+
 // ---- executor ----
 
 type executor struct {
@@ -242,6 +259,17 @@ func (e *executor) JobRescueStuck(ctx context.Context, params driver.JobRescuePa
 		rescued += n
 	}
 	return rescued, nil
+}
+func (e *executor) JobHeartbeat(ctx context.Context, params driver.JobHeartbeatParams) (bool, error) {
+	job, err := jobGetByID(ctx, e.rdb, params.ID)
+	if err != nil || job == nil {
+		return false, err
+	}
+	renewed, err := heartbeatScript.Run(ctx, e.rdb,
+		[]string{jobKey(params.ID), runKey(job.Queue)},
+		params.WorkerID, params.Attempt, params.At.UTC().UnixMilli(), params.ID,
+	).Int64()
+	return renewed == 1, err
 }
 func (e *executor) JobSetStateIfRunning(ctx context.Context, params driver.JobSetStateParams) error {
 	return jobSetStateIfRunning(ctx, e.rdb, e.clk, params)
@@ -509,76 +537,84 @@ func jobFetchBatch(ctx context.Context, rdb *redis.Client, clk clock.Clock, para
 }
 
 func jobSetStateIfRunning(ctx context.Context, rdb *redis.Client, clk clock.Clock, params driver.JobSetStateParams) error {
-	raw, err := rdb.Get(ctx, jobKey(params.ID)).Bytes()
-	if err == redis.Nil {
-		return nil
-	}
-	if err != nil {
-		return err
-	}
+	key := jobKey(params.ID)
+	for range 8 {
+		err := rdb.Watch(ctx, func(tx *redis.Tx) error {
+			raw, err := tx.Get(ctx, key).Bytes()
+			if err == redis.Nil {
+				return nil
+			}
+			if err != nil {
+				return err
+			}
 
-	var job redisJob
-	if err := json.Unmarshal(raw, &job); err != nil {
-		return err
-	}
-	if job.State != string(driver.JobStateRunning) {
-		return nil
-	}
+			var job redisJob
+			if err := json.Unmarshal(raw, &job); err != nil {
+				return err
+			}
+			if job.State != string(driver.JobStateRunning) || !params.MatchesClaim(job.WorkerID, job.AttemptNum) {
+				return nil
+			}
 
-	// Remove from running hash regardless of transition.
-	rdb.HDel(ctx, runKey(job.Queue), params.ID) //nolint:errcheck
+			now := clk.Now()
+			if params.Yield {
+				job.State = string(driver.JobStateAvailable)
+				job.AttemptNum--
+				job.AttemptedAtMs = 0
+				job.WorkerID = ""
+			} else {
+				if params.Err != nil {
+					job.Errors = append(job.Errors, redisAttemptErr{
+						AtMs: now.UnixMilli(), Attempt: job.AttemptNum, Message: *params.Err,
+					})
+				}
+				if params.State == driver.JobStateRetryable {
+					retryAt := params.RetryAt
+					if retryAt.IsZero() {
+						retryAt = now
+					}
+					job.State = string(driver.JobStateAvailable)
+					job.RunAtMs = millis(retryAt.UnixMilli())
+					job.WorkerID = ""
+				} else {
+					job.State = string(params.State)
+					job.FinalizedAtMs = millis(now.UnixMilli())
+					job.WorkerID = ""
+				}
+			}
 
-	if params.Yield {
-		job.State = string(driver.JobStateAvailable)
-		job.AttemptNum--
-		job.AttemptedAtMs = 0
-		job.WorkerID = ""
-		updated, _ := json.Marshal(job)
-		pipe := rdb.Pipeline()
-		pipe.Set(ctx, jobKey(params.ID), updated, 0)
-		pipe.ZAdd(ctx, availKey(job.Queue), redis.Z{Score: priorityScore(job.Priority, time.UnixMilli(int64(job.RunAtMs))), Member: params.ID})
-		_, err = pipe.Exec(ctx)
-		return err
-	}
-
-	now := clk.Now()
-
-	if params.Err != nil {
-		job.Errors = append(job.Errors, redisAttemptErr{
-			AtMs:    now.UnixMilli(),
-			Attempt: job.AttemptNum,
-			Message: *params.Err,
-		})
-	}
-
-	if params.State == driver.JobStateRetryable {
-		retryAt := params.RetryAt
-		if retryAt.IsZero() {
-			retryAt = now
+			updated, err := json.Marshal(job)
+			if err != nil {
+				return err
+			}
+			_, err = tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
+				pipe.HDel(ctx, runKey(job.Queue), params.ID)
+				pipe.Set(ctx, key, updated, 0)
+				switch {
+				case params.Yield:
+					pipe.ZAdd(ctx, availKey(job.Queue), redis.Z{
+						Score: priorityScore(job.Priority, time.UnixMilli(int64(job.RunAtMs))), Member: params.ID,
+					})
+				case params.State == driver.JobStateRetryable:
+					retryAt := time.UnixMilli(int64(job.RunAtMs))
+					if retryAt.After(now) {
+						pipe.ZAdd(ctx, schedKey(job.Queue), redis.Z{Score: float64(retryAt.UnixMilli()), Member: params.ID})
+					} else {
+						pipe.ZAdd(ctx, availKey(job.Queue), redis.Z{Score: priorityScore(job.Priority, retryAt), Member: params.ID})
+					}
+				case job.UniqueKey != "":
+					pipe.Del(ctx, uniqKey(job.Queue, job.UniqueKey))
+				}
+				return nil
+			})
+			return err
+		}, key)
+		if errors.Is(err, redis.TxFailedErr) {
+			continue
 		}
-		job.State = string(driver.JobStateAvailable)
-		job.RunAtMs = millis(retryAt.UnixMilli())
-
-		updated, _ := json.Marshal(job)
-		pipe := rdb.Pipeline()
-		pipe.Set(ctx, jobKey(params.ID), updated, 0)
-		if retryAt.After(now) {
-			pipe.ZAdd(ctx, schedKey(job.Queue), redis.Z{Score: float64(retryAt.UnixMilli()), Member: params.ID})
-		} else {
-			pipe.ZAdd(ctx, availKey(job.Queue), redis.Z{Score: priorityScore(job.Priority, retryAt), Member: params.ID})
-		}
-		_, err = pipe.Exec(ctx)
 		return err
 	}
-
-	// Terminal state.
-	job.State = string(params.State)
-	job.FinalizedAtMs = millis(now.UnixMilli())
-	if job.UniqueKey != "" {
-		rdb.Del(ctx, uniqKey(job.Queue, job.UniqueKey)) //nolint:errcheck
-	}
-	updated, _ := json.Marshal(job)
-	return rdb.Set(ctx, jobKey(params.ID), updated, 0).Err()
+	return fmt.Errorf("set state for job %s: too much concurrent contention", params.ID)
 }
 
 func jobCancel(ctx context.Context, rdb *redis.Client, clk clock.Clock, id string) error {

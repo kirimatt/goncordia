@@ -408,12 +408,14 @@ client.Enqueue(ctx, SendEmailArgs{To: "user@example.com", Subject: "Welcome"}, &
 goncordia.WorkerConfig{
     Queues:          []string{"default", "critical"},
     Concurrency:     20,
-    WorkerID:        "mailer-eu-1",                     // generated when empty
+    MaxPending:      80,                             // claimed jobs waiting/running; defaults to 4x concurrency
+    WorkerID:        "mailer-eu-1",                  // generated when empty
     PollInterval:    500 * time.Millisecond,         // fallback when no push notifications
     RetryPolicy:     core.ExponentialRetry{Base: time.Second, Max: time.Hour},
     ShutdownTimeout: 30 * time.Second,
     StuckJobTimeout: time.Hour,                       // negative disables rescue
     RescueInterval: time.Minute,
+    HeartbeatInterval: 20 * time.Minute,              // defaults to one third of StuckJobTimeout
     Clock:           clock.NewManual(time.Now()),     // omit in production; inject for tests
     ErrorHandler:    func(err error) { logger.Error("worker", "err", err) },
 }
@@ -531,6 +533,14 @@ func (MyPolicy) NextRetryAt(attempt int, err error, clk clock.Clock) time.Time {
     return clk.Now().Add(time.Duration(attempt) * time.Minute)
 }
 ```
+
+Running claims are fenced by worker ID and attempt number. Active and waiting
+claims heartbeat while they are owned, so rescue does not duplicate a healthy
+long-running job. Cancelling the pool context yields an interrupted claim back
+to the queue without consuming an attempt.
+
+Across all built-in drivers, due jobs are selected by `priority DESC`, then
+`run_at ASC`, `created_at ASC`, and `id ASC`.
 
 ---
 

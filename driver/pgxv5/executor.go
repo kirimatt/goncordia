@@ -81,6 +81,9 @@ func (e *executor) JobFetchBatch(ctx context.Context, params driver.FetchParams)
 func (e *executor) JobRescueStuck(ctx context.Context, params driver.JobRescueParams) (int64, error) {
 	return jobRescueStuck(ctx, poolQuerier{e.pool}, params)
 }
+func (e *executor) JobHeartbeat(ctx context.Context, params driver.JobHeartbeatParams) (bool, error) {
+	return jobHeartbeat(ctx, poolQuerier{e.pool}, params)
+}
 func (e *executor) JobSetStateIfRunning(ctx context.Context, params driver.JobSetStateParams) error {
 	return jobSetStateIfRunning(ctx, poolQuerier{e.pool}, e.clk, params)
 }
@@ -326,7 +329,7 @@ WITH fetched AS (
     WHERE queue = $1
       AND state IN ('available', 'scheduled')
       AND run_at <= $2
-    ORDER BY priority DESC, run_at
+    ORDER BY priority DESC, run_at, created_at, id
     LIMIT $3
     FOR UPDATE SKIP LOCKED
 )
@@ -362,6 +365,16 @@ WHERE queue = $1 AND state = 'running' AND attempted_at <= $2`
 	return tag.RowsAffected(), nil
 }
 
+func jobHeartbeat(ctx context.Context, q querier, params driver.JobHeartbeatParams) (bool, error) {
+	tag, err := q.Exec(ctx, `UPDATE goncordia_jobs SET attempted_at = $1
+WHERE id = $2 AND state = 'running' AND worker_id = $3 AND attempt_num = $4`,
+		params.At.UTC(), params.ID, params.WorkerID, params.Attempt)
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() > 0, nil
+}
+
 func jobSetStateIfRunning(ctx context.Context, q querier, clk clock.Clock, params driver.JobSetStateParams) error {
 	idInt, err := strconv.ParseInt(params.ID, 10, 64)
 	if err != nil {
@@ -375,8 +388,10 @@ UPDATE goncordia_jobs SET
     attempt_num  = attempt_num - 1,
     attempted_at = NULL,
     worker_id    = NULL
-WHERE id = $1 AND state = 'running'`
-		_, err = q.Exec(ctx, yieldSQL, idInt)
+WHERE id = $1 AND state = 'running'
+  AND ($2 = '' OR worker_id = $2)
+  AND ($3 = 0 OR attempt_num = $3)`
+		_, err = q.Exec(ctx, yieldSQL, idInt, params.ExpectedWorkerID, params.ExpectedAttempt)
 		return err
 	}
 
@@ -409,9 +424,11 @@ UPDATE goncordia_jobs SET
     errors       = CASE WHEN $5::jsonb IS NOT NULL
                         THEN errors || $5::jsonb
                         ELSE errors END
-WHERE id = $1 AND state = 'running'`
+WHERE id = $1 AND state = 'running'
+  AND ($6 = '' OR worker_id = $6)
+  AND ($7 = 0 OR attempt_num = $7)`
 
-	_, err = q.Exec(ctx, sql, idInt, targetState, finalizedAt, retryAt, errJSON)
+	_, err = q.Exec(ctx, sql, idInt, targetState, finalizedAt, retryAt, errJSON, params.ExpectedWorkerID, params.ExpectedAttempt)
 	return err
 }
 

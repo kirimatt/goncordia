@@ -96,6 +96,9 @@ func (e *executor) JobFetchBatch(ctx context.Context, params driver.FetchParams)
 func (e *executor) JobRescueStuck(ctx context.Context, params driver.JobRescueParams) (int64, error) {
 	return jobRescueStuck(ctx, e.db, params)
 }
+func (e *executor) JobHeartbeat(ctx context.Context, params driver.JobHeartbeatParams) (bool, error) {
+	return jobHeartbeat(ctx, e.db, params)
+}
 func (e *executor) JobSetStateIfRunning(ctx context.Context, params driver.JobSetStateParams) error {
 	return jobSetStateIfRunning(ctx, e.db, e.clk, params)
 }
@@ -371,7 +374,7 @@ func jobFetchBatch(ctx context.Context, db *mongo.Database, clk clock.Clock, par
 		"$inc": bson.M{"attempt_num": 1},
 	}
 	findOpts := options.FindOneAndUpdate().
-		SetSort(bson.D{{Key: "priority", Value: -1}, {Key: "run_at", Value: 1}}).
+		SetSort(bson.D{{Key: "priority", Value: -1}, {Key: "run_at", Value: 1}, {Key: "created_at", Value: 1}, {Key: "_id", Value: 1}}).
 		SetReturnDocument(options.After)
 
 	var rows []driver.JobRow
@@ -406,15 +409,37 @@ func jobRescueStuck(ctx context.Context, db *mongo.Database, params driver.JobRe
 	return result.ModifiedCount, nil
 }
 
+func jobHeartbeat(ctx context.Context, db *mongo.Database, params driver.JobHeartbeatParams) (bool, error) {
+	oid, err := primitive.ObjectIDFromHex(params.ID)
+	if err != nil {
+		return false, fmt.Errorf("invalid job id %q: %w", params.ID, err)
+	}
+	result, err := db.Collection(jobsCollection).UpdateOne(ctx, bson.M{
+		"_id": oid, "state": string(driver.JobStateRunning),
+		"worker_id": params.WorkerID, "attempt_num": params.Attempt,
+	}, bson.M{"$set": bson.M{"attempted_at": params.At.UTC()}})
+	if err != nil {
+		return false, err
+	}
+	return result.ModifiedCount == 1, nil
+}
+
 func jobSetStateIfRunning(ctx context.Context, db *mongo.Database, clk clock.Clock, params driver.JobSetStateParams) error {
 	oid, err := primitive.ObjectIDFromHex(params.ID)
 	if err != nil {
 		return fmt.Errorf("invalid job id %q: %w", params.ID, err)
 	}
+	filter := bson.M{"_id": oid, "state": string(driver.JobStateRunning)}
+	if params.ExpectedWorkerID != "" {
+		filter["worker_id"] = params.ExpectedWorkerID
+	}
+	if params.ExpectedAttempt > 0 {
+		filter["attempt_num"] = params.ExpectedAttempt
+	}
 
 	if params.Yield {
 		_, err = db.Collection(jobsCollection).UpdateOne(ctx,
-			bson.M{"_id": oid, "state": string(driver.JobStateRunning)},
+			filter,
 			bson.M{
 				"$set":   bson.M{"state": string(driver.JobStateAvailable), "attempted_at": nil},
 				"$inc":   bson.M{"attempt_num": -1},
@@ -457,7 +482,7 @@ func jobSetStateIfRunning(ctx context.Context, db *mongo.Database, clk clock.Clo
 	}
 
 	_, err = db.Collection(jobsCollection).UpdateOne(ctx,
-		bson.M{"_id": oid, "state": string(driver.JobStateRunning)},
+		filter,
 		update,
 	)
 	return err

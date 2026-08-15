@@ -48,6 +48,9 @@ func (e *executor) JobFetchBatch(ctx context.Context, params driver.FetchParams)
 func (e *executor) JobRescueStuck(ctx context.Context, params driver.JobRescueParams) (int64, error) {
 	return jobRescueStuck(ctx, e.svc, params)
 }
+func (e *executor) JobHeartbeat(ctx context.Context, params driver.JobHeartbeatParams) (bool, error) {
+	return jobHeartbeat(ctx, e.svc, params)
+}
 func (e *executor) JobSetStateIfRunning(ctx context.Context, params driver.JobSetStateParams) error {
 	return jobSetStateIfRunning(ctx, e.svc, e.clk, params)
 }
@@ -434,39 +437,54 @@ func jobFetchBatch(ctx context.Context, svc *dynamodb.Client, clk clock.Clock, p
 
 	candidates := make([]dynamoJob, 0, params.Limit*6)
 	for _, state := range []driver.JobState{driver.JobStateAvailable, driver.JobStateScheduled} {
-		out, queryErr := svc.Query(ctx, &dynamodb.QueryInput{
-			TableName:              aws.String(tableJobs),
-			IndexName:              aws.String(gsiQueueState),
-			KeyConditionExpression: aws.String("#qs = :qs AND run_at <= :now"),
-			ExpressionAttributeNames: map[string]string{
-				"#qs": "queue_state",
-			},
-			ExpressionAttributeValues: map[string]types.AttributeValue{
-				":qs":  &types.AttributeValueMemberS{Value: qsKey(params.Queue, string(state))},
-				":now": &types.AttributeValueMemberS{Value: nowStr},
-			},
-			Limit: aws.Int32(int32(params.Limit * 3)),
-		})
-		if queryErr != nil {
-			return nil, fmt.Errorf("query %s jobs: %w", state, queryErr)
-		}
-		for _, item := range out.Items {
-			var j dynamoJob
-			if err := attributevalue.UnmarshalMap(item, &j); err != nil {
-				continue
+		var startKey map[string]types.AttributeValue
+		for {
+			out, queryErr := svc.Query(ctx, &dynamodb.QueryInput{
+				TableName:              aws.String(tableJobs),
+				IndexName:              aws.String(gsiQueueState),
+				KeyConditionExpression: aws.String("#qs = :qs AND run_at <= :now"),
+				ExpressionAttributeNames: map[string]string{
+					"#qs": "queue_state",
+				},
+				ExpressionAttributeValues: map[string]types.AttributeValue{
+					":qs":  &types.AttributeValueMemberS{Value: qsKey(params.Queue, string(state))},
+					":now": &types.AttributeValueMemberS{Value: nowStr},
+				},
+				ExclusiveStartKey: startKey,
+			})
+			if queryErr != nil {
+				return nil, fmt.Errorf("query %s jobs: %w", state, queryErr)
 			}
-			candidates = append(candidates, j)
+			for _, item := range out.Items {
+				var j dynamoJob
+				if err := attributevalue.UnmarshalMap(item, &j); err != nil {
+					continue
+				}
+				candidates = append(candidates, j)
+			}
+			if len(out.LastEvaluatedKey) == 0 {
+				break
+			}
+			startKey = out.LastEvaluatedKey
 		}
 	}
 
-	// Sort: earliest run_at first, then highest priority first within same run_at.
+	// Portable order: highest priority, then earliest run_at/created_at/id.
 	sort.Slice(candidates, func(i, k int) bool {
-		ti := parseTime(candidates[i].RunAt)
-		tk := parseTime(candidates[k].RunAt)
-		if ti.Equal(tk) {
+		if candidates[i].Priority != candidates[k].Priority {
 			return candidates[i].Priority > candidates[k].Priority
 		}
-		return ti.Before(tk)
+		ti := parseTime(candidates[i].RunAt)
+		tk := parseTime(candidates[k].RunAt)
+		if !ti.Equal(tk) {
+			return ti.Before(tk)
+		}
+		ci := parseTime(candidates[i].CreatedAt)
+		ck := parseTime(candidates[k].CreatedAt)
+		if !ci.Equal(ck) {
+			return ci.Before(ck)
+		}
+		return candidates[i].ID < candidates[k].ID
 	})
 
 	qsRunning := qsKey(params.Queue, string(driver.JobStateRunning))
@@ -598,6 +616,35 @@ func jobRescueStuck(ctx context.Context, svc *dynamodb.Client, params driver.Job
 	}
 }
 
+func jobHeartbeat(ctx context.Context, svc *dynamodb.Client, params driver.JobHeartbeatParams) (bool, error) {
+	_, err := svc.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName: aws.String(tableJobs),
+		Key: map[string]types.AttributeValue{
+			"id": &types.AttributeValueMemberS{Value: params.ID},
+		},
+		UpdateExpression:    aws.String("SET #aat=:at, #ver=#ver+:one"),
+		ConditionExpression: aws.String("#state=:running AND #wid=:wid AND #anum=:anum"),
+		ExpressionAttributeNames: map[string]string{
+			"#aat": "attempted_at", "#ver": "version", "#state": "state", "#wid": "worker_id", "#anum": "attempt_num",
+		},
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":at":      &types.AttributeValueMemberS{Value: params.At.UTC().Format(timeFmt)},
+			":one":     &types.AttributeValueMemberN{Value: "1"},
+			":running": &types.AttributeValueMemberS{Value: string(driver.JobStateRunning)},
+			":wid":     &types.AttributeValueMemberS{Value: params.WorkerID},
+			":anum":    &types.AttributeValueMemberN{Value: strconv.Itoa(params.Attempt)},
+		},
+	})
+	if err != nil {
+		var conditional *types.ConditionalCheckFailedException
+		if errors.As(err, &conditional) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
 // ---- JobSetStateIfRunning ----
 
 func jobSetStateIfRunning(ctx context.Context, svc *dynamodb.Client, clk clock.Clock, params driver.JobSetStateParams) error {
@@ -605,7 +652,7 @@ func jobSetStateIfRunning(ctx context.Context, svc *dynamodb.Client, clk clock.C
 	if err != nil {
 		return err
 	}
-	if j == nil || j.State != string(driver.JobStateRunning) {
+	if j == nil || j.State != string(driver.JobStateRunning) || !params.MatchesClaim(j.WorkerID, j.AttemptNum) {
 		return nil
 	}
 
@@ -621,7 +668,7 @@ func jobSetStateIfRunning(ctx context.Context, svc *dynamodb.Client, clk clock.C
 					` REMOVE #aat` +
 					` ADD #anum :neg_one`,
 			),
-			ConditionExpression: aws.String("#state = :running"),
+			ConditionExpression: aws.String("#state = :running AND #ver = :expected_ver"),
 			ExpressionAttributeNames: map[string]string{
 				"#state": "state",
 				"#qs":    "queue_state",
@@ -631,12 +678,13 @@ func jobSetStateIfRunning(ctx context.Context, svc *dynamodb.Client, clk clock.C
 				"#ver":   "version",
 			},
 			ExpressionAttributeValues: map[string]types.AttributeValue{
-				":avail":   &types.AttributeValueMemberS{Value: string(driver.JobStateAvailable)},
-				":qs":      &types.AttributeValueMemberS{Value: qsAvail},
-				":empty":   &types.AttributeValueMemberS{Value: ""},
-				":one":     &types.AttributeValueMemberN{Value: "1"},
-				":neg_one": &types.AttributeValueMemberN{Value: "-1"},
-				":running": &types.AttributeValueMemberS{Value: string(driver.JobStateRunning)},
+				":avail":        &types.AttributeValueMemberS{Value: string(driver.JobStateAvailable)},
+				":qs":           &types.AttributeValueMemberS{Value: qsAvail},
+				":empty":        &types.AttributeValueMemberS{Value: ""},
+				":one":          &types.AttributeValueMemberN{Value: "1"},
+				":neg_one":      &types.AttributeValueMemberN{Value: "-1"},
+				":running":      &types.AttributeValueMemberS{Value: string(driver.JobStateRunning)},
+				":expected_ver": &types.AttributeValueMemberN{Value: strconv.FormatInt(j.Version, 10)},
 			},
 		})
 		if err != nil {
@@ -668,10 +716,11 @@ func jobSetStateIfRunning(ctx context.Context, svc *dynamodb.Client, clk clock.C
 		"#ver":   "version",
 	}
 	exprVals := map[string]types.AttributeValue{
-		":empty":   &types.AttributeValueMemberS{Value: ""},
-		":errj":    &types.AttributeValueMemberS{Value: errJSON},
-		":one":     &types.AttributeValueMemberN{Value: "1"},
-		":running": &types.AttributeValueMemberS{Value: string(driver.JobStateRunning)},
+		":empty":        &types.AttributeValueMemberS{Value: ""},
+		":errj":         &types.AttributeValueMemberS{Value: errJSON},
+		":one":          &types.AttributeValueMemberN{Value: "1"},
+		":running":      &types.AttributeValueMemberS{Value: string(driver.JobStateRunning)},
+		":expected_ver": &types.AttributeValueMemberN{Value: strconv.FormatInt(j.Version, 10)},
 	}
 
 	if params.State == driver.JobStateRetryable {
@@ -698,7 +747,7 @@ func jobSetStateIfRunning(ctx context.Context, svc *dynamodb.Client, clk clock.C
 			"id": &types.AttributeValueMemberS{Value: params.ID},
 		},
 		UpdateExpression:          aws.String(updateExpr),
-		ConditionExpression:       aws.String("#state = :running"),
+		ConditionExpression:       aws.String("#state = :running AND #ver = :expected_ver"),
 		ExpressionAttributeNames:  exprNames,
 		ExpressionAttributeValues: exprVals,
 	})

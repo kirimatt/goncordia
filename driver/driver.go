@@ -1,6 +1,7 @@
 // Package driver defines the interfaces that all storage backend drivers must implement.
-// Each backend (Postgres, MySQL, SQLite, MongoDB, Redis, in-memory) provides its own
-// implementation of Driver[TTx], parameterized by the transaction type native to that backend.
+// Built-in backends include PostgreSQL, MySQL, SQLite, MongoDB, Redis,
+// Cassandra, ClickHouse, DynamoDB, Firestore, and in-memory. Each implements
+// Driver[TTx], parameterized by its native transaction type.
 package driver
 
 import (
@@ -71,6 +72,13 @@ type StuckJobRescuer interface {
 	JobRescueStuck(ctx context.Context, params JobRescueParams) (int64, error)
 }
 
+// JobHeartbeater is an optional executor capability implemented by drivers
+// that can renew a running claim. The worker pool uses it to prevent healthy
+// long-running jobs from being rescued as abandoned.
+type JobHeartbeater interface {
+	JobHeartbeat(ctx context.Context, params JobHeartbeatParams) (renewed bool, err error)
+}
+
 // AdminExecutor is an optional executor capability used by the admin HTTP API
 // for filtered job inspection and queue-depth metrics.
 type AdminExecutor interface {
@@ -85,7 +93,8 @@ type baseExecutor interface {
 
 	JobInsertMany(ctx context.Context, params []JobInsertParams) ([]JobInsertResult, error)
 	JobGetByID(ctx context.Context, id string) (*JobRow, error)
-	// JobFetchBatch atomically claims up to limit available jobs for processing.
+	// JobFetchBatch atomically claims up to limit due jobs for processing in
+	// priority DESC, run_at ASC, created_at ASC, id ASC order.
 	// Implementations use SELECT FOR UPDATE SKIP LOCKED (SQL) or findOneAndUpdate (MongoDB).
 	JobFetchBatch(ctx context.Context, params FetchParams) ([]JobRow, error)
 	// JobSetStateIfRunning atomically transitions a running job to a terminal/retry state.
@@ -142,18 +151,35 @@ type JobRescueParams struct {
 	Before time.Time
 }
 
+// JobHeartbeatParams renews one fenced running claim at At.
+type JobHeartbeatParams struct {
+	ID       string
+	WorkerID string
+	Attempt  int
+	At       time.Time
+}
+
 // JobSetStateParams transitions a running job to a new state.
 type JobSetStateParams struct {
-	ID      string
-	State   JobState
-	Err     *string   // serialized error for failed/retryable states
-	Attempt int       // attempt number associated with Err
-	RetryAt time.Time // populated when State == JobStateRetryable
+	ID               string
+	State            JobState
+	Err              *string   // serialized error for failed/retryable states
+	Attempt          int       // attempt number associated with Err
+	RetryAt          time.Time // populated when State == JobStateRetryable
+	ExpectedWorkerID string    // optional fencing precondition
+	ExpectedAttempt  int       // optional fencing precondition
 	// Yield returns the job to available without recording an error or counting
 	// an attempt. Used by the pipeline serialization mechanism when a job cannot
 	// run yet because another job with the same PipelineID is already running.
 	// When Yield is true all other fields except ID are ignored.
 	Yield bool
+}
+
+// MatchesClaim reports whether the current claim satisfies the optional
+// fencing preconditions on a state transition.
+func (p JobSetStateParams) MatchesClaim(workerID string, attempt int) bool {
+	return (p.ExpectedWorkerID == "" || p.ExpectedWorkerID == workerID) &&
+		(p.ExpectedAttempt <= 0 || p.ExpectedAttempt == attempt)
 }
 
 // RescheduleParams reschedules a job to run at a future time.
@@ -213,7 +239,7 @@ type JobRow struct {
 	Priority    int
 	RunAt       time.Time
 	CreatedAt   time.Time
-	AttemptedAt *time.Time
+	AttemptedAt *time.Time // claim time, refreshed by heartbeats while running
 	FinalizedAt *time.Time
 	AttemptNum  int
 	MaxRetry    int

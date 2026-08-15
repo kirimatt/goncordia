@@ -46,6 +46,9 @@ func (e *executor) JobFetchBatch(ctx context.Context, params driver.FetchParams)
 func (e *executor) JobRescueStuck(ctx context.Context, params driver.JobRescueParams) (int64, error) {
 	return jobRescueStuck(ctx, e.db, e.dialect, params)
 }
+func (e *executor) JobHeartbeat(ctx context.Context, params driver.JobHeartbeatParams) (bool, error) {
+	return jobHeartbeat(ctx, e.db, e.dialect, params)
+}
 func (e *executor) JobSetStateIfRunning(ctx context.Context, params driver.JobSetStateParams) error {
 	return jobSetStateIfRunning(ctx, e.db, e.dialect, e.clk, params)
 }
@@ -172,7 +175,9 @@ const insertJobVals = `?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?`
 
 const sqlYield = `UPDATE goncordia_jobs
 SET state = 'available', attempted_at = NULL, worker_id = NULL, attempt_num = attempt_num - 1
-WHERE id = ? AND state = 'running'`
+WHERE id = ? AND state = 'running'
+  AND (? = '' OR worker_id = ?)
+  AND (? = 0 OR attempt_num = ?)`
 
 // Postgres uses COALESCE + JSONB concat in one statement.
 const sqlSetStatePostgres = `UPDATE goncordia_jobs
@@ -181,7 +186,9 @@ SET state        = $2,
     finalized_at = COALESCE($3, finalized_at),
     run_at       = COALESCE($4, run_at),
     errors       = CASE WHEN $5::jsonb IS NOT NULL THEN errors || $5::jsonb ELSE errors END
-WHERE id = $1 AND state = 'running'`
+WHERE id = $1 AND state = 'running'
+  AND ($6 = '' OR worker_id = $6)
+  AND ($7 = 0 OR attempt_num = $7)`
 
 // MySQL and SQLite share the same main-update SQL; error append differs.
 const sqlSetStateMain = `UPDATE goncordia_jobs
@@ -189,15 +196,21 @@ SET state        = ?,
     worker_id    = NULL,
     finalized_at = COALESCE(?, finalized_at),
     run_at       = COALESCE(?, run_at)
-WHERE id = ? AND state = 'running'`
+WHERE id = ? AND state = 'running'
+  AND (? = '' OR worker_id = ?)
+  AND (? = 0 OR attempt_num = ?)`
 
 const sqlAppendErrorMySQL = `UPDATE goncordia_jobs
 SET errors = JSON_ARRAY_APPEND(errors, '$', CAST(? AS JSON))
-WHERE id = ? AND state = 'running'`
+WHERE id = ? AND state = 'running'
+  AND (? = '' OR worker_id = ?)
+  AND (? = 0 OR attempt_num = ?)`
 
 const sqlAppendErrorSQLite = `UPDATE goncordia_jobs
 SET errors = json_insert(errors, '$[#]', json(?))
-WHERE id = ? AND state = 'running'`
+WHERE id = ? AND state = 'running'
+  AND (? = '' OR worker_id = ?)
+  AND (? = 0 OR attempt_num = ?)`
 
 const sqlJobCancel = `UPDATE goncordia_jobs
 SET state = 'cancelled', finalized_at = ?, unique_key = NULL
@@ -415,12 +428,23 @@ WHERE queue = ? AND state = 'running' AND attempted_at <= ?`
 	return result.RowsAffected()
 }
 
+func jobHeartbeat(ctx context.Context, q querier, d Dialect, params driver.JobHeartbeatParams) (bool, error) {
+	result, err := q.ExecContext(ctx, d.q(`UPDATE goncordia_jobs SET attempted_at = ?
+WHERE id = ? AND state = 'running' AND worker_id = ? AND attempt_num = ?`),
+		params.At.UTC(), params.ID, params.WorkerID, params.Attempt)
+	if err != nil {
+		return false, err
+	}
+	rows, err := result.RowsAffected()
+	return rows > 0, err
+}
+
 func jobFetchSkipLocked(ctx context.Context, q querier, d Dialect, now time.Time, params driver.FetchParams) ([]driver.JobRow, error) {
 	selectSQL := d.q(`SELECT id FROM goncordia_jobs
 WHERE queue = ?
   AND state IN ('available', 'scheduled')
   AND run_at <= ?
-ORDER BY priority DESC, run_at
+ORDER BY priority DESC, run_at, created_at, id
 LIMIT ?
 FOR UPDATE SKIP LOCKED`)
 	rows, err := q.QueryContext(ctx, selectSQL, params.Queue, now, params.Limit)
@@ -443,7 +467,7 @@ func jobFetchSQLite(ctx context.Context, q querier, d Dialect, now time.Time, pa
 WHERE queue = ?
   AND state IN ('available', 'scheduled')
   AND run_at <= ?
-ORDER BY priority DESC, run_at
+ORDER BY priority DESC, run_at, created_at, id
 LIMIT ?`,
 		params.Queue, now, params.Limit)
 	if err != nil {
@@ -506,7 +530,9 @@ WHERE id IN (`+inList+`)`),
 
 func jobSetStateIfRunning(ctx context.Context, q querier, d Dialect, clk clock.Clock, params driver.JobSetStateParams) error {
 	if params.Yield {
-		_, err := q.ExecContext(ctx, d.q(sqlYield), params.ID)
+		_, err := q.ExecContext(ctx, d.q(sqlYield), params.ID,
+			params.ExpectedWorkerID, params.ExpectedWorkerID,
+			params.ExpectedAttempt, params.ExpectedAttempt)
 		return err
 	}
 
@@ -538,7 +564,8 @@ func jobSetStateIfRunning(ctx context.Context, q querier, d Dialect, clk clock.C
 	}
 
 	if d == Postgres {
-		_, err := q.ExecContext(ctx, sqlSetStatePostgres, params.ID, targetState, finalizedAt, retryAt, errJSON)
+		_, err := q.ExecContext(ctx, sqlSetStatePostgres, params.ID, targetState, finalizedAt, retryAt, errJSON,
+			params.ExpectedWorkerID, params.ExpectedAttempt)
 		return err
 	}
 
@@ -547,11 +574,15 @@ func jobSetStateIfRunning(ctx context.Context, q querier, d Dialect, clk clock.C
 		if d == MySQL {
 			appendSQL = sqlAppendErrorMySQL
 		}
-		if _, err := q.ExecContext(ctx, appendSQL, *errJSON, params.ID); err != nil {
+		if _, err := q.ExecContext(ctx, appendSQL, *errJSON, params.ID,
+			params.ExpectedWorkerID, params.ExpectedWorkerID,
+			params.ExpectedAttempt, params.ExpectedAttempt); err != nil {
 			return err
 		}
 	}
-	if _, err := q.ExecContext(ctx, sqlSetStateMain, targetState, finalizedAt, retryAt, params.ID); err != nil {
+	if _, err := q.ExecContext(ctx, sqlSetStateMain, targetState, finalizedAt, retryAt, params.ID,
+		params.ExpectedWorkerID, params.ExpectedWorkerID,
+		params.ExpectedAttempt, params.ExpectedAttempt); err != nil {
 		return err
 	}
 	if d == MySQL && (params.State == driver.JobStateCompleted || params.State == driver.JobStateDiscarded || params.State == driver.JobStateCancelled) {

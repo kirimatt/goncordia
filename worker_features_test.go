@@ -94,6 +94,93 @@ func TestWorkerPassesMetadataAndAppliesTimeout(t *testing.T) {
 	pool.Stop()
 }
 
+func TestWorkerHeartbeatsLongRunningJob(t *testing.T) {
+	clk := clock.NewManual(time.Date(2026, 8, 16, 12, 0, 0, 0, time.UTC))
+	d := memory.New(memory.WithClock(clk))
+	client := goncordia.NewClient(d, goncordia.ClientConfig{})
+	registry := core.NewRegistry()
+	started := make(chan struct{})
+	release := make(chan struct{})
+	core.RegisterWorker(registry, core.WorkerFunc[featureArgs](func(context.Context, *core.Job[featureArgs]) error {
+		close(started)
+		<-release
+		return nil
+	}), core.WorkerOpts{})
+	if _, err := client.Enqueue(context.Background(), featureArgs{}, nil); err != nil {
+		t.Fatal(err)
+	}
+	pool := goncordia.NewWorkerPool(d, registry, goncordia.WorkerConfig{
+		Concurrency: 1, PollInterval: time.Hour,
+		StuckJobTimeout: 90 * time.Second, HeartbeatInterval: 30 * time.Second,
+		Clock: clk,
+	})
+	runCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go pool.Start(runCtx) //nolint:errcheck
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("job did not start")
+	}
+
+	claimedAt := d.AllJobs()[0].AttemptedAt
+	clk.Advance(30 * time.Second)
+	waitForCondition(t, time.Second, func() bool {
+		jobs := d.AllJobs()
+		return len(jobs) == 1 && jobs[0].AttemptedAt != nil && jobs[0].AttemptedAt.After(*claimedAt)
+	}, "worker heartbeat")
+	for range 4 {
+		clk.Advance(30 * time.Second)
+		waitForCondition(t, time.Second, func() bool {
+			jobs := d.AllJobs()
+			return len(jobs) == 1 && jobs[0].AttemptedAt != nil && jobs[0].AttemptedAt.Equal(clk.Now())
+		}, "renewed heartbeat after long execution")
+	}
+	rescued, err := d.Executor().(driver.StuckJobRescuer).JobRescueStuck(context.Background(), driver.JobRescueParams{
+		Queue: "default", Before: clk.Now().Add(-90 * time.Second),
+	})
+	if err != nil || rescued != 0 {
+		t.Fatalf("healthy job was rescued: rescued=%d err=%v", rescued, err)
+	}
+	close(release)
+	waitForCondition(t, time.Second, func() bool {
+		jobs := d.AllJobs()
+		return len(jobs) == 1 && jobs[0].State == driver.JobStateCompleted
+	}, "heartbeating job completion")
+	pool.Stop()
+}
+
+func TestWorkerCancellationYieldsWithoutConsumingAttempt(t *testing.T) {
+	d := memory.New()
+	client := goncordia.NewClient(d, goncordia.ClientConfig{})
+	registry := core.NewRegistry()
+	started := make(chan struct{})
+	core.RegisterWorker(registry, core.WorkerFunc[featureArgs](func(ctx context.Context, _ *core.Job[featureArgs]) error {
+		close(started)
+		<-ctx.Done()
+		return ctx.Err()
+	}), core.WorkerOpts{})
+	if _, err := client.Enqueue(context.Background(), featureArgs{}, nil); err != nil {
+		t.Fatal(err)
+	}
+	pool := goncordia.NewWorkerPool(d, registry, goncordia.WorkerConfig{
+		Concurrency: 1, PollInterval: time.Hour,
+	})
+	runCtx, cancel := context.WithCancel(context.Background())
+	go pool.Start(runCtx) //nolint:errcheck
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("job did not start")
+	}
+	cancel()
+	waitForCondition(t, time.Second, func() bool {
+		jobs := d.AllJobs()
+		return len(jobs) == 1 && jobs[0].State == driver.JobStateAvailable && jobs[0].AttemptNum == 0 && len(jobs[0].Errors) == 0
+	}, "cancelled worker to yield claim")
+	pool.Stop()
+}
+
 func TestWorkerOptsConcurrencyIsEnforced(t *testing.T) {
 	d := memory.New()
 	client := goncordia.NewClient(d, goncordia.ClientConfig{})
@@ -127,6 +214,58 @@ func TestWorkerOptsConcurrencyIsEnforced(t *testing.T) {
 	if got := maximum.Load(); got != 1 {
 		t.Fatalf("max kind concurrency=%d, want 1", got)
 	}
+	pool.Stop()
+}
+
+func TestPipelineWaitDoesNotConsumeGlobalConcurrency(t *testing.T) {
+	d := memory.New()
+	client := goncordia.NewClient(d, goncordia.ClientConfig{})
+	registry := core.NewRegistry()
+	firstStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	unrelatedRan := make(chan struct{}, 1)
+	var firstOnce sync.Once
+	core.RegisterWorker(registry, core.WorkerFunc[featureArgs](func(_ context.Context, job *core.Job[featureArgs]) error {
+		switch job.Args.N {
+		case 1:
+			firstOnce.Do(func() { close(firstStarted) })
+			<-releaseFirst
+		case 99:
+			unrelatedRan <- struct{}{}
+		}
+		return nil
+	}), core.WorkerOpts{})
+
+	ctx := context.Background()
+	for _, request := range []struct {
+		n        int
+		pipeline string
+	}{{1, "account-1"}, {2, "account-1"}, {99, ""}} {
+		if _, err := client.Enqueue(ctx, featureArgs{N: request.n}, &core.InsertOpts{PipelineID: request.pipeline}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	pool := goncordia.NewWorkerPool(d, registry, goncordia.WorkerConfig{
+		Concurrency: 2, MaxPending: 3, PollInterval: 5 * time.Millisecond,
+	})
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go pool.Start(runCtx) //nolint:errcheck
+	select {
+	case <-firstStarted:
+	case <-time.After(time.Second):
+		t.Fatal("first pipeline job did not start")
+	}
+	select {
+	case <-unrelatedRan:
+		// The second pipeline job is waiting without occupying the other slot.
+	case <-time.After(250 * time.Millisecond):
+		close(releaseFirst)
+		pool.Stop()
+		t.Fatal("pipeline waiter consumed global concurrency and starved unrelated work")
+	}
+	close(releaseFirst)
 	pool.Stop()
 }
 

@@ -93,6 +93,9 @@ func (e *executor) JobFetchBatch(ctx context.Context, params driver.FetchParams)
 func (e *executor) JobRescueStuck(ctx context.Context, params driver.JobRescueParams) (int64, error) {
 	return jobRescueStuck(ctx, e.client, params)
 }
+func (e *executor) JobHeartbeat(ctx context.Context, params driver.JobHeartbeatParams) (bool, error) {
+	return jobHeartbeat(ctx, e.client, params)
+}
 func (e *executor) JobSetStateIfRunning(ctx context.Context, params driver.JobSetStateParams) error {
 	return jobSetStateIfRunning(ctx, e.client, e.clk, params)
 }
@@ -455,7 +458,6 @@ func jobFetchBatch(ctx context.Context, client *firestore.Client, clk clock.Cloc
 		Where("queue", "==", params.Queue).
 		Where("state", "in", []string{string(driver.JobStateAvailable), string(driver.JobStateScheduled)}).
 		Where("run_at", "<=", now).
-		Limit(params.Limit * 3).
 		Documents(ctx).GetAll()
 	if err != nil {
 		return nil, fmt.Errorf("query available jobs: %w", err)
@@ -478,7 +480,13 @@ func jobFetchBatch(ctx context.Context, client *firestore.Client, clk clock.Cloc
 		if candidates[i].j.Priority != candidates[k].j.Priority {
 			return candidates[i].j.Priority > candidates[k].j.Priority
 		}
-		return candidates[i].j.RunAt.Before(candidates[k].j.RunAt)
+		if !candidates[i].j.RunAt.Equal(candidates[k].j.RunAt) {
+			return candidates[i].j.RunAt.Before(candidates[k].j.RunAt)
+		}
+		if !candidates[i].j.CreatedAt.Equal(candidates[k].j.CreatedAt) {
+			return candidates[i].j.CreatedAt.Before(candidates[k].j.CreatedAt)
+		}
+		return candidates[i].j.ID < candidates[k].j.ID
 	})
 
 	var claimed []driver.JobRow
@@ -581,6 +589,30 @@ func jobRescueStuck(ctx context.Context, client *firestore.Client, params driver
 	return rescued, nil
 }
 
+func jobHeartbeat(ctx context.Context, client *firestore.Client, params driver.JobHeartbeatParams) (bool, error) {
+	jobRef := client.Collection(colJobs).Doc(params.ID)
+	renewed := false
+	err := client.RunTransaction(ctx, func(ctx context.Context, tx *firestore.Transaction) error {
+		snap, err := tx.Get(jobRef)
+		if err != nil {
+			if status.Code(err) == codes.NotFound {
+				return nil
+			}
+			return err
+		}
+		var job jobDoc
+		if err := snap.DataTo(&job); err != nil {
+			return err
+		}
+		if job.State != string(driver.JobStateRunning) || job.WorkerID != params.WorkerID || job.AttemptNum != params.Attempt {
+			return nil
+		}
+		renewed = true
+		return tx.Update(jobRef, []firestore.Update{{Path: "attempted_at", Value: params.At.UTC()}})
+	})
+	return renewed && err == nil, err
+}
+
 // ---- JobSetStateIfRunning ----
 
 func jobSetStateIfRunning(ctx context.Context, client *firestore.Client, clk clock.Clock, params driver.JobSetStateParams) error {
@@ -597,7 +629,7 @@ func jobSetStateIfRunning(ctx context.Context, client *firestore.Client, clk clo
 		if err := snap.DataTo(&j); err != nil {
 			return err
 		}
-		if j.State != string(driver.JobStateRunning) {
+		if j.State != string(driver.JobStateRunning) || !params.MatchesClaim(j.WorkerID, j.AttemptNum) {
 			return nil
 		}
 

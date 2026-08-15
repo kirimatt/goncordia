@@ -69,6 +69,7 @@ func Run(t *testing.T, exec driver.Executor) {
 	if claimed.WorkerID != "conformance-worker" || claimed.AttemptNum != 1 {
 		t.Fatalf("claim metadata: %+v", claimed)
 	}
+	firstClaim := claimed
 	rescuer, ok := exec.(driver.StuckJobRescuer)
 	if !ok {
 		t.Fatal("executor does not implement driver.StuckJobRescuer")
@@ -89,7 +90,37 @@ func Run(t *testing.T, exec driver.Executor) {
 	if claimed.AttemptNum < 2 {
 		t.Fatalf("rescued job did not retain attempt count: %+v", claimed)
 	}
-	if err := exec.JobSetStateIfRunning(ctx, driver.JobSetStateParams{ID: id, State: driver.JobStateCompleted}); err != nil {
+	heartbeater, ok := exec.(driver.JobHeartbeater)
+	if !ok {
+		t.Fatal("executor does not implement driver.JobHeartbeater")
+	}
+	heartbeatAt := claimed.AttemptedAt.Add(time.Hour)
+	renewed, err := heartbeater.JobHeartbeat(ctx, driver.JobHeartbeatParams{
+		ID: id, WorkerID: claimed.WorkerID, Attempt: claimed.AttemptNum, At: heartbeatAt,
+	})
+	if err != nil || !renewed {
+		t.Fatalf("heartbeat: renewed=%v err=%v", renewed, err)
+	}
+	rescued, err := rescuer.JobRescueStuck(ctx, driver.JobRescueParams{
+		Queue: queue, Before: heartbeatAt.Add(-time.Second),
+	})
+	if err != nil || rescued != 0 {
+		t.Fatalf("heartbeat did not protect running job: rescued=%d err=%v", rescued, err)
+	}
+	if err := exec.JobSetStateIfRunning(ctx, driver.JobSetStateParams{
+		ID: id, State: driver.JobStateCompleted,
+		ExpectedWorkerID: firstClaim.WorkerID, ExpectedAttempt: firstClaim.AttemptNum,
+	}); err != nil {
+		t.Fatalf("stale completion: %v", err)
+	}
+	current, err := exec.JobGetByID(ctx, id)
+	if err != nil || current == nil || current.State != driver.JobStateRunning || current.AttemptNum != claimed.AttemptNum {
+		t.Fatalf("stale worker overwrote current claim: row=%+v err=%v", current, err)
+	}
+	if err := exec.JobSetStateIfRunning(ctx, driver.JobSetStateParams{
+		ID: id, State: driver.JobStateCompleted,
+		ExpectedWorkerID: claimed.WorkerID, ExpectedAttempt: claimed.AttemptNum,
+	}); err != nil {
 		t.Fatalf("complete: %v", err)
 	}
 	reinserted, err := exec.JobInsertMany(ctx, []driver.JobInsertParams{insert})
@@ -97,6 +128,34 @@ func Run(t *testing.T, exec driver.Executor) {
 		t.Fatalf("terminal job retained unique slot: results=%+v err=%v", reinserted, err)
 	}
 	t.Cleanup(func() { _ = exec.JobDelete(context.Background(), reinserted[0].Job.ID) })
+
+	// A backend must choose priority globally across all due candidates, not
+	// merely sort a small storage-ordered subset after fetching it.
+	var ordered []driver.JobInsertParams
+	for i := range 8 {
+		ordered = append(ordered, driver.JobInsertParams{
+			Queue: queue, Kind: "ordering-low", Args: []byte(fmt.Sprintf(`{"n":%d}`, i)),
+			Priority: 0, RunAt: now.Add(-2 * time.Hour),
+		})
+	}
+	ordered = append(ordered, driver.JobInsertParams{
+		Queue: queue, Kind: "ordering-high", Args: []byte(`{"n":99}`),
+		Priority: 100, RunAt: now.Add(-time.Hour),
+	})
+	orderedResults, err := exec.JobInsertMany(ctx, ordered)
+	if err != nil || len(orderedResults) != len(ordered) {
+		t.Fatalf("insert ordering jobs: results=%d err=%v", len(orderedResults), err)
+	}
+	for _, result := range orderedResults {
+		if result.Job != nil {
+			id := result.Job.ID
+			t.Cleanup(func() { _ = exec.JobDelete(context.Background(), id) })
+		}
+	}
+	orderedClaim := fetchEventually(t, ctx, exec, queue)
+	if orderedClaim.Kind != "ordering-high" || orderedClaim.Priority != 100 {
+		t.Fatalf("priority contract selected %+v", orderedClaim)
+	}
 }
 
 // RunScheduled verifies that an executor does not claim a future job and does

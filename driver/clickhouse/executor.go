@@ -43,6 +43,9 @@ func (e *executor) JobFetchBatch(ctx context.Context, params driver.FetchParams)
 func (e *executor) JobRescueStuck(ctx context.Context, params driver.JobRescueParams) (int64, error) {
 	return jobRescueStuck(ctx, e.conn, params)
 }
+func (e *executor) JobHeartbeat(ctx context.Context, params driver.JobHeartbeatParams) (bool, error) {
+	return jobHeartbeat(ctx, e.conn, params)
+}
 func (e *executor) JobSetStateIfRunning(ctx context.Context, params driver.JobSetStateParams) error {
 	return jobSetStateIfRunning(ctx, e.conn, e.clk, params)
 }
@@ -407,7 +410,7 @@ func jobFetchBatch(ctx context.Context, conn chdriver.Conn, clk clock.Clock, par
 	rows, err := conn.Query(ctx,
 		`SELECT `+selectJobCols+` FROM goncordia_jobs FINAL
 		 WHERE queue=? AND state IN ('available','scheduled') AND run_at<=?
-		 ORDER BY priority DESC, run_at ASC
+		 ORDER BY priority DESC, run_at ASC, created_at ASC, id ASC
 		 LIMIT ?`,
 		params.Queue, now, params.Limit,
 	)
@@ -532,6 +535,23 @@ func jobRescueStuck(ctx context.Context, conn chdriver.Conn, params driver.JobRe
 	return rescued, nil
 }
 
+func jobHeartbeat(ctx context.Context, conn chdriver.Conn, params driver.JobHeartbeatParams) (bool, error) {
+	job, err := queryJob(ctx, conn, params.ID)
+	if err != nil {
+		return false, err
+	}
+	if job.ID == "" || job.State != string(driver.JobStateRunning) || job.WorkerID != params.WorkerID || int(job.AttemptNum) != params.Attempt {
+		return false, nil
+	}
+	at := params.At.UTC()
+	job.AttemptedAt = &at
+	job.Version++
+	if err := insertJobRow(ctx, conn, job); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 // ---- JobSetStateIfRunning ----
 
 func jobSetStateIfRunning(ctx context.Context, conn chdriver.Conn, clk clock.Clock, params driver.JobSetStateParams) error {
@@ -539,7 +559,7 @@ func jobSetStateIfRunning(ctx context.Context, conn chdriver.Conn, clk clock.Clo
 	if err != nil || j.ID == "" {
 		return nil
 	}
-	if j.State != string(driver.JobStateRunning) {
+	if j.State != string(driver.JobStateRunning) || !params.MatchesClaim(j.WorkerID, int(j.AttemptNum)) {
 		return nil
 	}
 

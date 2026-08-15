@@ -211,7 +211,13 @@ func (e *executor) JobFetchBatch(_ context.Context, params driver.FetchParams) (
 		if candidates[i].Priority != candidates[k].Priority {
 			return candidates[i].Priority > candidates[k].Priority
 		}
-		return candidates[i].RunAt.Before(candidates[k].RunAt)
+		if !candidates[i].RunAt.Equal(candidates[k].RunAt) {
+			return candidates[i].RunAt.Before(candidates[k].RunAt)
+		}
+		if !candidates[i].CreatedAt.Equal(candidates[k].CreatedAt) {
+			return candidates[i].CreatedAt.Before(candidates[k].CreatedAt)
+		}
+		return candidates[i].ID < candidates[k].ID
 	})
 
 	limit := params.Limit
@@ -248,11 +254,23 @@ func (e *executor) JobRescueStuck(_ context.Context, params driver.JobRescuePara
 	return rescued, nil
 }
 
+func (e *executor) JobHeartbeat(_ context.Context, params driver.JobHeartbeatParams) (bool, error) {
+	e.d.mu.Lock()
+	defer e.d.mu.Unlock()
+	row, ok := e.d.jobs[params.ID]
+	if !ok || row.State != driver.JobStateRunning || row.WorkerID != params.WorkerID || row.AttemptNum != params.Attempt {
+		return false, nil
+	}
+	at := params.At.UTC()
+	row.AttemptedAt = &at
+	return true, nil
+}
+
 func (e *executor) JobSetStateIfRunning(_ context.Context, params driver.JobSetStateParams) error {
 	e.d.mu.Lock()
 	defer e.d.mu.Unlock()
 	row, ok := e.d.jobs[params.ID]
-	if !ok || row.State != driver.JobStateRunning {
+	if !ok || row.State != driver.JobStateRunning || !params.MatchesClaim(row.WorkerID, row.AttemptNum) {
 		return nil
 	}
 	if params.Yield {
