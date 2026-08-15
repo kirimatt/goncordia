@@ -417,7 +417,7 @@ func queueStats(ctx context.Context, svc *dynamodb.Client, queue string) (driver
 
 // ---- JobFetchBatch ----
 
-// JobFetchBatch claims up to params.Limit available jobs using a GSI query +
+// JobFetchBatch claims up to params.Limit due available or scheduled jobs using GSI queries +
 // conditional UpdateItem. Each UpdateItem checks both version and state, so
 // only one worker wins per job.
 func jobFetchBatch(ctx context.Context, svc *dynamodb.Client, clk clock.Clock, params driver.FetchParams) ([]driver.JobRow, error) {
@@ -432,30 +432,31 @@ func jobFetchBatch(ctx context.Context, svc *dynamodb.Client, clk clock.Clock, p
 	now := clk.Now()
 	nowStr := now.UTC().Format(timeFmt)
 
-	out, err := svc.Query(ctx, &dynamodb.QueryInput{
-		TableName:              aws.String(tableJobs),
-		IndexName:              aws.String(gsiQueueState),
-		KeyConditionExpression: aws.String("#qs = :qs AND run_at <= :now"),
-		ExpressionAttributeNames: map[string]string{
-			"#qs": "queue_state",
-		},
-		ExpressionAttributeValues: map[string]types.AttributeValue{
-			":qs":  &types.AttributeValueMemberS{Value: qsKey(params.Queue, string(driver.JobStateAvailable))},
-			":now": &types.AttributeValueMemberS{Value: nowStr},
-		},
-		Limit: aws.Int32(int32(params.Limit * 3)),
-	})
-	if err != nil {
-		return nil, fmt.Errorf("query avail: %w", err)
-	}
-
-	candidates := make([]dynamoJob, 0, len(out.Items))
-	for _, item := range out.Items {
-		var j dynamoJob
-		if err := attributevalue.UnmarshalMap(item, &j); err != nil {
-			continue
+	candidates := make([]dynamoJob, 0, params.Limit*6)
+	for _, state := range []driver.JobState{driver.JobStateAvailable, driver.JobStateScheduled} {
+		out, queryErr := svc.Query(ctx, &dynamodb.QueryInput{
+			TableName:              aws.String(tableJobs),
+			IndexName:              aws.String(gsiQueueState),
+			KeyConditionExpression: aws.String("#qs = :qs AND run_at <= :now"),
+			ExpressionAttributeNames: map[string]string{
+				"#qs": "queue_state",
+			},
+			ExpressionAttributeValues: map[string]types.AttributeValue{
+				":qs":  &types.AttributeValueMemberS{Value: qsKey(params.Queue, string(state))},
+				":now": &types.AttributeValueMemberS{Value: nowStr},
+			},
+			Limit: aws.Int32(int32(params.Limit * 3)),
+		})
+		if queryErr != nil {
+			return nil, fmt.Errorf("query %s jobs: %w", state, queryErr)
 		}
-		candidates = append(candidates, j)
+		for _, item := range out.Items {
+			var j dynamoJob
+			if err := attributevalue.UnmarshalMap(item, &j); err != nil {
+				continue
+			}
+			candidates = append(candidates, j)
+		}
 	}
 
 	// Sort: earliest run_at first, then highest priority first within same run_at.
@@ -485,7 +486,7 @@ func jobFetchBatch(ctx context.Context, svc *dynamodb.Client, clk clock.Clock, p
 				`SET #state = :running, #qs = :qs_running, #wid = :wid, ` +
 					`#aat = :now, #anum = #anum + :one, #ver = #ver + :one`,
 			),
-			ConditionExpression: aws.String("#ver = :ver AND #state = :avail"),
+			ConditionExpression: aws.String("#ver = :ver AND #state IN (:avail, :scheduled)"),
 			ExpressionAttributeNames: map[string]string{
 				"#state": "state",
 				"#qs":    "queue_state",
@@ -502,6 +503,7 @@ func jobFetchBatch(ctx context.Context, svc *dynamodb.Client, clk clock.Clock, p
 				":one":        &types.AttributeValueMemberN{Value: "1"},
 				":ver":        &types.AttributeValueMemberN{Value: strconv.FormatInt(c.Version, 10)},
 				":avail":      &types.AttributeValueMemberS{Value: string(driver.JobStateAvailable)},
+				":scheduled":  &types.AttributeValueMemberS{Value: string(driver.JobStateScheduled)},
 			},
 		})
 		if claimErr != nil {

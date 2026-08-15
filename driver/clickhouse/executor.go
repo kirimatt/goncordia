@@ -402,10 +402,11 @@ func jobFetchBatch(ctx context.Context, conn chdriver.Conn, clk clock.Clock, par
 
 	now := clk.Now()
 
-	// Find available candidates.
+	// Scheduled jobs become claimable directly when run_at is due. Keeping the
+	// persisted state until the claim avoids a separate promotion race.
 	rows, err := conn.Query(ctx,
 		`SELECT `+selectJobCols+` FROM goncordia_jobs FINAL
-		 WHERE queue=? AND state='available' AND run_at<=?
+		 WHERE queue=? AND state IN ('available','scheduled') AND run_at<=?
 		 ORDER BY priority DESC, run_at ASC
 		 LIMIT ?`,
 		params.Queue, now, params.Limit,

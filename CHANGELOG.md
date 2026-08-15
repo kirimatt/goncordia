@@ -13,6 +13,26 @@ No changes yet.
 
 ---
 
+## [v0.15.1] — 2026-08-16
+
+### Fixed
+- Due scheduled jobs are now claimable on Cassandra, ClickHouse, DynamoDB, and
+  Firestore instead of remaining permanently in the `scheduled` state.
+- Cassandra migrations backfill the due-job lookup for scheduled jobs created
+  by earlier releases.
+
+### Testing
+- Added a reusable scheduled-job conformance test driven by `clock.Manual`, so
+  drivers are verified before and after `run_at` without wall-clock sleeps.
+
+### Upgrade notes
+- Cassandra users must call `Migrate` once during deployment. It creates the
+  migration journal and backfills available/scheduled lookup rows idempotently.
+- Firestore still requires the documented composite index on `queue`, `state`,
+  and `run_at`; the scheduled query now uses both supported ready states.
+
+---
+
 ## [v0.15.0] — 2026-08-16
 
 ### Added

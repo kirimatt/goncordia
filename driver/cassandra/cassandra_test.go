@@ -12,7 +12,9 @@ import (
 	tccassandra "github.com/testcontainers/testcontainers-go/modules/cassandra"
 
 	"github.com/kirimatt/goncordia"
+	"github.com/kirimatt/goncordia/clock"
 	"github.com/kirimatt/goncordia/core"
+	"github.com/kirimatt/goncordia/driver"
 	cassandradriver "github.com/kirimatt/goncordia/driver/cassandra"
 	"github.com/kirimatt/goncordia/driver/drivertest"
 )
@@ -126,6 +128,69 @@ func TestCassandra_EnqueueAndProcess(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 	pool.Stop()
+}
+
+func TestCassandra_ScheduledConformance(t *testing.T) {
+	skipIfNoDocker(t)
+	session, cleanup := newTestSession(t)
+	defer cleanup()
+
+	clk := clock.NewManual(time.Date(2026, 8, 16, 12, 0, 0, 0, time.UTC))
+	d := cassandradriver.New(session, cassandradriver.WithClock(clk))
+	if err := d.Migrate(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	drivertest.RunScheduled(t, d.Executor(), clk)
+}
+
+func TestCassandra_MigrateBackfillsScheduledLookup(t *testing.T) {
+	skipIfNoDocker(t)
+	session, cleanup := newTestSession(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	clk := clock.NewManual(time.Date(2026, 8, 16, 12, 0, 0, 0, time.UTC))
+	d := cassandradriver.New(session, cassandradriver.WithClock(clk))
+	if err := d.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	result, err := d.Executor().JobInsertMany(ctx, []driver.JobInsertParams{{
+		Queue: "backfill", Kind: "scheduled", Args: []byte(`{}`), RunAt: clk.Now().Add(time.Hour),
+	}})
+	if err != nil || len(result) != 1 || result[0].Job == nil {
+		t.Fatalf("insert scheduled job: results=%+v err=%v", result, err)
+	}
+	job := result[0].Job
+	if err := session.Query(
+		`DELETE FROM goncordia_jobs_avail WHERE queue=? AND run_at=? AND priority=? AND id=?`,
+		job.Queue, job.RunAt, job.Priority, job.ID,
+	).WithContext(ctx).Exec(); err != nil {
+		t.Fatal(err)
+	}
+	if err := session.Query(`TRUNCATE goncordia_schema_migrations`).WithContext(ctx).Exec(); err != nil {
+		t.Fatal(err)
+	}
+
+	clk.Advance(time.Hour)
+	rows, err := d.Executor().JobFetchBatch(ctx, driver.FetchParams{Queue: job.Queue, Limit: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 0 {
+		t.Fatalf("job unexpectedly remained in lookup before backfill: %+v", rows)
+	}
+	if err := d.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	rows, err = d.Executor().JobFetchBatch(ctx, driver.FetchParams{
+		Queue: job.Queue, Limit: 1, WorkerID: "backfill-worker",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].ID != job.ID {
+		t.Fatalf("backfilled scheduled job was not claimable: %+v", rows)
+	}
 }
 
 func TestCassandra_UniqueJobs(t *testing.T) {

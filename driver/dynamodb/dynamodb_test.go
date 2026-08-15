@@ -17,6 +17,7 @@ import (
 	"github.com/testcontainers/testcontainers-go/wait"
 
 	goncordia "github.com/kirimatt/goncordia"
+	"github.com/kirimatt/goncordia/clock"
 	"github.com/kirimatt/goncordia/core"
 	"github.com/kirimatt/goncordia/driver/drivertest"
 	dynamodbdriver "github.com/kirimatt/goncordia/driver/dynamodb"
@@ -123,6 +124,18 @@ func TestDynamoDB_EnqueueAndProcess(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 	pool.Stop()
+}
+
+func TestDynamoDB_ScheduledConformance(t *testing.T) {
+	svc, cleanup := newTestClient(t)
+	defer cleanup()
+
+	clk := clock.NewManual(time.Date(2026, 8, 16, 12, 0, 0, 0, time.UTC))
+	d := dynamodbdriver.New(svc, dynamodbdriver.WithClock(clk))
+	if err := d.Migrate(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	drivertest.RunScheduled(t, d.Executor(), clk)
 }
 
 func TestDynamoDB_UniqueJobs(t *testing.T) {

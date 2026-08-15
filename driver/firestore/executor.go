@@ -453,7 +453,7 @@ func jobFetchBatch(ctx context.Context, client *firestore.Client, clk clock.Cloc
 
 	snaps, err := client.Collection(colJobs).
 		Where("queue", "==", params.Queue).
-		Where("state", "==", string(driver.JobStateAvailable)).
+		Where("state", "in", []string{string(driver.JobStateAvailable), string(driver.JobStateScheduled)}).
 		Where("run_at", "<=", now).
 		Limit(params.Limit * 3).
 		Documents(ctx).GetAll()
@@ -497,7 +497,7 @@ func jobFetchBatch(ctx context.Context, client *firestore.Client, clk clock.Cloc
 			if err := snap.DataTo(&cur); err != nil {
 				return err
 			}
-			if cur.State != string(driver.JobStateAvailable) {
+			if cur.State != string(driver.JobStateAvailable) && cur.State != string(driver.JobStateScheduled) {
 				return errJobGone
 			}
 			return tx.Update(c.ref, []firestore.Update{

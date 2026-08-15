@@ -341,8 +341,9 @@ func jobInsertMany(ctx context.Context, session *gocql.Session, clk clock.Clock,
 			return nil, fmt.Errorf("insert job: %w", err)
 		}
 
-		// Only available jobs go into the avail lookup table.
-		if state == driver.JobStateAvailable {
+		// The lookup contains both immediately available and scheduled jobs;
+		// run_at <= now makes scheduled rows visible without a promotion scan.
+		if state == driver.JobStateAvailable || state == driver.JobStateScheduled {
 			if err := session.Query(
 				`INSERT INTO goncordia_jobs_avail (queue, run_at, priority, id) VALUES (?, ?, ?, ?)`,
 				j.Queue, j.RunAt, j.Priority, j.ID,
@@ -379,8 +380,8 @@ func jobGetByID(ctx context.Context, session *gocql.Session, id string) (*driver
 
 // ---- JobFetchBatch ----
 
-// JobFetchBatch claims up to params.Limit available jobs from the given queue.
-// It uses Cassandra lightweight transactions (IF state = 'available') to ensure
+// JobFetchBatch claims up to params.Limit due available or scheduled jobs from the given queue.
+// It uses Cassandra lightweight transactions to ensure
 // each job is claimed by exactly one worker.
 func jobFetchBatch(ctx context.Context, session *gocql.Session, clk clock.Clock, params driver.FetchParams) ([]driver.JobRow, error) {
 	paused, err := isQueuePaused(ctx, session, params.Queue)
@@ -432,7 +433,7 @@ func jobFetchBatch(ctx context.Context, session *gocql.Session, clk clock.Clock,
 		if err != nil {
 			return nil, err
 		}
-		if j.State != string(driver.JobStateAvailable) {
+		if j.State != string(driver.JobStateAvailable) && j.State != string(driver.JobStateScheduled) {
 			// Already claimed by another worker.
 			_ = session.Query(`DELETE FROM goncordia_jobs_avail WHERE queue=? AND run_at=? AND priority=? AND id=?`,
 				params.Queue, c.runAt, c.priority, c.id).WithContext(ctx).Exec()
@@ -443,9 +444,9 @@ func jobFetchBatch(ctx context.Context, session *gocql.Session, clk clock.Clock,
 		newVersion := j.Version + 1
 		applied, lwtErr := session.Query(
 			`UPDATE goncordia_jobs SET state=?, worker_id=?, attempted_at=?, attempt_num=?, version=?
-			 WHERE id=? IF state=? AND version=?`,
+			 WHERE id=? IF state IN (?,?) AND version=?`,
 			string(driver.JobStateRunning), params.WorkerID, now, j.AttemptNum+1, newVersion,
-			c.id, string(driver.JobStateAvailable), j.Version,
+			c.id, string(driver.JobStateAvailable), string(driver.JobStateScheduled), j.Version,
 		).WithContext(ctx).MapScanCAS(map[string]interface{}{})
 		if lwtErr != nil {
 			return nil, fmt.Errorf("claim LWT: %w", lwtErr)

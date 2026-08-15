@@ -271,7 +271,7 @@ session, _ := cluster.CreateSession()
 defer session.Close()
 
 d := cassandradriver.New(session)
-d.Migrate(ctx)  // creates tables (idempotent)
+d.Migrate(ctx)  // creates tables and runs idempotent lookup backfills
 
 client := cassandradriver.NewClient(d, goncordia.ClientConfig{})
 client.Enqueue(ctx, SendEmailArgs{To: "user@example.com", Subject: "Welcome"}, nil)
@@ -376,7 +376,7 @@ available ──► running ──► completed
                 └──► discarded               (max retries exhausted)
 
 available ──► cancelled   (via JobCancel)
-scheduled ──► available   (when run_at is reached)
+scheduled ──► running     (claimed once run_at is reached)
 ```
 
 ---
@@ -573,7 +573,7 @@ func (d *MyDriver) Listener() driver.Listener          { return nil } // nil = p
 func (d *MyDriver) Close() error                       { return nil }
 ```
 
-See [`driver/driver.go`](driver/driver.go) for the full core interface and optional rescue/admin capabilities, and [`driver/memory/memory.go`](driver/memory/memory.go) for a reference implementation. Driver authors can reuse `driver/drivertest.Run` as a conformance suite.
+See [`driver/driver.go`](driver/driver.go) for the full core interface and optional rescue/admin capabilities, and [`driver/memory/memory.go`](driver/memory/memory.go) for a reference implementation. Driver authors can reuse `driver/drivertest.Run` for the base contract and `driver/drivertest.RunScheduled` with an injected `clock.Manual` for scheduled-job conformance.
 
 ---
 

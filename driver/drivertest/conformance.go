@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kirimatt/goncordia/clock"
 	"github.com/kirimatt/goncordia/driver"
 )
 
@@ -96,6 +97,46 @@ func Run(t *testing.T, exec driver.Executor) {
 		t.Fatalf("terminal job retained unique slot: results=%+v err=%v", reinserted, err)
 	}
 	t.Cleanup(func() { _ = exec.JobDelete(context.Background(), reinserted[0].Job.ID) })
+}
+
+// RunScheduled verifies that an executor does not claim a future job and does
+// claim it once the injected clock reaches run_at. Drivers must construct the
+// executor with clk; the test advances time without sleeping.
+func RunScheduled(t *testing.T, exec driver.Executor, clk *clock.Manual) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	queue := fmt.Sprintf("scheduled-conformance-%d", sequence.Add(1))
+	runAt := clk.Now().Add(time.Hour)
+
+	results, err := exec.JobInsertMany(ctx, []driver.JobInsertParams{{
+		Queue: queue, Kind: "scheduled-conformance", Args: []byte(`{"value":1}`),
+		RunAt: runAt,
+	}})
+	if err != nil || len(results) != 1 || results[0].Job == nil {
+		t.Fatalf("insert scheduled job: results=%+v err=%v", results, err)
+	}
+	id := results[0].Job.ID
+	t.Cleanup(func() { _ = exec.JobDelete(context.Background(), id) })
+	if results[0].Job.State != driver.JobStateScheduled {
+		t.Fatalf("future job state: got %q, want %q", results[0].Job.State, driver.JobStateScheduled)
+	}
+
+	rows, err := exec.JobFetchBatch(ctx, driver.FetchParams{
+		Queue: queue, Limit: 1, WorkerID: "scheduled-conformance-worker",
+	})
+	if err != nil {
+		t.Fatalf("fetch future job: %v", err)
+	}
+	if len(rows) != 0 {
+		t.Fatalf("future job was claimable before run_at: %+v", rows)
+	}
+
+	clk.Advance(time.Hour)
+	claimed := fetchEventually(t, ctx, exec, queue)
+	if claimed.ID != id || claimed.State != driver.JobStateRunning || claimed.RunAt.After(clk.Now()) {
+		t.Fatalf("claim due scheduled job: %+v", claimed)
+	}
 }
 
 func waitUntil(t *testing.T, condition func() bool, label string) {

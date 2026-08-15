@@ -12,6 +12,7 @@ import (
 	tcclickhouse "github.com/testcontainers/testcontainers-go/modules/clickhouse"
 
 	"github.com/kirimatt/goncordia"
+	"github.com/kirimatt/goncordia/clock"
 	"github.com/kirimatt/goncordia/core"
 	clickhousedriver "github.com/kirimatt/goncordia/driver/clickhouse"
 	"github.com/kirimatt/goncordia/driver/drivertest"
@@ -115,6 +116,19 @@ func TestClickHouse_EnqueueAndProcess(t *testing.T) {
 		time.Sleep(100 * time.Millisecond)
 	}
 	pool.Stop()
+}
+
+func TestClickHouse_ScheduledConformance(t *testing.T) {
+	skipIfNoDocker(t)
+	conn, cleanup := newTestConn(t)
+	defer cleanup()
+
+	clk := clock.NewManual(time.Date(2026, 8, 16, 12, 0, 0, 0, time.UTC))
+	d := clickhousedriver.New(conn, clickhousedriver.WithClock(clk))
+	if err := d.Migrate(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	drivertest.RunScheduled(t, d.Executor(), clk)
 }
 
 func TestClickHouse_UniqueJobs(t *testing.T) {

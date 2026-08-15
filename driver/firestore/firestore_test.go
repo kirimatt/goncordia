@@ -14,6 +14,7 @@ import (
 	"github.com/testcontainers/testcontainers-go/wait"
 
 	goncordia "github.com/kirimatt/goncordia"
+	"github.com/kirimatt/goncordia/clock"
 	"github.com/kirimatt/goncordia/core"
 	"github.com/kirimatt/goncordia/driver/drivertest"
 	firestoredriver "github.com/kirimatt/goncordia/driver/firestore"
@@ -114,6 +115,15 @@ func TestFirestore_EnqueueAndProcess(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 	pool.Stop()
+}
+
+func TestFirestore_ScheduledConformance(t *testing.T) {
+	client, cleanup := newTestClient(t)
+	defer cleanup()
+
+	clk := clock.NewManual(time.Date(2026, 8, 16, 12, 0, 0, 0, time.UTC))
+	d := firestoredriver.New(client, firestoredriver.WithClock(clk))
+	drivertest.RunScheduled(t, d.Executor(), clk)
 }
 
 func TestFirestore_UniqueJobs(t *testing.T) {

@@ -31,6 +31,7 @@ package cassandradriver
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/gocql/gocql"
 
@@ -68,7 +69,7 @@ func New(session *gocql.Session, opts ...Option) *Driver {
 }
 
 // Migrate creates the required tables and indexes. Safe to call multiple times.
-func (d *Driver) Migrate(_ context.Context) error {
+func (d *Driver) Migrate(ctx context.Context) error {
 	stmts := []string{
 		// Main job store — queried by id.
 		`CREATE TABLE IF NOT EXISTS goncordia_jobs (
@@ -134,11 +135,70 @@ func (d *Driver) Migrate(_ context.Context) error {
 			worker_id  text,
 			expires_at timestamp
 		)`,
+
+		`CREATE TABLE IF NOT EXISTS goncordia_schema_migrations (
+			version    text PRIMARY KEY,
+			applied_at timestamp
+		)`,
 	}
 	for _, stmt := range stmts {
-		if err := d.session.Query(stmt).Exec(); err != nil {
+		if err := d.session.Query(stmt).WithContext(ctx).Exec(); err != nil {
 			return fmt.Errorf("cassandra migrate: %w", err)
 		}
+	}
+	return d.backfillScheduledLookup(ctx)
+}
+
+const scheduledLookupMigration = "20260816_scheduled_lookup"
+
+// backfillScheduledLookup makes jobs created by versions before v0.15.1
+// visible to the run_at lookup. Concurrent runs are safe because lookup writes
+// are idempotent; the marker is written only after a complete scan.
+func (d *Driver) backfillScheduledLookup(ctx context.Context) error {
+	var appliedAt time.Time
+	if err := d.session.Query(
+		`SELECT applied_at FROM goncordia_schema_migrations WHERE version=?`,
+		scheduledLookupMigration,
+	).WithContext(ctx).Scan(&appliedAt); err == nil {
+		return nil
+	} else if err != gocql.ErrNotFound {
+		return fmt.Errorf("cassandra migrate: check scheduled lookup: %w", err)
+	}
+
+	iter := d.session.Query(
+		`SELECT id, queue, state, run_at, priority FROM goncordia_jobs`,
+	).WithContext(ctx).Iter()
+	type lookupRow struct {
+		id       string
+		queue    string
+		state    string
+		runAt    time.Time
+		priority int
+	}
+	var rows []lookupRow
+	var row lookupRow
+	for iter.Scan(&row.id, &row.queue, &row.state, &row.runAt, &row.priority) {
+		if row.state == string(driver.JobStateAvailable) || row.state == string(driver.JobStateScheduled) {
+			rows = append(rows, row)
+		}
+		row = lookupRow{}
+	}
+	if err := iter.Close(); err != nil {
+		return fmt.Errorf("cassandra migrate: scan scheduled lookup: %w", err)
+	}
+	for _, row := range rows {
+		if err := d.session.Query(
+			`INSERT INTO goncordia_jobs_avail (queue, run_at, priority, id) VALUES (?, ?, ?, ?)`,
+			row.queue, row.runAt, row.priority, row.id,
+		).WithContext(ctx).Exec(); err != nil {
+			return fmt.Errorf("cassandra migrate: backfill scheduled lookup: %w", err)
+		}
+	}
+	if err := d.session.Query(
+		`INSERT INTO goncordia_schema_migrations (version, applied_at) VALUES (?, ?)`,
+		scheduledLookupMigration, d.clk.Now(),
+	).WithContext(ctx).Exec(); err != nil {
+		return fmt.Errorf("cassandra migrate: record scheduled lookup: %w", err)
 	}
 	return nil
 }
