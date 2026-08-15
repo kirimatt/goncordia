@@ -2,6 +2,7 @@ package goncordia_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"slices"
 	"sync"
@@ -45,6 +46,47 @@ func TestNoRetryDiscardsAfterFirstFailure(t *testing.T) {
 	if got := attempts.Load(); got != 1 {
 		t.Fatalf("attempts=%d, want 1", got)
 	}
+	pool.Stop()
+}
+
+func TestWorkerHonorsRetryDirectives(t *testing.T) {
+	clk := clock.NewManual(time.Date(2026, 8, 16, 12, 0, 0, 0, time.UTC))
+	d := memory.New(memory.WithClock(clk))
+	client := goncordia.NewClient(d, goncordia.ClientConfig{Clock: clk})
+	registry := core.NewRegistry()
+	core.RegisterWorker(registry, core.WorkerFunc[featureArgs](func(_ context.Context, job *core.Job[featureArgs]) error {
+		if job.Args.N == 1 {
+			return core.Discard(errors.New("permanent"))
+		}
+		return core.RetryAfter(time.Hour, errors.New("rate limited"))
+	}), core.WorkerOpts{MaxRetry: 10})
+	for _, n := range []int{1, 2} {
+		if _, err := client.Enqueue(context.Background(), featureArgs{N: n}, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	pool := goncordia.NewWorkerPool(d, registry, goncordia.WorkerConfig{
+		Concurrency: 2, PollInterval: time.Hour, Clock: clk,
+	})
+	runCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go pool.Start(runCtx) //nolint:errcheck
+	waitForCondition(t, time.Second, func() bool {
+		jobs := d.AllJobs()
+		if len(jobs) != 2 {
+			return false
+		}
+		states := map[int]driver.JobRow{}
+		for _, job := range jobs {
+			var args featureArgs
+			if err := json.Unmarshal(job.Args, &args); err == nil {
+				states[args.N] = job
+			}
+		}
+		return states[1].State == driver.JobStateDiscarded &&
+			states[2].State == driver.JobStateAvailable &&
+			states[2].RunAt.Equal(clk.Now().Add(time.Hour))
+	}, "retry directives")
 	pool.Stop()
 }
 

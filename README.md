@@ -55,7 +55,7 @@ tx.Commit(ctx)  // job and order appear atomically
 | ClickHouse 23+ | `driver/clickhouse` | `NoTx` | ❌ | ReplacingMergeTree; at-least-once |
 | Amazon DynamoDB | `driver/dynamodb` | `NoTx` | ❌ | conditional writes; at-least-once |
 | Cloud Firestore | `driver/firestore` | `*firestore.Transaction` | ✅ | RunTransaction; composite index required |
-| In-memory | `driver/memory` | `memory.NoTx` | ✅ | no persistence; for tests |
+| In-memory | `driver/memory` | `memory.NoTx` | ❌ | synchronized operations, no rollback; for tests |
 
 ---
 
@@ -426,6 +426,14 @@ core.RegisterWorker(registry, worker, core.WorkerOpts{
 })
 ```
 
+Running claims are fenced by worker ID and attempt number. Active and waiting
+claims heartbeat while they are owned, so rescue does not duplicate a healthy
+long-running job. Cancelling the pool context yields an interrupted claim back
+to the queue without consuming an attempt.
+
+Across all built-in drivers, due jobs are selected by `priority DESC`, then
+`run_at ASC`, `created_at ASC`, and `id ASC`.
+
 ---
 
 ## Batch enqueue and pipelines
@@ -525,6 +533,11 @@ core.FixedRetry{Delay: 30 * time.Second}
 // No retry — discard immediately
 core.NoRetry{}
 
+// Per-attempt directives returned by a worker
+return core.Discard(err)                   // permanent failure
+return core.RetryAfter(30*time.Second, err)
+return core.RetryAt(nextWindow, err)
+
 // Custom
 import "github.com/kirimatt/goncordia/clock"
 
@@ -533,14 +546,6 @@ func (MyPolicy) NextRetryAt(attempt int, err error, clk clock.Clock) time.Time {
     return clk.Now().Add(time.Duration(attempt) * time.Minute)
 }
 ```
-
-Running claims are fenced by worker ID and attempt number. Active and waiting
-claims heartbeat while they are owned, so rescue does not duplicate a healthy
-long-running job. Cancelling the pool context yields an interrupted claim back
-to the queue without consuming an attempt.
-
-Across all built-in drivers, due jobs are selected by `priority DESC`, then
-`run_at ASC`, `created_at ASC`, and `id ASC`.
 
 ---
 

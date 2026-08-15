@@ -493,6 +493,12 @@ func (p *WorkerPool[TTx]) processRow(ctx context.Context, exec driver.Executor, 
 	}
 
 	errStr := jobErr.Error()
+	if _, discard := core.AsDiscard(jobErr); discard {
+		p.setState(ctx, exec, fencedStateParams(row, driver.JobSetStateParams{
+			State: driver.JobStateDiscarded, Err: &errStr, Attempt: row.AttemptNum,
+		}))
+		return
+	}
 
 	if row.AttemptNum >= maxRetry {
 		p.setState(ctx, exec, fencedStateParams(row, driver.JobSetStateParams{
@@ -503,7 +509,15 @@ func (p *WorkerPool[TTx]) processRow(ctx context.Context, exec driver.Executor, 
 		return
 	}
 
-	retryAt := p.config.RetryPolicy.NextRetryAt(row.AttemptNum, jobErr, p.config.Clock)
+	var retryAt time.Time
+	if directive, ok := core.AsRetry(jobErr); ok {
+		retryAt = directive.At
+		if retryAt.IsZero() {
+			retryAt = p.config.Clock.Now().Add(directive.After)
+		}
+	} else {
+		retryAt = p.config.RetryPolicy.NextRetryAt(row.AttemptNum, jobErr, p.config.Clock)
+	}
 	if retryAt.IsZero() {
 		p.setState(ctx, exec, fencedStateParams(row, driver.JobSetStateParams{
 			State:   driver.JobStateDiscarded,

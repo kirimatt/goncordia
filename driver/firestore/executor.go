@@ -72,7 +72,7 @@ type executor struct {
 func (e *executor) Begin(_ context.Context) (driver.ExecutorTx, error) {
 	// Firestore transactions must be started via RunTransaction.
 	// The engine never calls Begin; return an error to surface misuse early.
-	return nil, fmt.Errorf("firestoredriver: Begin is not supported; use client.RunTransaction + EnqueueTx")
+	return nil, fmt.Errorf("%w: use firestore.Client.RunTransaction with EnqueueTx", driver.ErrUnsupported)
 }
 
 func (e *executor) JobInsertMany(ctx context.Context, params []driver.JobInsertParams) ([]driver.JobInsertResult, error) {

@@ -17,6 +17,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   execution concurrency.
 - `WorkerConfig.HeartbeatInterval`, defaulting to one third of
   `StuckJobTimeout`.
+- Stable driver error categories, beginning with `driver.ErrUnsupported` for
+  `errors.Is` checks.
+- Worker-returned `core.Discard`, `core.RetryAfter`, and `core.RetryAt`
+  directives.
 
 ### Changed
 - Pipeline and per-kind waiters no longer occupy global execution slots.
@@ -26,6 +30,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   created_at ASC, id ASC` across built-in drivers.
 - Redis completion/retry/yield transitions now use `WATCH`/`MULTI` so claim
   validation and state changes are atomic.
+- The memory driver no longer advertises fake transaction support, and
+  non-transactional executors return `driver.ErrUnsupported` from `Begin`.
+- Exponential retry calculation is integer-based and overflow-safe for
+  arbitrarily large attempt numbers.
 
 ### Testing
 - Driver conformance now covers stale-worker fencing, heartbeat protection, and

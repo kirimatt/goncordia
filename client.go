@@ -84,7 +84,7 @@ func (c *Client[TTx]) Enqueue(ctx context.Context, args core.JobArgs, opts *core
 // Only available on backends with Capabilities.NativeTx == true.
 func (c *Client[TTx]) EnqueueTx(ctx context.Context, tx TTx, args core.JobArgs, opts *core.InsertOpts) (*driver.JobInsertResult, error) {
 	if !c.driver.Capabilities().NativeTx {
-		return nil, fmt.Errorf("driver %q does not support transactional inserts", c.driver.Name())
+		return nil, fmt.Errorf("%w: driver %q does not support transactional inserts", driver.ErrUnsupported, c.driver.Name())
 	}
 	params, err := c.buildInsertParams(args, opts)
 	if err != nil {
@@ -117,7 +117,7 @@ func (c *Client[TTx]) EnqueueBatch(ctx context.Context, requests []InsertRequest
 // EnqueueBatchTx inserts jobs with per-item options in an existing transaction.
 func (c *Client[TTx]) EnqueueBatchTx(ctx context.Context, tx TTx, requests []InsertRequest) ([]driver.JobInsertResult, error) {
 	if !c.driver.Capabilities().NativeTx {
-		return nil, fmt.Errorf("driver %q does not support transactional inserts", c.driver.Name())
+		return nil, fmt.Errorf("%w: driver %q does not support transactional inserts", driver.ErrUnsupported, c.driver.Name())
 	}
 	params := make([]driver.JobInsertParams, 0, len(requests))
 	for _, request := range requests {

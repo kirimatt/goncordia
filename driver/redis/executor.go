@@ -224,7 +224,7 @@ type executor struct {
 }
 
 func (e *executor) Begin(_ context.Context) (driver.ExecutorTx, error) {
-	return &txExecutor{executor: *e}, nil
+	return nil, fmt.Errorf("%w: redis transactions", driver.ErrUnsupported)
 }
 
 func (e *executor) JobInsertMany(ctx context.Context, params []driver.JobInsertParams) ([]driver.JobInsertResult, error) {

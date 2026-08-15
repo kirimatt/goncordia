@@ -1,6 +1,6 @@
 // Package memory provides an in-memory driver for testing and development.
 // It has no persistence — all jobs are lost on process restart.
-// TTx is NoTx since in-memory operations don't need real transactions.
+// TTx is NoTx; the driver does not claim rollback semantics.
 package memory
 
 import (
@@ -16,7 +16,7 @@ import (
 )
 
 // NoTx is the transaction type for the memory driver.
-// In-memory "transactions" are no-ops (state is managed by locks).
+// In-memory operations are individually synchronized but do not provide rollback.
 type NoTx struct{}
 
 // Driver implements driver.Driver[NoTx] using in-memory maps.
@@ -62,7 +62,7 @@ func (d *Driver) Name() string { return "memory" }
 
 func (d *Driver) Capabilities() driver.Capabilities {
 	return driver.Capabilities{
-		NativeTx:      true,
+		NativeTx:      false,
 		SkipLocked:    true,
 		UniqueJobs:    true,
 		ListenNotify:  true,
@@ -82,7 +82,7 @@ func (d *Driver) Close() error { return nil }
 type executor struct{ d *Driver }
 
 func (e *executor) Begin(_ context.Context) (driver.ExecutorTx, error) {
-	return &txExecutor{executor: executor{d: e.d}}, nil
+	return nil, fmt.Errorf("%w: memory transactions", driver.ErrUnsupported)
 }
 
 func (e *executor) JobInsertMany(_ context.Context, params []driver.JobInsertParams) ([]driver.JobInsertResult, error) {
