@@ -13,9 +13,10 @@ import (
 	_ "modernc.org/sqlite"
 
 	"github.com/kirimatt/goncordia"
+	"github.com/kirimatt/goncordia/clock"
 	"github.com/kirimatt/goncordia/core"
 	bundriver "github.com/kirimatt/goncordia/driver/bun"
-	"github.com/kirimatt/goncordia/internal/clock"
+	"github.com/kirimatt/goncordia/driver/drivertest"
 )
 
 type EmailJob struct {
@@ -49,6 +50,7 @@ func newDriver(t *testing.T, opts ...bundriver.Option) (*bundriver.Driver, *bun.
 
 func TestBun_EnqueueAndProcess(t *testing.T) {
 	d, _ := newDriver(t)
+	drivertest.Run(t, d.Executor())
 	ctx := context.Background()
 
 	var processed atomic.Int64

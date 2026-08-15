@@ -17,7 +17,6 @@ package otelgoncordia
 
 import (
 	"context"
-	"time"
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -26,19 +25,22 @@ import (
 	"go.opentelemetry.io/otel/trace"
 
 	goncordia "github.com/kirimatt/goncordia"
+	gonclock "github.com/kirimatt/goncordia/clock"
 	"github.com/kirimatt/goncordia/core"
 )
 
 const (
-	instrName   = "github.com/kirimatt/goncordia"
-	spanName    = "goncordia.process"
-	attrKind    = "goncordia.job.kind"
-	attrQueue   = "goncordia.job.queue"
-	attrID      = "goncordia.job.id"
-	attrAttempt = "goncordia.job.attempt"
-	attrStatus  = "status"
-	statusOK    = "ok"
-	statusError = "error"
+	instrName    = "github.com/kirimatt/goncordia"
+	spanName     = "goncordia.process"
+	attrKind     = "goncordia.job.kind"
+	attrQueue    = "goncordia.job.queue"
+	attrID       = "goncordia.job.id"
+	attrAttempt  = "goncordia.job.attempt"
+	attrPipeline = "goncordia.job.pipeline_id"
+	attrWorker   = "goncordia.worker.id"
+	attrStatus   = "status"
+	statusOK     = "ok"
+	statusError  = "error"
 )
 
 // Option configures the OTel middleware.
@@ -56,9 +58,15 @@ func WithMeterProvider(mp metric.MeterProvider) Option {
 	return func(o *mwOptions) { o.meterProvider = mp }
 }
 
+// WithClock sets the time source used for duration and queue-time metrics.
+func WithClock(clk gonclock.Clock) Option {
+	return func(o *mwOptions) { o.clock = clk }
+}
+
 type mwOptions struct {
 	tracerProvider trace.TracerProvider
 	meterProvider  metric.MeterProvider
+	clock          gonclock.Clock
 }
 
 // NewMiddleware returns a JobMiddleware that:
@@ -79,6 +87,10 @@ func NewMiddleware(opts ...Option) goncordia.JobMiddleware {
 	if mp == nil {
 		mp = otel.GetMeterProvider()
 	}
+	clk := o.clock
+	if clk == nil {
+		clk = gonclock.Real{}
+	}
 
 	tracer := tp.Tracer(instrName)
 	meter := mp.Meter(instrName)
@@ -86,6 +98,11 @@ func NewMiddleware(opts ...Option) goncordia.JobMiddleware {
 	duration, _ := meter.Float64Histogram(
 		"goncordia.job.duration",
 		metric.WithDescription("Job execution duration in seconds"),
+		metric.WithUnit("s"),
+	)
+	queueTime, _ := meter.Float64Histogram(
+		"goncordia.job.queue_time",
+		metric.WithDescription("Time from enqueue to worker execution in seconds"),
 		metric.WithUnit("s"),
 	)
 	count, _ := meter.Int64Counter(
@@ -100,15 +117,27 @@ func NewMiddleware(opts ...Option) goncordia.JobMiddleware {
 			attribute.String(attrID, job.ID),
 			attribute.Int(attrAttempt, job.AttemptNum),
 		}
+		if job.PipelineID != "" {
+			attrs = append(attrs, attribute.String(attrPipeline, job.PipelineID))
+		}
+		if job.WorkerID != "" {
+			attrs = append(attrs, attribute.String(attrWorker, job.WorkerID))
+		}
 
 		ctx, span := tracer.Start(ctx, spanName,
 			trace.WithAttributes(attrs...),
 			trace.WithSpanKind(trace.SpanKindConsumer),
 		)
 
-		start := time.Now()
+		start := clk.Now()
+		if !job.CreatedAt.IsZero() {
+			queueTime.Record(ctx, clk.Since(job.CreatedAt).Seconds(), metric.WithAttributes(
+				attribute.String(attrKind, job.Kind),
+				attribute.String(attrQueue, job.Queue),
+			))
+		}
 		err := next(ctx, job)
-		elapsed := time.Since(start).Seconds()
+		elapsed := clk.Since(start).Seconds()
 
 		status := statusOK
 		if err != nil {

@@ -7,6 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [Unreleased]
+
+### Added
+- Process-local `PipelineID` serialization across all drivers.
+- Per-kind `WorkerOpts.Concurrency`, worker/job timeouts, generated or configured
+  worker IDs, round-robin queue polling, and asynchronous error reporting.
+- Automatic rescue of abandoned running jobs on every built-in backend.
+- Lease-based cron leader election and enqueue-error reporting.
+- MongoDB Change Stream notifications with polling fallback.
+- `EnqueueBatch` and `EnqueueBatchTx` for per-item enqueue options.
+- Embeddable `admin` HTTP dashboard and JSON API, health/readiness probes, and
+  Prometheus-compatible queue metrics.
+- Reusable `driver/drivertest` conformance suite, enabled for every built-in driver.
+- Public injectable `clock` package with deterministic `Manual` timers and tickers.
+- OpenTelemetry worker/pipeline attributes and queue-time histogram.
+
+### Changed
+- SQL migrations are versioned in `goncordia_schema_migrations`; existing
+  installations receive `pipeline_id` and leader-lease tables without replaying
+  the initial schema.
+- Production timestamps are persisted in UTC.
+- Worker default maximum attempts now matches the documented value of three.
+- `core.NoRetry` now discards immediately after the first failed attempt.
+- Direct module dependencies are classified correctly by `go mod tidy`.
+- Minimum Go patch and affected transitive modules were raised to versions with
+  no reachable vulnerabilities reported by `govulncheck`.
+
+### Fixed
+- Worker metadata now propagates `CreatedAt` and `WorkerID` to handlers.
+- State-transition, fetch, rescue, cron election, and cron enqueue failures are
+  surfaced through configured error handlers.
+- Redis claiming is atomic and keeps JSON array/timestamp fields valid after Lua
+  transitions.
+- Firestore queue pause creates missing queue metadata.
+- Release tag input is validated before reaching the shell.
+
+### Removed
+- Configurable unique-state exclusions, which were never implemented consistently.
+  Terminal jobs never block a new unique insert on any driver.
+
+---
+
 ## [v0.15.0] — 2026-05-17
 
 ### Added

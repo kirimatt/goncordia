@@ -11,9 +11,10 @@ import (
 	_ "github.com/jackc/pgx/v5/stdlib"
 
 	"github.com/kirimatt/goncordia"
+	"github.com/kirimatt/goncordia/clock"
 	"github.com/kirimatt/goncordia/core"
+	"github.com/kirimatt/goncordia/driver/drivertest"
 	stdlibdriver "github.com/kirimatt/goncordia/driver/stdlib"
-	"github.com/kirimatt/goncordia/internal/clock"
 )
 
 func newPostgresDriver(t *testing.T, opts ...stdlibdriver.Option) *stdlibdriver.Driver {
@@ -27,7 +28,7 @@ func newPostgresDriver(t *testing.T, opts ...stdlibdriver.Option) *stdlibdriver.
 
 	// Drop and recreate tables for test isolation (shared container).
 	if _, err := db.ExecContext(ctx,
-		"DROP TABLE IF EXISTS goncordia_jobs; DROP TABLE IF EXISTS goncordia_queues",
+		"DROP TABLE IF EXISTS goncordia_jobs; DROP TABLE IF EXISTS goncordia_queues; DROP TABLE IF EXISTS goncordia_leaders; DROP TABLE IF EXISTS goncordia_schema_migrations",
 	); err != nil {
 		db.Close()
 		t.Fatalf("drop tables: %v", err)
@@ -44,6 +45,7 @@ func newPostgresDriver(t *testing.T, opts ...stdlibdriver.Option) *stdlibdriver.
 
 func TestStdlibPostgres_EnqueueAndProcess(t *testing.T) {
 	d := newPostgresDriver(t)
+	drivertest.Run(t, d.Executor())
 	ctx := context.Background()
 
 	var processed atomic.Int64

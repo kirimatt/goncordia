@@ -13,9 +13,10 @@ import (
 	tcredis "github.com/testcontainers/testcontainers-go/modules/redis"
 
 	"github.com/kirimatt/goncordia"
+	"github.com/kirimatt/goncordia/clock"
 	"github.com/kirimatt/goncordia/core"
+	"github.com/kirimatt/goncordia/driver/drivertest"
 	redisdriver "github.com/kirimatt/goncordia/driver/redis"
-	"github.com/kirimatt/goncordia/internal/clock"
 )
 
 var redisAddr string
@@ -71,6 +72,7 @@ func newDriver(t *testing.T, opts ...redisdriver.Option) (*redisdriver.Driver, *
 
 func TestRedis_EnqueueAndProcess(t *testing.T) {
 	d, _ := newDriver(t)
+	drivertest.Run(t, d.Executor())
 	ctx := context.Background()
 
 	var processed atomic.Int64

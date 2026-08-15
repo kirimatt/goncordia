@@ -36,9 +36,9 @@ import (
 	"cloud.google.com/go/firestore"
 
 	goncordia "github.com/kirimatt/goncordia"
+	"github.com/kirimatt/goncordia/clock"
 	"github.com/kirimatt/goncordia/core"
 	"github.com/kirimatt/goncordia/driver"
-	"github.com/kirimatt/goncordia/internal/clock"
 )
 
 const (

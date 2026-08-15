@@ -2,7 +2,6 @@ package mongodriver
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"time"
 
@@ -11,8 +10,8 @@ import (
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
 
+	"github.com/kirimatt/goncordia/clock"
 	"github.com/kirimatt/goncordia/driver"
-	"github.com/kirimatt/goncordia/internal/clock"
 )
 
 // ---- BSON document types ----
@@ -35,6 +34,7 @@ type jobDoc struct {
 	WorkerID    string             `bson:"worker_id,omitempty"`
 	Tags        []string           `bson:"tags"`
 	Errors      []attemptError     `bson:"errors"`
+	PipelineID  string             `bson:"pipeline_id,omitempty"`
 }
 
 type attemptError struct {
@@ -84,8 +84,17 @@ func (e *executor) JobInsertMany(ctx context.Context, params []driver.JobInsertP
 func (e *executor) JobGetByID(ctx context.Context, id string) (*driver.JobRow, error) {
 	return jobGetByID(ctx, e.db, id)
 }
+func (e *executor) JobList(ctx context.Context, params driver.JobListParams) ([]driver.JobRow, error) {
+	return jobList(ctx, e.db, params)
+}
+func (e *executor) QueueStats(ctx context.Context, queue string) (driver.QueueStats, error) {
+	return queueStats(ctx, e.db, queue)
+}
 func (e *executor) JobFetchBatch(ctx context.Context, params driver.FetchParams) ([]driver.JobRow, error) {
 	return jobFetchBatch(ctx, e.db, e.clk, params)
+}
+func (e *executor) JobRescueStuck(ctx context.Context, params driver.JobRescueParams) (int64, error) {
+	return jobRescueStuck(ctx, e.db, params)
 }
 func (e *executor) JobSetStateIfRunning(ctx context.Context, params driver.JobSetStateParams) error {
 	return jobSetStateIfRunning(ctx, e.db, e.clk, params)
@@ -204,18 +213,19 @@ func jobInsertMany(ctx context.Context, db *mongo.Database, clk clock.Clock, par
 		}
 
 		doc := jobDoc{
-			Queue:     p.Queue,
-			Kind:      p.Kind,
-			Args:      string(p.Args),
-			State:     string(state),
-			Priority:  p.Priority,
-			RunAt:     runAt,
-			CreatedAt: now,
-			MaxRetry:  p.MaxRetry,
-			TimeoutMs: p.Timeout.Milliseconds(),
-			UniqueKey: p.UniqueKey,
-			Tags:      p.Tags,
-			Errors:    []attemptError{},
+			Queue:      p.Queue,
+			Kind:       p.Kind,
+			Args:       string(p.Args),
+			State:      string(state),
+			Priority:   p.Priority,
+			RunAt:      runAt,
+			CreatedAt:  now,
+			MaxRetry:   p.MaxRetry,
+			TimeoutMs:  p.Timeout.Milliseconds(),
+			UniqueKey:  p.UniqueKey,
+			Tags:       p.Tags,
+			Errors:     []attemptError{},
+			PipelineID: p.PipelineID,
 		}
 		if doc.Tags == nil {
 			doc.Tags = []string{}
@@ -271,6 +281,71 @@ func jobGetByID(ctx context.Context, db *mongo.Database, id string) (*driver.Job
 	return row, nil
 }
 
+func jobList(ctx context.Context, db *mongo.Database, params driver.JobListParams) ([]driver.JobRow, error) {
+	filter := bson.M{}
+	if params.Queue != "" {
+		filter["queue"] = params.Queue
+	}
+	if params.State != "" {
+		filter["state"] = string(params.State)
+	}
+	if params.Kind != "" {
+		filter["kind"] = params.Kind
+	}
+	if params.Cursor != "" {
+		cursor, err := primitive.ObjectIDFromHex(params.Cursor)
+		if err != nil {
+			return nil, fmt.Errorf("invalid cursor %q: %w", params.Cursor, err)
+		}
+		filter["_id"] = bson.M{"$lt": cursor}
+	}
+	limit := params.Limit
+	if limit <= 0 || limit > 1000 {
+		limit = 100
+	}
+	cursor, err := db.Collection(jobsCollection).Find(ctx, filter,
+		options.Find().SetSort(bson.D{{Key: "created_at", Value: -1}, {Key: "_id", Value: -1}}).SetLimit(int64(limit)),
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer cursor.Close(ctx)
+	var docs []jobDoc
+	if err := cursor.All(ctx, &docs); err != nil {
+		return nil, err
+	}
+	rows := make([]driver.JobRow, 0, len(docs))
+	for _, doc := range docs {
+		rows = append(rows, *docToRow(doc))
+	}
+	return rows, nil
+}
+
+func queueStats(ctx context.Context, db *mongo.Database, queue string) (driver.QueueStats, error) {
+	pipeline := mongo.Pipeline{
+		{{Key: "$match", Value: bson.D{{Key: "queue", Value: queue}}}},
+		{{Key: "$group", Value: bson.D{{Key: "_id", Value: "$state"}, {Key: "count", Value: bson.D{{Key: "$sum", Value: 1}}}}}},
+	}
+	cursor, err := db.Collection(jobsCollection).Aggregate(ctx, pipeline)
+	if err != nil {
+		return driver.QueueStats{}, err
+	}
+	defer cursor.Close(ctx)
+	stats := driver.QueueStats{Queue: queue, States: make(map[driver.JobState]int64)}
+	for cursor.Next(ctx) {
+		var row struct {
+			State string `bson:"_id"`
+			Count int64  `bson:"count"`
+		}
+		if err := cursor.Decode(&row); err != nil {
+			return driver.QueueStats{}, err
+		}
+		stats.States[driver.JobState(row.State)] = row.Count
+		stats.Total += row.Count
+	}
+	return stats, cursor.Err()
+}
+
 func jobFetchBatch(ctx context.Context, db *mongo.Database, clk clock.Clock, params driver.FetchParams) ([]driver.JobRow, error) {
 	// Check if queue is paused.
 	var q queueDoc
@@ -291,6 +366,7 @@ func jobFetchBatch(ctx context.Context, db *mongo.Database, clk clock.Clock, par
 		"$set": bson.M{
 			"state":        string(driver.JobStateRunning),
 			"attempted_at": now,
+			"worker_id":    params.WorkerID,
 		},
 		"$inc": bson.M{"attempt_num": 1},
 	}
@@ -312,15 +388,45 @@ func jobFetchBatch(ctx context.Context, db *mongo.Database, clk clock.Clock, par
 	return rows, nil
 }
 
+func jobRescueStuck(ctx context.Context, db *mongo.Database, params driver.JobRescueParams) (int64, error) {
+	result, err := db.Collection(jobsCollection).UpdateMany(ctx,
+		bson.M{
+			"queue":        params.Queue,
+			"state":        string(driver.JobStateRunning),
+			"attempted_at": bson.M{"$lte": params.Before},
+		},
+		bson.M{
+			"$set":   bson.M{"state": string(driver.JobStateAvailable), "attempted_at": nil},
+			"$unset": bson.M{"worker_id": ""},
+		},
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.ModifiedCount, nil
+}
+
 func jobSetStateIfRunning(ctx context.Context, db *mongo.Database, clk clock.Clock, params driver.JobSetStateParams) error {
 	oid, err := primitive.ObjectIDFromHex(params.ID)
 	if err != nil {
 		return fmt.Errorf("invalid job id %q: %w", params.ID, err)
 	}
 
+	if params.Yield {
+		_, err = db.Collection(jobsCollection).UpdateOne(ctx,
+			bson.M{"_id": oid, "state": string(driver.JobStateRunning)},
+			bson.M{
+				"$set":   bson.M{"state": string(driver.JobStateAvailable), "attempted_at": nil},
+				"$inc":   bson.M{"attempt_num": -1},
+				"$unset": bson.M{"worker_id": ""},
+			},
+		)
+		return err
+	}
+
 	now := clk.Now()
 	set := bson.M{"state": string(params.State)}
-	unset := bson.M{}
+	unset := bson.M{"worker_id": ""}
 	push := bson.M{}
 
 	switch params.State {
@@ -337,7 +443,7 @@ func jobSetStateIfRunning(ctx context.Context, db *mongo.Database, clk clock.Clo
 	if params.Err != nil {
 		push["errors"] = attemptError{
 			At:      now,
-			Attempt: 0, // attempt_num is already incremented at fetch time
+			Attempt: params.Attempt,
 			Message: *params.Err,
 		}
 	}
@@ -546,10 +652,9 @@ func docToRow(doc jobDoc) *driver.JobRow {
 		MaxRetry:    doc.MaxRetry,
 		Timeout:     timeout,
 		UniqueKey:   doc.UniqueKey,
+		WorkerID:    doc.WorkerID,
 		Tags:        tags,
 		Errors:      errs,
+		PipelineID:  doc.PipelineID,
 	}
 }
-
-// marshalArgs converts job args to JSON for storage (no-op since already JSON).
-func marshalArgs(v interface{}) ([]byte, error) { return json.Marshal(v) }

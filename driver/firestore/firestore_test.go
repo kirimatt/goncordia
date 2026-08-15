@@ -15,6 +15,7 @@ import (
 
 	goncordia "github.com/kirimatt/goncordia"
 	"github.com/kirimatt/goncordia/core"
+	"github.com/kirimatt/goncordia/driver/drivertest"
 	firestoredriver "github.com/kirimatt/goncordia/driver/firestore"
 )
 
@@ -81,6 +82,7 @@ func TestFirestore_EnqueueAndProcess(t *testing.T) {
 
 	ctx := context.Background()
 	d := firestoredriver.New(client)
+	drivertest.Run(t, d.Executor())
 
 	registry := core.NewRegistry()
 	var processed atomic.Int64

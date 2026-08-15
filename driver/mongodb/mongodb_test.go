@@ -15,9 +15,10 @@ import (
 	"go.mongodb.org/mongo-driver/mongo/options"
 
 	"github.com/kirimatt/goncordia"
+	"github.com/kirimatt/goncordia/clock"
 	"github.com/kirimatt/goncordia/core"
+	"github.com/kirimatt/goncordia/driver/drivertest"
 	mongodriver "github.com/kirimatt/goncordia/driver/mongodb"
-	"github.com/kirimatt/goncordia/internal/clock"
 )
 
 var mongoURI string
@@ -85,6 +86,7 @@ func newDriver(t *testing.T, opts ...mongodriver.Option) (*mongodriver.Driver, *
 
 func TestMongo_EnqueueAndProcess(t *testing.T) {
 	d, _ := newDriver(t)
+	drivertest.Run(t, d.Executor())
 	ctx := context.Background()
 
 	var processed atomic.Int64

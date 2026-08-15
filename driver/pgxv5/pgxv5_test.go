@@ -14,9 +14,10 @@ import (
 	"github.com/testcontainers/testcontainers-go/wait"
 
 	"github.com/kirimatt/goncordia"
+	"github.com/kirimatt/goncordia/clock"
 	"github.com/kirimatt/goncordia/core"
+	"github.com/kirimatt/goncordia/driver/drivertest"
 	pgxdriver "github.com/kirimatt/goncordia/driver/pgxv5"
-	"github.com/kirimatt/goncordia/internal/clock"
 )
 
 // skipIfNoDocker skips the test if Docker is not available.
@@ -85,6 +86,7 @@ func TestPgxv5_EnqueueAndProcess(t *testing.T) {
 	if err := d.Migrate(ctx); err != nil {
 		t.Fatal(err)
 	}
+	drivertest.Run(t, d.Executor())
 
 	var processed atomic.Int64
 	registry := core.NewRegistry()

@@ -2,13 +2,18 @@ package goncordia
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"fmt"
+	"log/slog"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/kirimatt/goncordia/clock"
 	"github.com/kirimatt/goncordia/core"
 	"github.com/kirimatt/goncordia/driver"
-	"github.com/kirimatt/goncordia/internal/clock"
 )
 
 // JobMiddleware wraps job execution. Call next to continue the chain.
@@ -24,6 +29,8 @@ type WorkerConfig struct {
 	// Concurrency is the maximum number of jobs running simultaneously.
 	// Default: 10.
 	Concurrency int
+	// WorkerID identifies claims made by this pool. If empty, a random ID is generated.
+	WorkerID string
 	// PollInterval is how long to wait between polls when the queue is empty.
 	// Only used when the backend has no push notification support.
 	// Default: 1 second.
@@ -33,12 +40,20 @@ type WorkerConfig struct {
 	// ShutdownTimeout is the max duration to wait for in-flight jobs during shutdown.
 	// Default: 30 seconds.
 	ShutdownTimeout time.Duration
+	// StuckJobTimeout is the age after which an abandoned running job is made
+	// available again. Default: 1 hour. Set to a negative duration to disable.
+	StuckJobTimeout time.Duration
+	// RescueInterval controls how often abandoned jobs are checked. Default: 1 minute.
+	RescueInterval time.Duration
 	// Clock overrides the time source. Defaults to clock.Real{}.
 	// Inject clock.NewMock() in tests to control time.
 	Clock clock.Clock
 	// Middleware is applied around each job execution in order (outermost first).
 	// Use it to add tracing, logging, or metrics without modifying job handlers.
 	Middleware []JobMiddleware
+	// ErrorHandler receives asynchronous fetch, rescue, and state-transition errors.
+	// Default: slog.Error.
+	ErrorHandler func(error)
 }
 
 // WorkerPool processes jobs from the queue using a pool of goroutines.
@@ -54,6 +69,13 @@ type WorkerPool[TTx any] struct {
 	shutdownOnce   sync.Once
 	shutdownCh     chan struct{}
 	isShuttingDown atomic.Bool
+	started        atomic.Bool
+	queueCursor    atomic.Uint64
+	fetchMu        sync.Mutex
+	pipelineMu     sync.Mutex
+	pipelineTails  map[string]chan struct{}
+	kindSemMu      sync.Mutex
+	kindSemaphores map[string]chan struct{}
 }
 
 // NewWorkerPool creates a WorkerPool.
@@ -62,33 +84,74 @@ func NewWorkerPool[TTx any](d driver.Driver[TTx], registry *core.Registry, cfg W
 	if cfg.Concurrency <= 0 {
 		cfg.Concurrency = 10
 	}
+	if cfg.WorkerID == "" {
+		cfg.WorkerID = newWorkerID()
+	}
 	if cfg.PollInterval <= 0 {
 		cfg.PollInterval = time.Second
 	}
 	if cfg.ShutdownTimeout <= 0 {
 		cfg.ShutdownTimeout = 30 * time.Second
 	}
+	if cfg.StuckJobTimeout == 0 {
+		cfg.StuckJobTimeout = time.Hour
+	}
+	if cfg.RescueInterval <= 0 {
+		cfg.RescueInterval = time.Minute
+	}
 	if cfg.RetryPolicy == nil {
 		cfg.RetryPolicy = core.DefaultRetryPolicy
 	}
 	if len(cfg.Queues) == 0 {
 		cfg.Queues = []string{"default"}
+	} else {
+		seen := make(map[string]struct{}, len(cfg.Queues))
+		queues := make([]string, 0, len(cfg.Queues))
+		for _, queue := range cfg.Queues {
+			if queue == "" {
+				queue = "default"
+			}
+			if _, ok := seen[queue]; ok {
+				continue
+			}
+			seen[queue] = struct{}{}
+			queues = append(queues, queue)
+		}
+		cfg.Queues = queues
 	}
 	if cfg.Clock == nil {
 		cfg.Clock = clock.Real{}
 	}
+	if cfg.ErrorHandler == nil {
+		cfg.ErrorHandler = func(err error) { slog.Error("goncordia worker error", "error", err) }
+	}
 
 	return &WorkerPool[TTx]{
-		driver:     d,
-		registry:   registry,
-		config:     cfg,
-		sem:        make(chan struct{}, cfg.Concurrency),
-		shutdownCh: make(chan struct{}),
+		driver:         d,
+		registry:       registry,
+		config:         cfg,
+		sem:            make(chan struct{}, cfg.Concurrency),
+		shutdownCh:     make(chan struct{}),
+		pipelineTails:  make(map[string]chan struct{}),
+		kindSemaphores: make(map[string]chan struct{}),
 	}
 }
 
+func newWorkerID() string {
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return fmt.Sprintf("worker-%d", workerSequence.Add(1))
+	}
+	return "worker-" + hex.EncodeToString(b[:])
+}
+
+var workerSequence atomic.Uint64
+
 // Start launches the fetch-and-process loops. Blocks until ctx is cancelled or Stop is called.
 func (p *WorkerPool[TTx]) Start(ctx context.Context) error {
+	if !p.started.CompareAndSwap(false, true) {
+		return fmt.Errorf("worker pool already started")
+	}
 	if listener := p.driver.Listener(); listener != nil {
 		return p.runWithNotifications(ctx, listener)
 	}
@@ -98,8 +161,12 @@ func (p *WorkerPool[TTx]) Start(ctx context.Context) error {
 // Stop initiates a graceful shutdown, waiting up to ShutdownTimeout for in-flight jobs.
 func (p *WorkerPool[TTx]) Stop() {
 	p.shutdownOnce.Do(func() {
+		// Serialize shutdown with claiming so no goroutine can be added after
+		// Wait begins.
+		p.fetchMu.Lock()
 		p.isShuttingDown.Store(true)
 		close(p.shutdownCh)
+		p.fetchMu.Unlock()
 	})
 
 	done := make(chan struct{})
@@ -118,6 +185,20 @@ func (p *WorkerPool[TTx]) Stop() {
 func (p *WorkerPool[TTx]) runWithPolling(ctx context.Context) error {
 	ticker := p.config.Clock.NewTicker(p.config.PollInterval)
 	defer ticker.Stop()
+	p.fetchAndDispatch(ctx)
+	return p.runMainLoop(ctx, ticker.C())
+}
+
+func (p *WorkerPool[TTx]) runMainLoop(ctx context.Context, ticks <-chan time.Time) error {
+	var rescue <-chan time.Time
+	var rescueTicker clock.Ticker
+	if p.config.StuckJobTimeout > 0 {
+		if _, ok := p.driver.Executor().(driver.StuckJobRescuer); ok {
+			rescueTicker = p.config.Clock.NewTicker(p.config.RescueInterval)
+			defer rescueTicker.Stop()
+			rescue = rescueTicker.C()
+		}
+	}
 
 	for {
 		select {
@@ -126,8 +207,10 @@ func (p *WorkerPool[TTx]) runWithPolling(ctx context.Context) error {
 			return ctx.Err()
 		case <-p.shutdownCh:
 			return nil
-		case <-ticker.C:
+		case <-ticks:
 			p.fetchAndDispatch(ctx)
+		case <-rescue:
+			p.rescueStuck(ctx)
 		}
 	}
 }
@@ -137,12 +220,26 @@ func (p *WorkerPool[TTx]) runWithPolling(ctx context.Context) error {
 func (p *WorkerPool[TTx]) runWithNotifications(ctx context.Context, l driver.Listener) error {
 	fallbackTicker := p.config.Clock.NewTicker(p.config.PollInterval)
 	defer fallbackTicker.Stop()
+	var subscribed []string
+	defer func() {
+		cleanupCtx, cancel := clock.WithTimeout(context.Background(), p.config.Clock, 5*time.Second)
+		defer cancel()
+		for _, queue := range subscribed {
+			if err := l.Unlisten(cleanupCtx, queue); err != nil {
+				p.reportError(fmt.Errorf("unlisten queue %q: %w", queue, err))
+			}
+		}
+		if err := l.Close(); err != nil {
+			p.reportError(fmt.Errorf("close listener: %w", err))
+		}
+	}()
 
 	for _, q := range p.config.Queues {
 		ch, err := l.Listen(ctx, q)
 		if err != nil {
 			return err
 		}
+		subscribed = append(subscribed, q)
 		p.wg.Add(1)
 		go func(notifications <-chan driver.Notification) {
 			defer p.wg.Done()
@@ -161,22 +258,14 @@ func (p *WorkerPool[TTx]) runWithNotifications(ctx context.Context, l driver.Lis
 			}
 		}(ch)
 	}
-
-	for {
-		select {
-		case <-ctx.Done():
-			p.Stop()
-			return ctx.Err()
-		case <-p.shutdownCh:
-			return nil
-		case <-fallbackTicker.C:
-			p.fetchAndDispatch(ctx)
-		}
-	}
+	p.fetchAndDispatch(ctx)
+	return p.runMainLoop(ctx, fallbackTicker.C())
 }
 
 // fetchAndDispatch claims a batch of jobs and starts a goroutine per job.
 func (p *WorkerPool[TTx]) fetchAndDispatch(ctx context.Context) {
+	p.fetchMu.Lock()
+	defer p.fetchMu.Unlock()
 	if p.isShuttingDown.Load() {
 		return
 	}
@@ -188,26 +277,106 @@ func (p *WorkerPool[TTx]) fetchAndDispatch(ctx context.Context) {
 
 	exec := p.driver.Executor()
 
-	for _, queue := range p.config.Queues {
+	start := int(p.queueCursor.Add(1)-1) % len(p.config.Queues)
+	for offset := range len(p.config.Queues) {
+		queue := p.config.Queues[(start+offset)%len(p.config.Queues)]
 		rows, err := exec.JobFetchBatch(ctx, driver.FetchParams{
-			Queue: queue,
-			Limit: free,
+			Queue:    queue,
+			Limit:    free,
+			WorkerID: p.config.WorkerID,
 		})
-		if err != nil || len(rows) == 0 {
+		if err != nil {
+			p.reportError(fmt.Errorf("fetch queue %q: %w", queue, err))
 			continue
 		}
+		if len(rows) == 0 {
+			continue
+		}
+		sort.SliceStable(rows, func(i, j int) bool {
+			if rows[i].Priority != rows[j].Priority {
+				return rows[i].Priority > rows[j].Priority
+			}
+			if !rows[i].RunAt.Equal(rows[j].RunAt) {
+				return rows[i].RunAt.Before(rows[j].RunAt)
+			}
+			if !rows[i].CreatedAt.Equal(rows[j].CreatedAt) {
+				return rows[i].CreatedAt.Before(rows[j].CreatedAt)
+			}
+			return rows[i].ID < rows[j].ID
+		})
 
 		for i := range rows {
 			row := rows[i]
+			pipelineReady, pipelineDone := p.pipelineGate(row.PipelineID)
 			p.sem <- struct{}{}
 			p.wg.Add(1)
 			go func() {
 				defer p.wg.Done()
 				defer func() { <-p.sem }()
+				defer pipelineDone()
+				if pipelineReady != nil {
+					select {
+					case <-pipelineReady:
+					case <-ctx.Done():
+						p.setState(ctx, exec, driver.JobSetStateParams{ID: row.ID, Yield: true})
+						return
+					case <-p.shutdownCh:
+						p.setState(context.Background(), exec, driver.JobSetStateParams{ID: row.ID, Yield: true})
+						return
+					}
+				}
+				kindSem := p.kindSemaphore(row.Kind)
+				if kindSem != nil {
+					select {
+					case kindSem <- struct{}{}:
+						defer func() { <-kindSem }()
+					case <-ctx.Done():
+						p.setState(ctx, exec, driver.JobSetStateParams{ID: row.ID, Yield: true})
+						return
+					}
+				}
 				p.processRow(ctx, exec, row)
 			}()
 		}
+		free = cap(p.sem) - len(p.sem)
+		if free <= 0 {
+			return
+		}
 	}
+}
+
+func (p *WorkerPool[TTx]) pipelineGate(id string) (<-chan struct{}, func()) {
+	if id == "" {
+		return nil, func() {}
+	}
+	p.pipelineMu.Lock()
+	previous := p.pipelineTails[id]
+	done := make(chan struct{})
+	p.pipelineTails[id] = done
+	p.pipelineMu.Unlock()
+	return previous, func() {
+		close(done)
+		p.pipelineMu.Lock()
+		if p.pipelineTails[id] == done {
+			delete(p.pipelineTails, id)
+		}
+		p.pipelineMu.Unlock()
+	}
+}
+
+func (p *WorkerPool[TTx]) kindSemaphore(kind string) chan struct{} {
+	opts, ok := p.registry.Opts(kind)
+	if !ok || opts.Concurrency <= 0 {
+		return nil
+	}
+	p.kindSemMu.Lock()
+	defer p.kindSemMu.Unlock()
+	if sem := p.kindSemaphores[kind]; sem != nil {
+		return sem
+	}
+	sem := make(chan struct{}, opts.Concurrency)
+	p.kindSemaphores[kind] = sem
+	return sem
 }
 
 // processRow executes a single job, applies middleware, then updates its state.
@@ -220,7 +389,7 @@ func (p *WorkerPool[TTx]) processRow(ctx context.Context, exec driver.Executor, 
 		}
 	}
 	if maxRetry <= 0 {
-		maxRetry = 1 // bare minimum: at least one attempt
+		maxRetry = 3
 	}
 
 	raw := &core.RawJob{
@@ -230,7 +399,10 @@ func (p *WorkerPool[TTx]) processRow(ctx context.Context, exec driver.Executor, 
 		Args:       row.Args,
 		AttemptNum: row.AttemptNum,
 		MaxRetry:   maxRetry,
+		CreatedAt:  row.CreatedAt,
+		WorkerID:   row.WorkerID,
 		Tags:       row.Tags,
+		PipelineID: row.PipelineID,
 	}
 
 	// Innermost handler: runs the job with panic recovery so middleware always
@@ -259,10 +431,23 @@ func (p *WorkerPool[TTx]) processRow(ctx context.Context, exec driver.Executor, 
 		}
 	}
 
-	jobErr := handler(ctx, raw)
+	jobCtx := ctx
+	var cancel context.CancelFunc
+	timeout := row.Timeout
+	if timeout <= 0 {
+		if opts, ok := p.registry.Opts(row.Kind); ok {
+			timeout = opts.Timeout
+		}
+	}
+	if timeout > 0 {
+		jobCtx, cancel = clock.WithTimeout(ctx, p.config.Clock, timeout)
+		defer cancel()
+	}
+
+	jobErr := callHandler(jobCtx, raw, handler)
 
 	if jobErr == nil {
-		_ = exec.JobSetStateIfRunning(ctx, driver.JobSetStateParams{
+		p.setState(ctx, exec, driver.JobSetStateParams{
 			ID:    row.ID,
 			State: driver.JobStateCompleted,
 		})
@@ -272,21 +457,77 @@ func (p *WorkerPool[TTx]) processRow(ctx context.Context, exec driver.Executor, 
 	errStr := jobErr.Error()
 
 	if row.AttemptNum >= maxRetry {
-		_ = exec.JobSetStateIfRunning(ctx, driver.JobSetStateParams{
-			ID:    row.ID,
-			State: driver.JobStateDiscarded,
-			Err:   &errStr,
+		p.setState(ctx, exec, driver.JobSetStateParams{
+			ID:      row.ID,
+			State:   driver.JobStateDiscarded,
+			Err:     &errStr,
+			Attempt: row.AttemptNum,
 		})
 		return
 	}
 
 	retryAt := p.config.RetryPolicy.NextRetryAt(row.AttemptNum, jobErr, p.config.Clock)
-	_ = exec.JobSetStateIfRunning(ctx, driver.JobSetStateParams{
+	if retryAt.IsZero() {
+		p.setState(ctx, exec, driver.JobSetStateParams{
+			ID:      row.ID,
+			State:   driver.JobStateDiscarded,
+			Err:     &errStr,
+			Attempt: row.AttemptNum,
+		})
+		return
+	}
+	p.setState(ctx, exec, driver.JobSetStateParams{
 		ID:      row.ID,
 		State:   driver.JobStateRetryable,
 		Err:     &errStr,
+		Attempt: row.AttemptNum,
 		RetryAt: retryAt,
 	})
+}
+
+func callHandler(ctx context.Context, job *core.RawJob, handler func(context.Context, *core.RawJob) error) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			switch v := r.(type) {
+			case error:
+				err = v
+			default:
+				err = &panicError{val: v}
+			}
+		}
+	}()
+	return handler(ctx, job)
+}
+
+func (p *WorkerPool[TTx]) setState(ctx context.Context, exec driver.Executor, params driver.JobSetStateParams) {
+	stateCtx := ctx
+	var cancel context.CancelFunc
+	if ctx.Err() != nil {
+		stateCtx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+	}
+	if err := exec.JobSetStateIfRunning(stateCtx, params); err != nil {
+		p.reportError(fmt.Errorf("set state for job %s: %w", params.ID, err))
+	}
+}
+
+func (p *WorkerPool[TTx]) rescueStuck(ctx context.Context) {
+	rescuer, ok := p.driver.Executor().(driver.StuckJobRescuer)
+	if !ok {
+		return
+	}
+	before := p.config.Clock.Now().Add(-p.config.StuckJobTimeout)
+	for _, queue := range p.config.Queues {
+		if _, err := rescuer.JobRescueStuck(ctx, driver.JobRescueParams{Queue: queue, Before: before}); err != nil {
+			p.reportError(fmt.Errorf("rescue queue %q: %w", queue, err))
+		}
+	}
+}
+
+func (p *WorkerPool[TTx]) reportError(err error) {
+	if err != nil {
+		p.config.ErrorHandler(err)
+	}
 }
 
 type panicError struct{ val any }

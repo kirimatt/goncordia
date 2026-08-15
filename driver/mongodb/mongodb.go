@@ -25,9 +25,9 @@ import (
 	"go.mongodb.org/mongo-driver/mongo/options"
 
 	goncordia "github.com/kirimatt/goncordia"
+	"github.com/kirimatt/goncordia/clock"
 	"github.com/kirimatt/goncordia/core"
 	"github.com/kirimatt/goncordia/driver"
-	"github.com/kirimatt/goncordia/internal/clock"
 )
 
 const (
@@ -139,7 +139,7 @@ func (d *Driver) UnwrapTx(sc mongo.SessionContext) driver.ExecutorTx {
 	return &txExecutor{db: d.db, sc: sc, clk: d.clk}
 }
 
-func (d *Driver) Listener() driver.Listener { return nil }
+func (d *Driver) Listener() driver.Listener { return &listener{db: d.db} }
 func (d *Driver) Close() error              { return d.client.Disconnect(context.Background()) }
 
 // Client is a type alias so callers never write goncordia.Client[mongo.SessionContext].

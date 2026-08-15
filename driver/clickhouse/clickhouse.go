@@ -2,8 +2,8 @@
 //
 // # Transaction guarantees
 //
-// ClickHouse does not support transactions. EnqueueTx is identical to Enqueue —
-// there is NO atomicity between your business operations and job insertion.
+// ClickHouse does not support transactions. EnqueueTx is rejected; enqueue after
+// the business operation commits.
 //
 // # Job claiming semantics
 //
@@ -39,13 +39,13 @@ import (
 	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
 
 	goncordia "github.com/kirimatt/goncordia"
+	"github.com/kirimatt/goncordia/clock"
 	"github.com/kirimatt/goncordia/core"
 	gdriver "github.com/kirimatt/goncordia/driver"
-	"github.com/kirimatt/goncordia/internal/clock"
 )
 
 // NoTx is the transaction type for the ClickHouse driver.
-// ClickHouse has no transactions; EnqueueTx behaves like Enqueue.
+// ClickHouse has no transactions; EnqueueTx is rejected.
 type NoTx struct{}
 
 // Driver implements gdriver.Driver[NoTx] backed by ClickHouse.
@@ -93,7 +93,8 @@ func (d *Driver) Migrate(ctx context.Context) error {
 			worker_id    String,
 			tags         Array(String),
 			errors_json  String,
-			version      Int64
+			version      Int64,
+			pipeline_id  String
 		) ENGINE = ReplacingMergeTree(version)
 		ORDER BY (queue, id)
 		SETTINGS index_granularity = 8192`,
@@ -142,7 +143,7 @@ func (d *Driver) Executor() gdriver.Executor {
 	return &executor{conn: d.conn, clk: d.clk}
 }
 
-// UnwrapTx returns a non-transactional executor — ClickHouse has no transactions.
+// UnwrapTx exists to satisfy Driver; Client rejects EnqueueTx before calling it.
 func (d *Driver) UnwrapTx(_ NoTx) gdriver.ExecutorTx {
 	return &txExecutor{executor: executor{conn: d.conn, clk: d.clk}}
 }

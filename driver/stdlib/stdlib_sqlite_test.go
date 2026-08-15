@@ -11,9 +11,10 @@ import (
 	_ "modernc.org/sqlite"
 
 	"github.com/kirimatt/goncordia"
+	"github.com/kirimatt/goncordia/clock"
 	"github.com/kirimatt/goncordia/core"
+	"github.com/kirimatt/goncordia/driver/drivertest"
 	stdlibdriver "github.com/kirimatt/goncordia/driver/stdlib"
-	"github.com/kirimatt/goncordia/internal/clock"
 )
 
 func newSQLiteDriver(t *testing.T, opts ...stdlibdriver.Option) (*stdlibdriver.Driver, *sql.DB) {
@@ -32,6 +33,63 @@ func newSQLiteDriver(t *testing.T, opts ...stdlibdriver.Option) (*stdlibdriver.D
 	return d, db
 }
 
+func TestStdlibSQLite_MigratesExistingSchema(t *testing.T) {
+	db, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	// This is the complete pre-pipeline schema. Existing installations have no
+	// migration journal, so 001 must remain safe before 002 adds pipeline_id.
+	if _, err := db.Exec(`CREATE TABLE goncordia_jobs (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		queue TEXT NOT NULL,
+		kind TEXT NOT NULL,
+		args TEXT NOT NULL DEFAULT '{}',
+		state TEXT NOT NULL DEFAULT 'available',
+		priority INTEGER NOT NULL DEFAULT 0,
+		run_at DATETIME NOT NULL,
+		created_at DATETIME NOT NULL,
+		attempted_at DATETIME,
+		finalized_at DATETIME,
+		attempt_num INTEGER NOT NULL DEFAULT 0,
+		max_retry INTEGER NOT NULL DEFAULT 0,
+		timeout_ms INTEGER NOT NULL DEFAULT 0,
+		unique_key TEXT,
+		worker_id TEXT,
+		tags TEXT NOT NULL DEFAULT '[]',
+		errors TEXT NOT NULL DEFAULT '[]'
+	)`); err != nil {
+		t.Fatal(err)
+	}
+	d := stdlibdriver.New(db, stdlibdriver.SQLite)
+	if err := d.Migrate(context.Background()); err != nil {
+		t.Fatalf("first migrate: %v", err)
+	}
+	if err := d.Migrate(context.Background()); err != nil {
+		t.Fatalf("idempotent migrate: %v", err)
+	}
+	rows, err := db.Query(`PRAGMA table_info(goncordia_jobs)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var found bool
+	for rows.Next() {
+		var cid int
+		var name, typ string
+		var notNull, primaryKey int
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &defaultValue, &primaryKey); err != nil {
+			t.Fatal(err)
+		}
+		found = found || name == "pipeline_id"
+	}
+	if !found {
+		t.Fatal("pipeline_id was not added to existing schema")
+	}
+}
+
 type EmailJob struct {
 	To      string `json:"to"`
 	Subject string `json:"subject"`
@@ -41,6 +99,7 @@ func (EmailJob) Kind() string { return "email" }
 
 func TestStdlibSQLite_EnqueueAndProcess(t *testing.T) {
 	d, _ := newSQLiteDriver(t)
+	drivertest.Run(t, d.Executor())
 	ctx := context.Background()
 
 	var processed atomic.Int64

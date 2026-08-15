@@ -9,8 +9,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/kirimatt/goncordia/clock"
 	"github.com/kirimatt/goncordia/driver"
-	"github.com/kirimatt/goncordia/internal/clock"
 )
 
 // executor is the non-transactional executor (uses *sql.DB).
@@ -34,8 +34,17 @@ func (e *executor) JobInsertMany(ctx context.Context, params []driver.JobInsertP
 func (e *executor) JobGetByID(ctx context.Context, id string) (*driver.JobRow, error) {
 	return jobGetByID(ctx, e.db, e.dialect, id)
 }
+func (e *executor) JobList(ctx context.Context, params driver.JobListParams) ([]driver.JobRow, error) {
+	return jobList(ctx, e.db, e.dialect, params)
+}
+func (e *executor) QueueStats(ctx context.Context, queue string) (driver.QueueStats, error) {
+	return queueStats(ctx, e.db, e.dialect, queue)
+}
 func (e *executor) JobFetchBatch(ctx context.Context, params driver.FetchParams) ([]driver.JobRow, error) {
 	return jobFetchBatch(ctx, e.db, e.dialect, e.clk, params)
+}
+func (e *executor) JobRescueStuck(ctx context.Context, params driver.JobRescueParams) (int64, error) {
+	return jobRescueStuck(ctx, e.db, e.dialect, params)
 }
 func (e *executor) JobSetStateIfRunning(ctx context.Context, params driver.JobSetStateParams) error {
 	return jobSetStateIfRunning(ctx, e.db, e.dialect, e.clk, params)
@@ -62,7 +71,7 @@ func (e *executor) QueueList(ctx context.Context, params driver.QueueListParams)
 	return queueList(ctx, e.db, e.dialect, params)
 }
 func (e *executor) LeaderAttemptElect(ctx context.Context, params driver.LeaderElectParams) (bool, error) {
-	return leaderAttemptElect(ctx, e.db, e.dialect, params)
+	return leaderAttemptElect(ctx, e.db, e.dialect, e.clk, params)
 }
 func (e *executor) LeaderResign(ctx context.Context, name string) error {
 	return leaderResign(ctx, e.db, e.dialect, name)
@@ -79,14 +88,13 @@ func (t *txExecutor) Commit(ctx context.Context) error   { return t.tx.Commit() 
 func (t *txExecutor) Rollback(ctx context.Context) error { return t.tx.Rollback() }
 
 func (t *txExecutor) Begin(ctx context.Context) (driver.ExecutorTx, error) {
-	// database/sql doesn't support nested transactions natively — wrap in savepoint for Postgres
 	if t.dialect == Postgres {
 		if _, err := t.tx.ExecContext(ctx, "SAVEPOINT goncordia_sp"); err != nil {
 			return nil, err
 		}
 		return &savepointExecutor{txExecutor: t, ctx: ctx}, nil
 	}
-	return t, nil // MySQL/SQLite: reuse same tx (flat)
+	return t, nil
 }
 
 func (t *txExecutor) JobInsertMany(ctx context.Context, params []driver.JobInsertParams) ([]driver.JobInsertResult, error) {
@@ -123,7 +131,7 @@ func (t *txExecutor) QueueList(ctx context.Context, params driver.QueueListParam
 	return queueList(ctx, t.tx, t.dialect, params)
 }
 func (t *txExecutor) LeaderAttemptElect(ctx context.Context, params driver.LeaderElectParams) (bool, error) {
-	return leaderAttemptElect(ctx, t.tx, t.dialect, params)
+	return leaderAttemptElect(ctx, t.tx, t.dialect, t.clk, params)
 }
 func (t *txExecutor) LeaderResign(ctx context.Context, name string) error {
 	return leaderResign(ctx, t.tx, t.dialect, name)
@@ -144,12 +152,83 @@ func (s *savepointExecutor) Rollback(_ context.Context) error {
 	return err
 }
 
-// --- querier interface satisfied by *sql.DB and *sql.Tx ---
-
+// querier is satisfied by *sql.DB, *sql.Tx, and savepointExecutor.
 type querier interface {
 	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
 	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
 	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
+// --- static SQL ---
+
+const selectJobCols = `id, queue, kind, args, state, priority, run_at, created_at,
+    attempted_at, finalized_at, attempt_num, max_retry, timeout_ms,
+    unique_key, worker_id, tags, errors, pipeline_id`
+
+const insertJobCols = `queue, kind, args, state, priority, run_at, created_at,
+    max_retry, timeout_ms, unique_key, tags, errors, pipeline_id`
+
+const insertJobVals = `?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?`
+
+const sqlYield = `UPDATE goncordia_jobs
+SET state = 'available', attempted_at = NULL, worker_id = NULL, attempt_num = attempt_num - 1
+WHERE id = ? AND state = 'running'`
+
+// Postgres uses COALESCE + JSONB concat in one statement.
+const sqlSetStatePostgres = `UPDATE goncordia_jobs
+SET state        = $2,
+    worker_id    = NULL,
+    finalized_at = COALESCE($3, finalized_at),
+    run_at       = COALESCE($4, run_at),
+    errors       = CASE WHEN $5::jsonb IS NOT NULL THEN errors || $5::jsonb ELSE errors END
+WHERE id = $1 AND state = 'running'`
+
+// MySQL and SQLite share the same main-update SQL; error append differs.
+const sqlSetStateMain = `UPDATE goncordia_jobs
+SET state        = ?,
+    worker_id    = NULL,
+    finalized_at = COALESCE(?, finalized_at),
+    run_at       = COALESCE(?, run_at)
+WHERE id = ? AND state = 'running'`
+
+const sqlAppendErrorMySQL = `UPDATE goncordia_jobs
+SET errors = JSON_ARRAY_APPEND(errors, '$', CAST(? AS JSON))
+WHERE id = ? AND state = 'running'`
+
+const sqlAppendErrorSQLite = `UPDATE goncordia_jobs
+SET errors = json_insert(errors, '$[#]', json(?))
+WHERE id = ? AND state = 'running'`
+
+const sqlJobCancel = `UPDATE goncordia_jobs
+SET state = 'cancelled', finalized_at = ?, unique_key = NULL
+WHERE id = ? AND state IN ('available', 'scheduled')`
+
+const sqlJobDelete = `DELETE FROM goncordia_jobs WHERE id = ?`
+
+const sqlJobReschedule = `UPDATE goncordia_jobs SET state = 'scheduled', run_at = ? WHERE id = ?`
+
+const sqlQueueGet = `SELECT name, paused, created_at, updated_at FROM goncordia_queues WHERE name = ?`
+
+const sqlQueueList = `SELECT name, paused, created_at, updated_at FROM goncordia_queues ORDER BY name LIMIT ?`
+
+const sqlQueueUpsertPostgres = `INSERT INTO goncordia_queues (name, paused, created_at, updated_at)
+VALUES ($1, $2, $3, $3)
+ON CONFLICT (name) DO UPDATE SET paused = EXCLUDED.paused, updated_at = EXCLUDED.updated_at`
+
+const sqlQueueUpsertMySQL = `INSERT INTO goncordia_queues (name, paused, created_at, updated_at)
+VALUES (?, ?, ?, ?)
+ON DUPLICATE KEY UPDATE paused = VALUES(paused), updated_at = VALUES(updated_at)`
+
+const sqlQueueUpsertSQLite = `INSERT INTO goncordia_queues (name, paused, created_at, updated_at)
+VALUES (?, ?, ?, ?)
+ON CONFLICT(name) DO UPDATE SET paused = excluded.paused, updated_at = excluded.updated_at`
+
+// repeatIN builds a comma-separated list of count ? placeholders for IN clauses.
+func repeatIN(count int) string {
+	if count == 1 {
+		return "?"
+	}
+	return "?" + strings.Repeat(", ?", count-1)
 }
 
 // --- SQL implementations ---
@@ -178,7 +257,6 @@ func jobInsertMany(ctx context.Context, q querier, d Dialect, clk clock.Clock, p
 			uniqueKey = &p.UniqueKey
 		}
 
-		// Check for existing unique job
 		if uniqueKey != nil {
 			existing, err := findUniqueJob(ctx, q, d, p.Queue, *uniqueKey)
 			if err != nil {
@@ -195,8 +273,8 @@ func jobInsertMany(ctx context.Context, q querier, d Dialect, clk clock.Clock, p
 			args = []byte("{}")
 		}
 
-		// pgx/v5/stdlib sends []byte as bytea, not jsonb — pass JSON columns as string for Postgres.
-		var argsArg, tagsArg, errorsArg interface{}
+		// database/sql sends []byte as bytea for Postgres jsonb — pass as string instead.
+		var argsArg, tagsArg, errorsArg any
 		if d == Postgres {
 			argsArg = string(args)
 			tagsArg = string(tagsJSON)
@@ -210,7 +288,7 @@ func jobInsertMany(ctx context.Context, q querier, d Dialect, clk clock.Clock, p
 		sqlArgs := []any{
 			p.Queue, p.Kind, argsArg, string(state), p.Priority,
 			runAt, now, p.MaxRetry, p.Timeout.Milliseconds(),
-			uniqueKey, tagsArg, errorsArg,
+			uniqueKey, tagsArg, errorsArg, p.PipelineID,
 		}
 
 		var (
@@ -218,29 +296,23 @@ func jobInsertMany(ctx context.Context, q querier, d Dialect, clk clock.Clock, p
 			rowErr error
 		)
 		if d == Postgres {
-			// Postgres: LastInsertId unsupported; use RETURNING.
-			insertSQL := fmt.Sprintf(`
-INSERT INTO goncordia_jobs
-    (queue, kind, args, state, priority, run_at, created_at, max_retry, timeout_ms, unique_key, tags, errors)
-VALUES (%s)
-RETURNING id`, d.placeholders(12, 1))
+			insertSQL := d.q(`INSERT INTO goncordia_jobs (` + insertJobCols + `)
+VALUES (` + insertJobVals + `)
+RETURNING id`)
 			var insertedID string
-			if scanErr := q.QueryRowContext(ctx, insertSQL, sqlArgs...).Scan(&insertedID); scanErr != nil {
-				return nil, fmt.Errorf("insert job: %w", scanErr)
+			if err := q.QueryRowContext(ctx, insertSQL, sqlArgs...).Scan(&insertedID); err != nil {
+				return nil, fmt.Errorf("insert job: %w", err)
 			}
 			row, rowErr = jobGetByID(ctx, q, d, insertedID)
 		} else {
-			insertSQL := fmt.Sprintf(`
-INSERT INTO goncordia_jobs
-    (queue, kind, args, state, priority, run_at, created_at, max_retry, timeout_ms, unique_key, tags, errors)
-VALUES (%s)`, d.placeholders(12, 1))
-			res, execErr := q.ExecContext(ctx, insertSQL, sqlArgs...)
-			if execErr != nil {
-				return nil, fmt.Errorf("insert job: %w", execErr)
+			insertSQL := `INSERT INTO goncordia_jobs (` + insertJobCols + `) VALUES (` + insertJobVals + `)`
+			res, err := q.ExecContext(ctx, insertSQL, sqlArgs...)
+			if err != nil {
+				return nil, fmt.Errorf("insert job: %w", err)
 			}
-			id, idErr := res.LastInsertId()
-			if idErr != nil {
-				return nil, fmt.Errorf("get last insert id: %w", idErr)
+			id, err := res.LastInsertId()
+			if err != nil {
+				return nil, fmt.Errorf("get last insert id: %w", err)
 			}
 			row, rowErr = jobGetByID(ctx, q, d, strconv.FormatInt(id, 10))
 		}
@@ -253,16 +325,11 @@ VALUES (%s)`, d.placeholders(12, 1))
 }
 
 func findUniqueJob(ctx context.Context, q querier, d Dialect, queue, uniqueKey string) (*driver.JobRow, error) {
-	query := fmt.Sprintf(`
-SELECT id, queue, kind, args, state, priority, run_at, created_at,
-       attempted_at, finalized_at, attempt_num, max_retry, timeout_ms,
-       unique_key, worker_id, tags, errors
-FROM goncordia_jobs
-WHERE queue = %s AND unique_key = %s
+	query := d.q(`SELECT ` + selectJobCols + ` FROM goncordia_jobs
+WHERE queue = ? AND unique_key = ?
   AND state IN ('available', 'running', 'scheduled', 'retryable')
-LIMIT 1`, d.placeholder(1), d.placeholder(2))
-	row := q.QueryRowContext(ctx, query, queue, uniqueKey)
-	j, err := scanJobRow(d, row)
+LIMIT 1`)
+	j, err := scanJobRow(d, q.QueryRowContext(ctx, query, queue, uniqueKey))
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -270,13 +337,60 @@ LIMIT 1`, d.placeholder(1), d.placeholder(2))
 }
 
 func jobGetByID(ctx context.Context, q querier, d Dialect, id string) (*driver.JobRow, error) {
-	query := fmt.Sprintf(`
-SELECT id, queue, kind, args, state, priority, run_at, created_at,
-       attempted_at, finalized_at, attempt_num, max_retry, timeout_ms,
-       unique_key, worker_id, tags, errors
-FROM goncordia_jobs WHERE id = %s`, d.placeholder(1))
-	row := q.QueryRowContext(ctx, query, id)
-	return scanJobRow(d, row)
+	query := d.q(`SELECT ` + selectJobCols + ` FROM goncordia_jobs WHERE id = ?`)
+	return scanJobRow(d, q.QueryRowContext(ctx, query, id))
+}
+
+func jobList(ctx context.Context, q querier, d Dialect, params driver.JobListParams) ([]driver.JobRow, error) {
+	query := `SELECT ` + selectJobCols + ` FROM goncordia_jobs WHERE 1=1`
+	args := make([]any, 0, 5)
+	if params.Queue != "" {
+		query += ` AND queue=?`
+		args = append(args, params.Queue)
+	}
+	if params.State != "" {
+		query += ` AND state=?`
+		args = append(args, string(params.State))
+	}
+	if params.Kind != "" {
+		query += ` AND kind=?`
+		args = append(args, params.Kind)
+	}
+	if params.Cursor != "" {
+		query += ` AND id<?`
+		args = append(args, params.Cursor)
+	}
+	limit := params.Limit
+	if limit <= 0 || limit > 1000 {
+		limit = 100
+	}
+	query += ` ORDER BY created_at DESC, id DESC LIMIT ?`
+	args = append(args, limit)
+	rows, err := q.QueryContext(ctx, d.q(query), args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanJobRows(d, rows)
+}
+
+func queueStats(ctx context.Context, q querier, d Dialect, queue string) (driver.QueueStats, error) {
+	rows, err := q.QueryContext(ctx, d.q(`SELECT state, COUNT(*) FROM goncordia_jobs WHERE queue=? GROUP BY state`), queue)
+	if err != nil {
+		return driver.QueueStats{}, err
+	}
+	defer rows.Close()
+	stats := driver.QueueStats{Queue: queue, States: make(map[driver.JobState]int64)}
+	for rows.Next() {
+		var state driver.JobState
+		var count int64
+		if err := rows.Scan(&state, &count); err != nil {
+			return driver.QueueStats{}, err
+		}
+		stats.States[state] = count
+		stats.Total += count
+	}
+	return stats, rows.Err()
 }
 
 func jobFetchBatch(ctx context.Context, q querier, d Dialect, clk clock.Clock, params driver.FetchParams) ([]driver.JobRow, error) {
@@ -284,119 +398,105 @@ func jobFetchBatch(ctx context.Context, q querier, d Dialect, clk clock.Clock, p
 		params.Limit = 1
 	}
 	now := clk.Now()
-
 	if d.supportsSkipLocked() {
 		return jobFetchSkipLocked(ctx, q, d, now, params)
 	}
 	return jobFetchSQLite(ctx, q, d, now, params)
 }
 
+func jobRescueStuck(ctx context.Context, q querier, d Dialect, params driver.JobRescueParams) (int64, error) {
+	query := `UPDATE goncordia_jobs
+SET state = 'available', attempted_at = NULL, worker_id = NULL
+WHERE queue = ? AND state = 'running' AND attempted_at <= ?`
+	result, err := q.ExecContext(ctx, d.q(query), params.Queue, params.Before)
+	if err != nil {
+		return 0, fmt.Errorf("rescue stuck jobs: %w", err)
+	}
+	return result.RowsAffected()
+}
+
 func jobFetchSkipLocked(ctx context.Context, q querier, d Dialect, now time.Time, params driver.FetchParams) ([]driver.JobRow, error) {
-	// Step 1: select IDs with SKIP LOCKED
-	selectSQL := fmt.Sprintf(`
-SELECT id FROM goncordia_jobs
-WHERE queue = %s
+	selectSQL := d.q(`SELECT id FROM goncordia_jobs
+WHERE queue = ?
   AND state IN ('available', 'scheduled')
-  AND run_at <= %s
+  AND run_at <= ?
 ORDER BY priority DESC, run_at
-LIMIT %s
-FOR UPDATE SKIP LOCKED`,
-		d.placeholder(1), d.placeholder(2), d.placeholder(3),
-	)
+LIMIT ?
+FOR UPDATE SKIP LOCKED`)
 	rows, err := q.QueryContext(ctx, selectSQL, params.Queue, now, params.Limit)
 	if err != nil {
 		return nil, fmt.Errorf("fetch ids: %w", err)
 	}
-	var ids []int64
-	for rows.Next() {
-		var id int64
-		if err := rows.Scan(&id); err != nil {
-			rows.Close()
-			return nil, err
-		}
-		ids = append(ids, id)
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	if len(ids) == 0 {
-		return nil, nil
-	}
-
-	return claimJobs(ctx, q, d, now, ids, params.WorkerID)
-}
-
-// jobFetchSQLite uses a transaction-safe approach for SQLite (no SKIP LOCKED).
-// Works because SQLite serializes writes; reads from the same connection see the same view.
-func jobFetchSQLite(ctx context.Context, q querier, d Dialect, now time.Time, params driver.FetchParams) ([]driver.JobRow, error) {
-	selectSQL := fmt.Sprintf(`
-SELECT id FROM goncordia_jobs
-WHERE queue = %s
-  AND state IN ('available', 'scheduled')
-  AND run_at <= %s
-ORDER BY priority DESC, run_at
-LIMIT %s`,
-		d.placeholder(1), d.placeholder(2), d.placeholder(3),
-	)
-	rows, err := q.QueryContext(ctx, selectSQL, params.Queue, now, params.Limit)
+	ids, err := scanIDs(rows)
 	if err != nil {
 		return nil, err
 	}
-	var ids []int64
-	for rows.Next() {
-		var id int64
-		if err := rows.Scan(&id); err != nil {
-			rows.Close()
-			return nil, err
-		}
-		ids = append(ids, id)
+	if len(ids) == 0 {
+		return nil, nil
 	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
+	return claimJobs(ctx, q, d, now, ids, params.WorkerID)
+}
+
+func jobFetchSQLite(ctx context.Context, q querier, d Dialect, now time.Time, params driver.FetchParams) ([]driver.JobRow, error) {
+	rows, err := q.QueryContext(ctx,
+		`SELECT id FROM goncordia_jobs
+WHERE queue = ?
+  AND state IN ('available', 'scheduled')
+  AND run_at <= ?
+ORDER BY priority DESC, run_at
+LIMIT ?`,
+		params.Queue, now, params.Limit)
+	if err != nil {
+		return nil, err
+	}
+	ids, err := scanIDs(rows)
+	if err != nil {
 		return nil, err
 	}
 	if len(ids) == 0 {
 		return nil, nil
 	}
-
 	return claimJobs(ctx, q, d, now, ids, params.WorkerID)
 }
 
-func claimJobs(ctx context.Context, q querier, d Dialect, now time.Time, ids []int64, workerID string) ([]driver.JobRow, error) {
-	placeholderList := make([]string, len(ids))
-	args := make([]any, 0, 3+len(ids))
-	args = append(args, "running", now, workerID)
-	for i, id := range ids {
-		placeholderList[i] = d.placeholder(i + 4)
-		args = append(args, id)
+func scanIDs(rows *sql.Rows) ([]int64, error) {
+	defer rows.Close()
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
 	}
-	updateSQL := fmt.Sprintf(`
-UPDATE goncordia_jobs
-SET state = %s, attempted_at = %s, attempt_num = attempt_num + 1, worker_id = %s
-WHERE id IN (%s)`,
-		d.placeholder(1), d.placeholder(2), d.placeholder(3),
-		strings.Join(placeholderList, ", "),
-	)
-	if _, err := q.ExecContext(ctx, updateSQL, args...); err != nil {
+	return ids, rows.Err()
+}
+
+func claimJobs(ctx context.Context, q querier, d Dialect, now time.Time, ids []int64, workerID string) ([]driver.JobRow, error) {
+	inList := repeatIN(len(ids))
+
+	updateArgs := make([]any, 0, 3+len(ids))
+	updateArgs = append(updateArgs, "running", now, workerID)
+	for _, id := range ids {
+		updateArgs = append(updateArgs, id)
+	}
+	if _, err := q.ExecContext(ctx,
+		d.q(`UPDATE goncordia_jobs
+SET state = ?, attempted_at = ?, attempt_num = attempt_num + 1, worker_id = ?
+WHERE id IN (`+inList+`)`),
+		updateArgs...,
+	); err != nil {
 		return nil, fmt.Errorf("claim jobs: %w", err)
 	}
 
-	// Fetch the claimed rows
 	selectArgs := make([]any, len(ids))
-	idPlaceholders := make([]string, len(ids))
 	for i, id := range ids {
 		selectArgs[i] = id
-		idPlaceholders[i] = d.placeholder(i + 1)
 	}
-	selectSQL := fmt.Sprintf(`
-SELECT id, queue, kind, args, state, priority, run_at, created_at,
-       attempted_at, finalized_at, attempt_num, max_retry, timeout_ms,
-       unique_key, worker_id, tags, errors
-FROM goncordia_jobs WHERE id IN (%s)`,
-		strings.Join(idPlaceholders, ", "),
+	rows, err := q.QueryContext(ctx,
+		d.q(`SELECT `+selectJobCols+` FROM goncordia_jobs WHERE id IN (`+inList+`)`),
+		selectArgs...,
 	)
-	rows, err := q.QueryContext(ctx, selectSQL, selectArgs...)
 	if err != nil {
 		return nil, err
 	}
@@ -405,6 +505,11 @@ FROM goncordia_jobs WHERE id IN (%s)`,
 }
 
 func jobSetStateIfRunning(ctx context.Context, q querier, d Dialect, clk clock.Clock, params driver.JobSetStateParams) error {
+	if params.Yield {
+		_, err := q.ExecContext(ctx, d.q(sqlYield), params.ID)
+		return err
+	}
+
 	var finalizedAt *time.Time
 	switch params.State {
 	case driver.JobStateCompleted, driver.JobStateDiscarded, driver.JobStateCancelled:
@@ -414,165 +519,80 @@ func jobSetStateIfRunning(ctx context.Context, q querier, d Dialect, clk clock.C
 
 	targetState := string(params.State)
 	var retryAt *time.Time
-	if params.State == driver.JobStateRetryable && !params.RetryAt.IsZero() {
+	if params.State == driver.JobStateRetryable {
 		targetState = string(driver.JobStateAvailable)
-		retryAt = &params.RetryAt
+		if !params.RetryAt.IsZero() {
+			retryAt = &params.RetryAt
+		}
 	}
 
-	var entryJSON []byte // single AttemptError encoded as JSON object
+	var errJSON *string
 	if params.Err != nil {
-		entry := driver.AttemptError{At: clk.Now(), Error: *params.Err}
-		entryJSON, _ = json.Marshal(entry)
+		entry := driver.AttemptError{At: clk.Now(), Attempt: params.Attempt, Error: *params.Err}
+		b, _ := json.Marshal(entry)
+		s := string(b)
+		if d == Postgres {
+			s = "[" + s + "]"
+		}
+		errJSON = &s
 	}
 
-	switch d {
-	case SQLite:
-		return jobSetStateIfRunningSQLite(ctx, q, d, params.ID, targetState, finalizedAt, retryAt, entryJSON)
-	case MySQL:
-		return jobSetStateIfRunningMySQL(ctx, q, params.ID, targetState, finalizedAt, retryAt, entryJSON)
-	default: // Postgres: JSONB concat via ||, cast string to jsonb
-		return jobSetStateIfRunningPostgres(ctx, q, params.ID, targetState, finalizedAt, retryAt, entryJSON)
+	if d == Postgres {
+		_, err := q.ExecContext(ctx, sqlSetStatePostgres, params.ID, targetState, finalizedAt, retryAt, errJSON)
+		return err
 	}
-}
 
-func jobSetStateIfRunningPostgres(ctx context.Context, q querier, id, targetState string, finalizedAt, retryAt *time.Time, entryJSON []byte) error {
-	// Build SET clauses dynamically to avoid CASE IS NOT NULL with pointer params
-	// (pgx prepared statement type inference can be unreliable for nullable timestamps).
-	setClauses := []string{"state = $1"}
-	args := []any{targetState}
-	n := 2
-
-	if finalizedAt != nil {
-		setClauses = append(setClauses, fmt.Sprintf("finalized_at = $%d", n))
-		args = append(args, *finalizedAt)
-		n++
-	}
-	if retryAt != nil {
-		setClauses = append(setClauses, fmt.Sprintf("run_at = $%d", n))
-		args = append(args, *retryAt)
-		n++
-	}
-	if entryJSON != nil {
-		setClauses = append(setClauses, fmt.Sprintf("errors = errors || $%d::jsonb", n))
-		args = append(args, "["+string(entryJSON)+"]")
-		n++
-	}
-	args = append(args, id)
-
-	_, err := q.ExecContext(ctx, fmt.Sprintf(
-		"UPDATE goncordia_jobs SET %s WHERE id = $%d AND state = 'running'",
-		strings.Join(setClauses, ", "), n,
-	), args...)
-	return err
-}
-
-func jobSetStateIfRunningMySQL(ctx context.Context, q querier, id, targetState string, finalizedAt, retryAt *time.Time, entryJSON []byte) error {
-	if entryJSON != nil {
-		// Append the new error entry to the JSON array first.
-		if _, err := q.ExecContext(ctx,
-			`UPDATE goncordia_jobs SET errors = JSON_ARRAY_APPEND(errors, '$', CAST(? AS JSON)) WHERE id = ? AND state = 'running'`,
-			string(entryJSON), id,
-		); err != nil {
+	if errJSON != nil {
+		appendSQL := sqlAppendErrorSQLite
+		if d == MySQL {
+			appendSQL = sqlAppendErrorMySQL
+		}
+		if _, err := q.ExecContext(ctx, appendSQL, *errJSON, params.ID); err != nil {
 			return err
 		}
 	}
-	_, err := q.ExecContext(ctx, `
-UPDATE goncordia_jobs
-SET state        = ?,
-    finalized_at = CASE WHEN ? IS NOT NULL THEN ? ELSE finalized_at END,
-    run_at       = CASE WHEN ? IS NOT NULL THEN ? ELSE run_at END
-WHERE id = ? AND state = 'running'`,
-		targetState,
-		finalizedAt, finalizedAt,
-		retryAt, retryAt,
-		id,
-	)
-	return err
-}
-
-func jobSetStateIfRunningSQLite(ctx context.Context, q querier, d Dialect, id, targetState string, finalizedAt, retryAt *time.Time, entryJSON []byte) error {
-	if entryJSON != nil {
-		if _, err := q.ExecContext(ctx,
-			fmt.Sprintf(`UPDATE goncordia_jobs SET errors = json_insert(errors, '$[#]', json(%s)) WHERE id = %s AND state = 'running'`,
-				d.placeholder(1), d.placeholder(2)),
-			string(entryJSON), id,
-		); err != nil {
-			return err
-		}
+	if _, err := q.ExecContext(ctx, sqlSetStateMain, targetState, finalizedAt, retryAt, params.ID); err != nil {
+		return err
 	}
-	_, err := q.ExecContext(ctx, fmt.Sprintf(`
-UPDATE goncordia_jobs
-SET state        = %s,
-    finalized_at = CASE WHEN %s IS NOT NULL THEN %s ELSE finalized_at END,
-    run_at       = CASE WHEN %s IS NOT NULL THEN %s ELSE run_at END
-WHERE id = %s AND state = 'running'`,
-		d.placeholder(1),
-		d.placeholder(2), d.placeholder(3),
-		d.placeholder(4), d.placeholder(5),
-		d.placeholder(6),
-	),
-		targetState,
-		finalizedAt, finalizedAt,
-		retryAt, retryAt,
-		id,
-	)
-	return err
+	if d == MySQL && (params.State == driver.JobStateCompleted || params.State == driver.JobStateDiscarded || params.State == driver.JobStateCancelled) {
+		_, err := q.ExecContext(ctx, `UPDATE goncordia_jobs SET unique_key=NULL WHERE id=?`, params.ID)
+		return err
+	}
+	return nil
 }
 
 func jobCancel(ctx context.Context, q querier, d Dialect, clk clock.Clock, id string) error {
-	updateSQL := fmt.Sprintf(`
-UPDATE goncordia_jobs SET state = 'cancelled', finalized_at = %s
-WHERE id = %s AND state IN ('available', 'scheduled')`,
-		d.placeholder(1), d.placeholder(2),
-	)
-	_, err := q.ExecContext(ctx, updateSQL, clk.Now(), id)
+	_, err := q.ExecContext(ctx, d.q(sqlJobCancel), clk.Now(), id)
 	return err
 }
 
 func jobDelete(ctx context.Context, q querier, d Dialect, id string) error {
-	_, err := q.ExecContext(ctx, fmt.Sprintf(`DELETE FROM goncordia_jobs WHERE id = %s`, d.placeholder(1)), id)
+	_, err := q.ExecContext(ctx, d.q(sqlJobDelete), id)
 	return err
 }
 
 func jobReschedule(ctx context.Context, q querier, d Dialect, params driver.RescheduleParams) error {
-	updateSQL := fmt.Sprintf(`UPDATE goncordia_jobs SET state = 'scheduled', run_at = %s WHERE id = %s`,
-		d.placeholder(1), d.placeholder(2),
-	)
-	_, err := q.ExecContext(ctx, updateSQL, params.RunAt, params.ID)
+	_, err := q.ExecContext(ctx, d.q(sqlJobReschedule), params.RunAt, params.ID)
 	return err
 }
 
 func queueGet(ctx context.Context, q querier, d Dialect, name string) (*driver.QueueRow, error) {
-	query := fmt.Sprintf(`SELECT name, paused, created_at, updated_at FROM goncordia_queues WHERE name = %s`, d.placeholder(1))
-	row := q.QueryRowContext(ctx, query, name)
-	return scanQueueRow(row)
+	return scanQueueRow(q.QueryRowContext(ctx, d.q(sqlQueueGet), name))
 }
 
 func queueSetPaused(ctx context.Context, q querier, d Dialect, clk clock.Clock, name string, paused bool) error {
-	var query string
-	switch d {
-	case MySQL:
-		query = fmt.Sprintf(`
-INSERT INTO goncordia_queues (name, paused, created_at, updated_at) VALUES (%s, %s, %s, %s)
-ON DUPLICATE KEY UPDATE paused = VALUES(paused), updated_at = VALUES(updated_at)`,
-			d.placeholder(1), d.placeholder(2), d.placeholder(3), d.placeholder(4),
-		)
-	case SQLite:
-		query = fmt.Sprintf(`
-INSERT INTO goncordia_queues (name, paused, created_at, updated_at) VALUES (%s, %s, %s, %s)
-ON CONFLICT(name) DO UPDATE SET paused = excluded.paused, updated_at = excluded.updated_at`,
-			d.placeholder(1), d.placeholder(2), d.placeholder(3), d.placeholder(4),
-		)
-	default: // Postgres
-		query = fmt.Sprintf(`
-INSERT INTO goncordia_queues (name, paused, created_at, updated_at) VALUES (%s, %s, %s, %s)
-ON CONFLICT (name) DO UPDATE SET paused = EXCLUDED.paused, updated_at = EXCLUDED.updated_at`,
-			d.placeholder(1), d.placeholder(2), d.placeholder(3), d.placeholder(4),
-		)
-	}
 	now := clk.Now()
-	_, err := q.ExecContext(ctx, query, name, paused, now, now)
-	return err
+	switch d {
+	case Postgres:
+		_, err := q.ExecContext(ctx, sqlQueueUpsertPostgres, name, paused, now)
+		return err
+	case MySQL:
+		_, err := q.ExecContext(ctx, sqlQueueUpsertMySQL, name, paused, now, now)
+		return err
+	default:
+		_, err := q.ExecContext(ctx, sqlQueueUpsertSQLite, name, paused, now, now)
+		return err
+	}
 }
 
 func queueList(ctx context.Context, q querier, d Dialect, params driver.QueueListParams) ([]*driver.QueueRow, error) {
@@ -580,8 +600,7 @@ func queueList(ctx context.Context, q querier, d Dialect, params driver.QueueLis
 	if limit <= 0 {
 		limit = 100
 	}
-	query := fmt.Sprintf(`SELECT name, paused, created_at, updated_at FROM goncordia_queues ORDER BY name LIMIT %s`, d.placeholder(1))
-	rows, err := q.QueryContext(ctx, query, limit)
+	rows, err := q.QueryContext(ctx, d.q(sqlQueueList), limit)
 	if err != nil {
 		return nil, err
 	}
@@ -597,21 +616,33 @@ func queueList(ctx context.Context, q querier, d Dialect, params driver.QueueLis
 	return result, rows.Err()
 }
 
-func leaderAttemptElect(ctx context.Context, q querier, d Dialect, params driver.LeaderElectParams) (bool, error) {
-	if d == Postgres {
-		var elected bool
-		err := q.QueryRowContext(ctx, fmt.Sprintf(`SELECT pg_try_advisory_lock(hashtext(%s))`, d.placeholder(1)), params.Name).Scan(&elected)
-		return elected, err
+func leaderAttemptElect(ctx context.Context, q querier, d Dialect, clk clock.Clock, params driver.LeaderElectParams) (bool, error) {
+	now := clk.Now()
+	expiresAt := now.Add(params.TTL)
+	result, err := q.ExecContext(ctx, d.q(`UPDATE goncordia_leaders
+SET worker_id=?, expires_at=?
+WHERE name=? AND (expires_at<=? OR worker_id=?)`), params.WorkerID, expiresAt, params.Name, now, params.WorkerID)
+	if err != nil {
+		return false, err
 	}
-	return true, nil // single-process for MySQL/SQLite
+	if n, _ := result.RowsAffected(); n > 0 {
+		return true, nil
+	}
+	if _, err := q.ExecContext(ctx, d.q(`INSERT INTO goncordia_leaders (name, worker_id, expires_at) VALUES (?, ?, ?)`), params.Name, params.WorkerID, expiresAt); err == nil {
+		return true, nil
+	} else {
+		var currentWorker string
+		var currentExpiry time.Time
+		if scanErr := q.QueryRowContext(ctx, d.q(`SELECT worker_id, expires_at FROM goncordia_leaders WHERE name=?`), params.Name).Scan(&currentWorker, &currentExpiry); scanErr != nil {
+			return false, err
+		}
+	}
+	return false, nil
 }
 
 func leaderResign(ctx context.Context, q querier, d Dialect, name string) error {
-	if d == Postgres {
-		_, err := q.ExecContext(ctx, fmt.Sprintf(`SELECT pg_advisory_unlock(hashtext(%s))`, d.placeholder(1)), name)
-		return err
-	}
-	return nil
+	_, err := q.ExecContext(ctx, d.q(`DELETE FROM goncordia_leaders WHERE name=?`), name)
+	return err
 }
 
 // --- scan helpers ---
@@ -634,7 +665,7 @@ func scanJobRow(d Dialect, s rowScanner) (*driver.JobRow, error) {
 	err := s.Scan(
 		&idStr, &r.Queue, &r.Kind, &r.Args, &state, &r.Priority, &r.RunAt,
 		&r.CreatedAt, &r.AttemptedAt, &r.FinalizedAt, &r.AttemptNum,
-		&r.MaxRetry, &timeoutMS, &uniqueKey, &workerID, &tagsRaw, &errorsRaw,
+		&r.MaxRetry, &timeoutMS, &uniqueKey, &workerID, &tagsRaw, &errorsRaw, &r.PipelineID,
 	)
 	if err != nil {
 		return nil, err
@@ -675,7 +706,6 @@ func scanQueueRow(s rowScanner) (*driver.QueueRow, error) {
 	if err := s.Scan(&r.Name, &paused, &r.CreatedAt, &r.UpdatedAt); err != nil {
 		return nil, err
 	}
-	// Normalize paused: bool (Postgres) or int (SQLite/MySQL)
 	switch v := paused.(type) {
 	case bool:
 		r.Paused = v

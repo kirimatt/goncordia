@@ -4,8 +4,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kirimatt/goncordia/clock"
 	"github.com/kirimatt/goncordia/core"
-	"github.com/kirimatt/goncordia/internal/clock"
 )
 
 func TestExponentialRetry(t *testing.T) {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"time"
 )
 
 // workerEntry is the type-erased wrapper stored in the registry.
@@ -21,7 +22,10 @@ type RawJob struct {
 	Args       json.RawMessage
 	AttemptNum int
 	MaxRetry   int
+	CreatedAt  time.Time
+	WorkerID   string
 	Tags       []string
+	PipelineID string
 }
 
 // Registry maps job kinds to their type-erased worker implementations.
@@ -53,7 +57,10 @@ func RegisterWorker[T JobArgs](r *Registry, w Worker[T], opts WorkerOpts) {
 				Args:       args,
 				AttemptNum: rawJob.AttemptNum,
 				MaxRetry:   rawJob.MaxRetry,
+				CreatedAt:  rawJob.CreatedAt,
+				WorkerID:   rawJob.WorkerID,
 				Tags:       rawJob.Tags,
+				PipelineID: rawJob.PipelineID,
 			}
 			return w.Process(ctx, typedJob)
 		},

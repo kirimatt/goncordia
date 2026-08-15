@@ -19,12 +19,13 @@ import (
 	"database/sql"
 	"embed"
 	"fmt"
+	"strconv"
 	"strings"
 
 	goncordia "github.com/kirimatt/goncordia"
+	"github.com/kirimatt/goncordia/clock"
 	"github.com/kirimatt/goncordia/core"
 	"github.com/kirimatt/goncordia/driver"
-	"github.com/kirimatt/goncordia/internal/clock"
 )
 
 //go:embed migrations/**/*.sql
@@ -52,22 +53,24 @@ func (d Dialect) String() string {
 	}
 }
 
-// placeholder returns the positional placeholder for argument n (1-based).
-// Postgres uses $1, MySQL/SQLite use ?.
-func (d Dialect) placeholder(n int) string {
-	if d == Postgres {
-		return fmt.Sprintf("$%d", n)
+// q rebinds a query written with ? placeholders to the dialect's format.
+// Postgres replaces each ? with $1, $2, etc.; other dialects return the query unchanged.
+func (d Dialect) q(query string) string {
+	if d != Postgres {
+		return query
 	}
-	return "?"
-}
-
-// placeholders returns a comma-separated list of n placeholders starting at offset.
-func (d Dialect) placeholders(n, offset int) string {
-	parts := make([]string, n)
-	for i := range parts {
-		parts[i] = d.placeholder(i + offset)
+	var b strings.Builder
+	n := 0
+	for i := 0; i < len(query); i++ {
+		if query[i] == '?' {
+			n++
+			b.WriteByte('$')
+			b.WriteString(strconv.Itoa(n))
+		} else {
+			b.WriteByte(query[i])
+		}
 	}
-	return strings.Join(parts, ", ")
+	return b.String()
 }
 
 // supportsSkipLocked reports whether this dialect supports SELECT FOR UPDATE SKIP LOCKED.
@@ -100,6 +103,12 @@ func New(db *sql.DB, dialect Dialect, opts ...Option) *Driver {
 
 // Migrate runs embedded SQL migrations for the configured dialect.
 func (d *Driver) Migrate(ctx context.Context) error {
+	if _, err := d.db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS goncordia_schema_migrations (
+		version VARCHAR(255) PRIMARY KEY,
+		applied_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+	)`); err != nil {
+		return fmt.Errorf("create migration journal for %s: %w", d.dialect, err)
+	}
 	dir := "migrations/" + d.dialect.String()
 	entries, err := migrationFS.ReadDir(dir)
 	if err != nil {
@@ -109,15 +118,40 @@ func (d *Driver) Migrate(ctx context.Context) error {
 		if !strings.HasSuffix(e.Name(), ".sql") {
 			continue
 		}
+		var applied int
+		if err := d.db.QueryRowContext(ctx,
+			d.dialect.q(`SELECT COUNT(*) FROM goncordia_schema_migrations WHERE version = ?`),
+			e.Name(),
+		).Scan(&applied); err != nil {
+			return fmt.Errorf("check migration %s: %w", e.Name(), err)
+		}
+		if applied > 0 {
+			continue
+		}
 		sqlBytes, err := migrationFS.ReadFile(dir + "/" + e.Name())
 		if err != nil {
 			return fmt.Errorf("read migration %s: %w", e.Name(), err)
 		}
-		// Split on semicolons to run each statement individually
+		tx, err := d.db.BeginTx(ctx, nil)
+		if err != nil {
+			return fmt.Errorf("begin migration %s: %w", e.Name(), err)
+		}
+		// Split on semicolons to run each statement individually.
 		for _, stmt := range splitStatements(string(sqlBytes)) {
-			if _, err := d.db.ExecContext(ctx, stmt); err != nil {
+			if _, err := tx.ExecContext(ctx, stmt); err != nil {
+				_ = tx.Rollback()
 				return fmt.Errorf("apply migration %s: %w", e.Name(), err)
 			}
+		}
+		if _, err := tx.ExecContext(ctx,
+			d.dialect.q(`INSERT INTO goncordia_schema_migrations (version) VALUES (?)`),
+			e.Name(),
+		); err != nil {
+			_ = tx.Rollback()
+			return fmt.Errorf("record migration %s: %w", e.Name(), err)
+		}
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("commit migration %s: %w", e.Name(), err)
 		}
 	}
 	return nil
@@ -131,7 +165,7 @@ func (d *Driver) Capabilities() driver.Capabilities {
 		SkipLocked:    d.dialect.supportsSkipLocked(),
 		UniqueJobs:    true,
 		ListenNotify:  false, // stdlib doesn't support LISTEN/NOTIFY
-		AdvisoryLocks: d.dialect == Postgres,
+		AdvisoryLocks: false,
 	}
 }
 

@@ -1,6 +1,6 @@
 # goncordia
 
-> Transactional job queue engine for Go. One `Driver[TTx]` interface covers Postgres, MySQL, SQLite, MongoDB, Redis, Cassandra, ClickHouse, DynamoDB, Firestore, and in-memory — without forcing you to adopt a new dependency. Implements the transactional outbox pattern via `EnqueueTx`.
+> Transactional job queue engine for Go with ten storage backends, crash recovery, pipeline serialization, leader-safe schedules, an embeddable admin UI, OpenTelemetry, and deterministic injected clocks.
 
 ## Key concept
 

@@ -14,6 +14,7 @@ import (
 	"github.com/kirimatt/goncordia"
 	"github.com/kirimatt/goncordia/core"
 	clickhousedriver "github.com/kirimatt/goncordia/driver/clickhouse"
+	"github.com/kirimatt/goncordia/driver/drivertest"
 )
 
 func skipIfNoDocker(t *testing.T) {
@@ -80,6 +81,7 @@ func TestClickHouse_EnqueueAndProcess(t *testing.T) {
 	if err := d.Migrate(ctx); err != nil {
 		t.Fatal(err)
 	}
+	drivertest.Run(t, d.Executor())
 
 	var processed atomic.Int64
 	registry := core.NewRegistry()

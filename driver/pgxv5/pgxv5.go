@@ -22,9 +22,9 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	goncordia "github.com/kirimatt/goncordia"
+	"github.com/kirimatt/goncordia/clock"
 	"github.com/kirimatt/goncordia/core"
 	"github.com/kirimatt/goncordia/driver"
-	"github.com/kirimatt/goncordia/internal/clock"
 )
 
 //go:embed migrations/*.sql
@@ -55,6 +55,12 @@ func New(pool *pgxpool.Pool, opts ...Option) *Driver {
 // Migrate runs embedded SQL migrations against the database.
 // Safe to call multiple times (uses IF NOT EXISTS / CREATE OR REPLACE).
 func (d *Driver) Migrate(ctx context.Context) error {
+	if _, err := d.pool.Exec(ctx, `CREATE TABLE IF NOT EXISTS goncordia_schema_migrations (
+		version TEXT PRIMARY KEY,
+		applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+	)`); err != nil {
+		return fmt.Errorf("create migration journal: %w", err)
+	}
 	entries, err := migrationFS.ReadDir("migrations")
 	if err != nil {
 		return fmt.Errorf("read migrations: %w", err)
@@ -63,12 +69,34 @@ func (d *Driver) Migrate(ctx context.Context) error {
 		if !strings.HasSuffix(e.Name(), ".sql") {
 			continue
 		}
+		var applied bool
+		if err := d.pool.QueryRow(ctx,
+			`SELECT EXISTS (SELECT 1 FROM goncordia_schema_migrations WHERE version=$1)`,
+			e.Name(),
+		).Scan(&applied); err != nil {
+			return fmt.Errorf("check migration %s: %w", e.Name(), err)
+		}
+		if applied {
+			continue
+		}
 		sql, err := migrationFS.ReadFile("migrations/" + e.Name())
 		if err != nil {
 			return fmt.Errorf("read migration %s: %w", e.Name(), err)
 		}
-		if _, err := d.pool.Exec(ctx, string(sql)); err != nil {
+		tx, err := d.pool.Begin(ctx)
+		if err != nil {
+			return fmt.Errorf("begin migration %s: %w", e.Name(), err)
+		}
+		if _, err := tx.Exec(ctx, string(sql)); err != nil {
+			_ = tx.Rollback(ctx)
 			return fmt.Errorf("apply migration %s: %w", e.Name(), err)
+		}
+		if _, err := tx.Exec(ctx, `INSERT INTO goncordia_schema_migrations (version) VALUES ($1)`, e.Name()); err != nil {
+			_ = tx.Rollback(ctx)
+			return fmt.Errorf("record migration %s: %w", e.Name(), err)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return fmt.Errorf("commit migration %s: %w", e.Name(), err)
 		}
 	}
 	return nil
@@ -82,7 +110,7 @@ func (d *Driver) Capabilities() driver.Capabilities {
 		ListenNotify:  true,
 		SkipLocked:    true,
 		UniqueJobs:    true,
-		AdvisoryLocks: true,
+		AdvisoryLocks: false,
 	}
 }
 

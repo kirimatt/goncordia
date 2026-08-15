@@ -3,9 +3,8 @@
 // # Transaction guarantees
 //
 // Cassandra does not support multi-statement transactions with rollback semantics.
-// EnqueueTx is identical to Enqueue — there is NO atomicity between your business
-// operations and job insertion. Jobs are delivered at-least-once when combined with
-// idempotent workers.
+// EnqueueTx is rejected; enqueue after the business operation commits. Jobs are
+// delivered at-least-once when combined with idempotent workers.
 //
 // Lightweight transactions (IF NOT EXISTS / IF condition) are used internally for
 // atomic job claiming and unique-key deduplication.
@@ -36,13 +35,13 @@ import (
 	"github.com/gocql/gocql"
 
 	goncordia "github.com/kirimatt/goncordia"
+	"github.com/kirimatt/goncordia/clock"
 	"github.com/kirimatt/goncordia/core"
 	"github.com/kirimatt/goncordia/driver"
-	"github.com/kirimatt/goncordia/internal/clock"
 )
 
 // NoTx is the transaction type for the Cassandra driver.
-// Cassandra sessions have no rollback guarantee; EnqueueTx behaves like Enqueue.
+// Cassandra sessions have no rollback guarantee; EnqueueTx is rejected.
 type NoTx struct{}
 
 // Driver implements driver.Driver[NoTx] backed by Cassandra.
@@ -91,6 +90,7 @@ func (d *Driver) Migrate(_ context.Context) error {
 			tags          list<text>,
 			errors_json   text,
 			version       bigint,
+			pipeline_id   text,
 			PRIMARY KEY (id)
 		)`,
 
@@ -103,6 +103,14 @@ func (d *Driver) Migrate(_ context.Context) error {
 			id          text,
 			PRIMARY KEY ((queue), run_at, priority, id)
 		) WITH CLUSTERING ORDER BY (run_at ASC, priority DESC, id ASC)`,
+
+		// Running-job lookup used to recover claims abandoned by crashed workers.
+		`CREATE TABLE IF NOT EXISTS goncordia_jobs_running (
+			queue        text,
+			attempted_at timestamp,
+			id           text,
+			PRIMARY KEY ((queue), attempted_at, id)
+		) WITH CLUSTERING ORDER BY (attempted_at ASC, id ASC)`,
 
 		// Queue metadata (paused flag, timestamps).
 		`CREATE TABLE IF NOT EXISTS goncordia_queues (

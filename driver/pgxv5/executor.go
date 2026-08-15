@@ -10,8 +10,8 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/kirimatt/goncordia/clock"
 	"github.com/kirimatt/goncordia/driver"
-	"github.com/kirimatt/goncordia/internal/clock"
 )
 
 // querier is the common interface satisfied by both *pgxpool.Pool and pgx.Tx.
@@ -69,8 +69,17 @@ func (e *executor) JobInsertMany(ctx context.Context, params []driver.JobInsertP
 func (e *executor) JobGetByID(ctx context.Context, id string) (*driver.JobRow, error) {
 	return jobGetByID(ctx, poolQuerier{e.pool}, id)
 }
+func (e *executor) JobList(ctx context.Context, params driver.JobListParams) ([]driver.JobRow, error) {
+	return jobList(ctx, poolQuerier{e.pool}, params)
+}
+func (e *executor) QueueStats(ctx context.Context, queue string) (driver.QueueStats, error) {
+	return queueStats(ctx, poolQuerier{e.pool}, queue)
+}
 func (e *executor) JobFetchBatch(ctx context.Context, params driver.FetchParams) ([]driver.JobRow, error) {
 	return jobFetchBatch(ctx, poolQuerier{e.pool}, e.clk, params)
+}
+func (e *executor) JobRescueStuck(ctx context.Context, params driver.JobRescueParams) (int64, error) {
+	return jobRescueStuck(ctx, poolQuerier{e.pool}, params)
 }
 func (e *executor) JobSetStateIfRunning(ctx context.Context, params driver.JobSetStateParams) error {
 	return jobSetStateIfRunning(ctx, poolQuerier{e.pool}, e.clk, params)
@@ -97,7 +106,7 @@ func (e *executor) QueueList(ctx context.Context, params driver.QueueListParams)
 	return queueList(ctx, poolQuerier{e.pool}, params)
 }
 func (e *executor) LeaderAttemptElect(ctx context.Context, params driver.LeaderElectParams) (bool, error) {
-	return leaderAttemptElect(ctx, poolQuerier{e.pool}, params)
+	return leaderAttemptElect(ctx, poolQuerier{e.pool}, e.clk, params)
 }
 func (e *executor) LeaderResign(ctx context.Context, name string) error {
 	return leaderResign(ctx, poolQuerier{e.pool}, name)
@@ -155,7 +164,7 @@ func (t *txExecutor) QueueList(ctx context.Context, params driver.QueueListParam
 	return queueList(ctx, txQuerier{t.querier}, params)
 }
 func (t *txExecutor) LeaderAttemptElect(ctx context.Context, params driver.LeaderElectParams) (bool, error) {
-	return leaderAttemptElect(ctx, txQuerier{t.querier}, params)
+	return leaderAttemptElect(ctx, txQuerier{t.querier}, t.clk, params)
 }
 func (t *txExecutor) LeaderResign(ctx context.Context, name string) error {
 	return leaderResign(ctx, txQuerier{t.querier}, name)
@@ -189,20 +198,20 @@ func jobInsertMany(ctx context.Context, q querier, clk clock.Clock, params []dri
 
 		const insertSQL = `
 INSERT INTO goncordia_jobs
-    (queue, kind, args, state, priority, run_at, created_at, max_retry, timeout_ms, unique_key, tags)
+    (queue, kind, args, state, priority, run_at, created_at, max_retry, timeout_ms, unique_key, tags, pipeline_id)
 VALUES
-    ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+    ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 ON CONFLICT (queue, unique_key) WHERE unique_key IS NOT NULL
     AND state IN ('available', 'running', 'scheduled', 'retryable')
 DO NOTHING
 RETURNING id, queue, kind, args, state, priority, run_at, created_at,
           attempted_at, finalized_at, attempt_num, max_retry, timeout_ms,
-          unique_key, worker_id, tags, errors`
+          unique_key, worker_id, tags, errors, pipeline_id`
 
 		row := q.QueryRow(ctx, insertSQL,
 			p.Queue, p.Kind, p.Args, string(state), p.Priority, runAt, now,
 			p.MaxRetry, p.Timeout.Milliseconds(),
-			uniqueKey, tags,
+			uniqueKey, tags, p.PipelineID,
 		)
 
 		jobRow, err := scanJobRow(row)
@@ -227,7 +236,7 @@ func findUniqueJob(ctx context.Context, q querier, queue, uniqueKey string) (*dr
 	const sql = `
 SELECT id, queue, kind, args, state, priority, run_at, created_at,
        attempted_at, finalized_at, attempt_num, max_retry, timeout_ms,
-       unique_key, worker_id, tags, errors
+       unique_key, worker_id, tags, errors, pipeline_id
 FROM goncordia_jobs
 WHERE queue = $1 AND unique_key = $2
   AND state IN ('available', 'running', 'scheduled', 'retryable')
@@ -243,9 +252,68 @@ func jobGetByID(ctx context.Context, q querier, id string) (*driver.JobRow, erro
 	const sql = `
 SELECT id, queue, kind, args, state, priority, run_at, created_at,
        attempted_at, finalized_at, attempt_num, max_retry, timeout_ms,
-       unique_key, worker_id, tags, errors
+       unique_key, worker_id, tags, errors, pipeline_id
 FROM goncordia_jobs WHERE id = $1`
 	return scanJobRow(q.QueryRow(ctx, sql, idInt))
+}
+
+func jobList(ctx context.Context, q querier, params driver.JobListParams) ([]driver.JobRow, error) {
+	query := `SELECT id, queue, kind, args, state, priority, run_at, created_at,
+       attempted_at, finalized_at, attempt_num, max_retry, timeout_ms,
+       unique_key, worker_id, tags, errors, pipeline_id
+FROM goncordia_jobs WHERE TRUE`
+	args := make([]any, 0, 5)
+	add := func(clause string, value any) {
+		args = append(args, value)
+		query += fmt.Sprintf(clause, len(args))
+	}
+	if params.Queue != "" {
+		add(" AND queue=$%d", params.Queue)
+	}
+	if params.State != "" {
+		add(" AND state=$%d", string(params.State))
+	}
+	if params.Kind != "" {
+		add(" AND kind=$%d", params.Kind)
+	}
+	if params.Cursor != "" {
+		cursor, err := strconv.ParseInt(params.Cursor, 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("invalid cursor %q: %w", params.Cursor, err)
+		}
+		add(" AND id<$%d", cursor)
+	}
+	limit := params.Limit
+	if limit <= 0 || limit > 1000 {
+		limit = 100
+	}
+	args = append(args, limit)
+	query += fmt.Sprintf(" ORDER BY created_at DESC, id DESC LIMIT $%d", len(args))
+	rows, err := q.Query(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanJobRows(rows)
+}
+
+func queueStats(ctx context.Context, q querier, queue string) (driver.QueueStats, error) {
+	rows, err := q.Query(ctx, `SELECT state, COUNT(*) FROM goncordia_jobs WHERE queue=$1 GROUP BY state`, queue)
+	if err != nil {
+		return driver.QueueStats{}, err
+	}
+	defer rows.Close()
+	stats := driver.QueueStats{Queue: queue, States: make(map[driver.JobState]int64)}
+	for rows.Next() {
+		var state driver.JobState
+		var count int64
+		if err := rows.Scan(&state, &count); err != nil {
+			return driver.QueueStats{}, err
+		}
+		stats.States[state] = count
+		stats.Total += count
+	}
+	return stats, rows.Err()
 }
 
 func jobFetchBatch(ctx context.Context, q querier, clk clock.Clock, params driver.FetchParams) ([]driver.JobRow, error) {
@@ -271,7 +339,7 @@ FROM fetched
 WHERE j.id = fetched.id
 RETURNING j.id, j.queue, j.kind, j.args, j.state, j.priority, j.run_at,
           j.created_at, j.attempted_at, j.finalized_at, j.attempt_num,
-          j.max_retry, j.timeout_ms, j.unique_key, j.worker_id, j.tags, j.errors`
+          j.max_retry, j.timeout_ms, j.unique_key, j.worker_id, j.tags, j.errors, j.pipeline_id`
 
 	now := clk.Now()
 	rows, err := q.Query(ctx, sql, params.Queue, now, params.Limit, now, params.WorkerID)
@@ -282,13 +350,37 @@ RETURNING j.id, j.queue, j.kind, j.args, j.state, j.priority, j.run_at,
 	return scanJobRows(rows)
 }
 
+func jobRescueStuck(ctx context.Context, q querier, params driver.JobRescueParams) (int64, error) {
+	const sql = `
+UPDATE goncordia_jobs SET
+    state = 'available', attempted_at = NULL, worker_id = NULL
+WHERE queue = $1 AND state = 'running' AND attempted_at <= $2`
+	tag, err := q.Exec(ctx, sql, params.Queue, params.Before)
+	if err != nil {
+		return 0, fmt.Errorf("rescue stuck jobs: %w", err)
+	}
+	return tag.RowsAffected(), nil
+}
+
 func jobSetStateIfRunning(ctx context.Context, q querier, clk clock.Clock, params driver.JobSetStateParams) error {
 	idInt, err := strconv.ParseInt(params.ID, 10, 64)
 	if err != nil {
 		return fmt.Errorf("invalid job id %q: %w", params.ID, err)
 	}
 
-	errJSON := encodeError(params.Err, clk)
+	if params.Yield {
+		const yieldSQL = `
+UPDATE goncordia_jobs SET
+    state        = 'available',
+    attempt_num  = attempt_num - 1,
+    attempted_at = NULL,
+    worker_id    = NULL
+WHERE id = $1 AND state = 'running'`
+		_, err = q.Exec(ctx, yieldSQL, idInt)
+		return err
+	}
+
+	errJSON := encodeError(params.Err, params.Attempt, clk)
 
 	var finalizedAt *time.Time
 	switch params.State {
@@ -311,6 +403,7 @@ func jobSetStateIfRunning(ctx context.Context, q querier, clk clock.Clock, param
 	const sql = `
 UPDATE goncordia_jobs SET
     state        = $2,
+    worker_id    = NULL,
     finalized_at = COALESCE($3, finalized_at),
     run_at       = COALESCE($4, run_at),
     errors       = CASE WHEN $5::jsonb IS NOT NULL
@@ -392,17 +485,25 @@ func queueList(ctx context.Context, q querier, params driver.QueueListParams) ([
 	return result, rows.Err()
 }
 
-func leaderAttemptElect(ctx context.Context, q querier, params driver.LeaderElectParams) (bool, error) {
-	// Use pg_try_advisory_lock with a stable hash of the name
-	const sql = `SELECT pg_try_advisory_lock(hashtext($1))`
-	var elected bool
-	err := q.QueryRow(ctx, sql, params.Name).Scan(&elected)
-	return elected, err
+func leaderAttemptElect(ctx context.Context, q querier, clk clock.Clock, params driver.LeaderElectParams) (bool, error) {
+	const sql = `
+INSERT INTO goncordia_leaders (name, worker_id, expires_at)
+VALUES ($1, $2, $3)
+ON CONFLICT (name) DO UPDATE SET
+    worker_id = EXCLUDED.worker_id,
+    expires_at = EXCLUDED.expires_at
+WHERE goncordia_leaders.expires_at <= $4
+   OR goncordia_leaders.worker_id = EXCLUDED.worker_id`
+	now := clk.Now()
+	tag, err := q.Exec(ctx, sql, params.Name, params.WorkerID, now.Add(params.TTL), now)
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() > 0, nil
 }
 
 func leaderResign(ctx context.Context, q querier, name string) error {
-	const sql = `SELECT pg_advisory_unlock(hashtext($1))`
-	_, err := q.Exec(ctx, sql, name)
+	_, err := q.Exec(ctx, `DELETE FROM goncordia_leaders WHERE name=$1`, name)
 	return err
 }
 
@@ -426,7 +527,7 @@ func scanJobRow(s scanner) (*driver.JobRow, error) {
 	err := s.Scan(
 		&id, &r.Queue, &r.Kind, &r.Args, &state, &r.Priority, &r.RunAt,
 		&r.CreatedAt, &r.AttemptedAt, &r.FinalizedAt, &r.AttemptNum,
-		&r.MaxRetry, &timeoutMS, &uniqueKey, &workerID, &tags, &errorsJSON,
+		&r.MaxRetry, &timeoutMS, &uniqueKey, &workerID, &tags, &errorsJSON, &r.PipelineID,
 	)
 	if err != nil {
 		return nil, err
@@ -469,11 +570,11 @@ func scanQueueRow(s scanner) (*driver.QueueRow, error) {
 }
 
 // encodeError serialises a single error into a JSONB array element for appending.
-func encodeError(errStr *string, clk clock.Clock) []byte {
+func encodeError(errStr *string, attempt int, clk clock.Clock) []byte {
 	if errStr == nil {
 		return nil
 	}
-	entry := driver.AttemptError{At: clk.Now(), Error: *errStr}
+	entry := driver.AttemptError{At: clk.Now(), Attempt: attempt, Error: *errStr}
 	b, _ := json.Marshal([]driver.AttemptError{entry})
 	return b
 }

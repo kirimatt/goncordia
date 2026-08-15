@@ -18,8 +18,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"time"
 
+	"github.com/kirimatt/goncordia/clock"
 	"github.com/kirimatt/goncordia/core"
 	"github.com/kirimatt/goncordia/driver"
 )
@@ -36,12 +38,26 @@ type Client[TTx any] struct {
 type ClientConfig struct {
 	// DefaultQueue is used when InsertOpts.Queue is empty. Default: "default".
 	DefaultQueue string
+	// Clock controls period-based unique-key windows. Default: clock.Real{}.
+	Clock clock.Clock
+	// Now overrides the wall clock used for period-based unique keys.
+	// Deprecated: use Clock.
+	Now func() time.Time
+}
+
+// InsertRequest allows each item in a batch to have independent options.
+type InsertRequest struct {
+	Args core.JobArgs
+	Opts *core.InsertOpts
 }
 
 // NewClient creates a Client backed by the given driver.
 func NewClient[TTx any](d driver.Driver[TTx], cfg ClientConfig) *Client[TTx] {
 	if cfg.DefaultQueue == "" {
 		cfg.DefaultQueue = "default"
+	}
+	if cfg.Clock == nil && cfg.Now == nil {
+		cfg.Clock = clock.Real{}
 	}
 	return &Client[TTx]{driver: d, config: cfg}
 }
@@ -56,6 +72,9 @@ func (c *Client[TTx]) Enqueue(ctx context.Context, args core.JobArgs, opts *core
 	results, err := c.driver.Executor().JobInsertMany(ctx, []driver.JobInsertParams{params})
 	if err != nil {
 		return nil, err
+	}
+	if len(results) != 1 {
+		return nil, fmt.Errorf("driver %q returned %d results for one insert", c.driver.Name(), len(results))
 	}
 	return &results[0], nil
 }
@@ -76,7 +95,39 @@ func (c *Client[TTx]) EnqueueTx(ctx context.Context, tx TTx, args core.JobArgs, 
 	if err != nil {
 		return nil, err
 	}
+	if len(results) != 1 {
+		return nil, fmt.Errorf("driver %q returned %d results for one transactional insert", c.driver.Name(), len(results))
+	}
 	return &results[0], nil
+}
+
+// EnqueueBatch inserts jobs with per-item options.
+func (c *Client[TTx]) EnqueueBatch(ctx context.Context, requests []InsertRequest) ([]driver.JobInsertResult, error) {
+	params := make([]driver.JobInsertParams, 0, len(requests))
+	for _, request := range requests {
+		p, err := c.buildInsertParams(request.Args, request.Opts)
+		if err != nil {
+			return nil, err
+		}
+		params = append(params, p)
+	}
+	return c.driver.Executor().JobInsertMany(ctx, params)
+}
+
+// EnqueueBatchTx inserts jobs with per-item options in an existing transaction.
+func (c *Client[TTx]) EnqueueBatchTx(ctx context.Context, tx TTx, requests []InsertRequest) ([]driver.JobInsertResult, error) {
+	if !c.driver.Capabilities().NativeTx {
+		return nil, fmt.Errorf("driver %q does not support transactional inserts", c.driver.Name())
+	}
+	params := make([]driver.JobInsertParams, 0, len(requests))
+	for _, request := range requests {
+		p, err := c.buildInsertParams(request.Args, request.Opts)
+		if err != nil {
+			return nil, err
+		}
+		params = append(params, p)
+	}
+	return c.driver.UnwrapTx(tx).JobInsertMany(ctx, params)
 }
 
 // EnqueueMany inserts multiple jobs in a single batch (non-transactional).
@@ -115,6 +166,13 @@ func (c *Client[TTx]) Cancel(ctx context.Context, id string) error {
 }
 
 func (c *Client[TTx]) buildInsertParams(args core.JobArgs, opts *core.InsertOpts) (driver.JobInsertParams, error) {
+	if args == nil || reflect.ValueOf(args).Kind() == reflect.Pointer && reflect.ValueOf(args).IsNil() {
+		return driver.JobInsertParams{}, fmt.Errorf("job args must not be nil")
+	}
+	kind := args.Kind()
+	if kind == "" {
+		return driver.JobInsertParams{}, fmt.Errorf("job kind must not be empty")
+	}
 	argsJSON, err := json.Marshal(args)
 	if err != nil {
 		return driver.JobInsertParams{}, fmt.Errorf("marshal job args: %w", err)
@@ -127,8 +185,18 @@ func (c *Client[TTx]) buildInsertParams(args core.JobArgs, opts *core.InsertOpts
 	var maxRetry int
 	var timeout time.Duration
 	var tags []string
+	var pipelineID string
 
 	if opts != nil {
+		if opts.MaxRetry != nil && *opts.MaxRetry < 0 {
+			return driver.JobInsertParams{}, fmt.Errorf("max retry must not be negative")
+		}
+		if opts.Timeout != nil && *opts.Timeout < 0 {
+			return driver.JobInsertParams{}, fmt.Errorf("timeout must not be negative")
+		}
+		if opts.UniqueOpts != nil && opts.UniqueOpts.ByPeriod < 0 {
+			return driver.JobInsertParams{}, fmt.Errorf("unique period must not be negative")
+		}
 		if opts.Queue != "" {
 			queue = opts.Queue
 		}
@@ -147,9 +215,16 @@ func (c *Client[TTx]) buildInsertParams(args core.JobArgs, opts *core.InsertOpts
 			return 0
 		}()
 		tags = opts.Tags
+		pipelineID = opts.PipelineID
 
 		if opts.UniqueOpts != nil {
-			uniqueKey, err = buildUniqueKey(args, queue, opts.UniqueOpts)
+			var now time.Time
+			if c.config.Clock != nil {
+				now = c.config.Clock.Now()
+			} else {
+				now = c.config.Now()
+			}
+			uniqueKey, err = buildUniqueKey(args, queue, opts.UniqueOpts, now)
 			if err != nil {
 				return driver.JobInsertParams{}, err
 			}
@@ -157,19 +232,20 @@ func (c *Client[TTx]) buildInsertParams(args core.JobArgs, opts *core.InsertOpts
 	}
 
 	return driver.JobInsertParams{
-		Queue:     queue,
-		Kind:      args.Kind(),
-		Args:      argsJSON,
-		Priority:  priority,
-		RunAt:     runAt,
-		UniqueKey: uniqueKey,
-		MaxRetry:  maxRetry,
-		Timeout:   timeout,
-		Tags:      tags,
+		Queue:      queue,
+		Kind:       kind,
+		Args:       argsJSON,
+		Priority:   priority,
+		RunAt:      runAt,
+		UniqueKey:  uniqueKey,
+		MaxRetry:   maxRetry,
+		Timeout:    timeout,
+		Tags:       tags,
+		PipelineID: pipelineID,
 	}, nil
 }
 
-func buildUniqueKey(args core.JobArgs, queue string, opts *core.UniqueOpts) (string, error) {
+func buildUniqueKey(args core.JobArgs, queue string, opts *core.UniqueOpts, now time.Time) (string, error) {
 	if opts == nil {
 		return "", nil
 	}
@@ -186,7 +262,7 @@ func buildUniqueKey(args core.JobArgs, queue string, opts *core.UniqueOpts) (str
 		key += ":" + string(b)
 	}
 	if opts.ByPeriod > 0 {
-		window := time.Now().Truncate(opts.ByPeriod)
+		window := now.Truncate(opts.ByPeriod)
 		key += ":" + window.Format(time.RFC3339)
 	}
 	return key, nil

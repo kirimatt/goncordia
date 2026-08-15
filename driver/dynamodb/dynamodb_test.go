@@ -18,6 +18,7 @@ import (
 
 	goncordia "github.com/kirimatt/goncordia"
 	"github.com/kirimatt/goncordia/core"
+	"github.com/kirimatt/goncordia/driver/drivertest"
 	dynamodbdriver "github.com/kirimatt/goncordia/driver/dynamodb"
 )
 
@@ -90,6 +91,7 @@ func TestDynamoDB_EnqueueAndProcess(t *testing.T) {
 	if err := d.Migrate(ctx); err != nil {
 		t.Fatal(err)
 	}
+	drivertest.Run(t, d.Executor())
 
 	registry := core.NewRegistry()
 	var processed atomic.Int64

@@ -7,11 +7,12 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strconv"
 	"sync"
 	"time"
 
+	"github.com/kirimatt/goncordia/clock"
 	"github.com/kirimatt/goncordia/driver"
-	"github.com/kirimatt/goncordia/internal/clock"
 )
 
 // NoTx is the transaction type for the memory driver.
@@ -20,12 +21,18 @@ type NoTx struct{}
 
 // Driver implements driver.Driver[NoTx] using in-memory maps.
 type Driver struct {
-	mu     sync.Mutex
-	jobs   map[string]*driver.JobRow
-	queues map[string]*driver.QueueRow
-	seq    uint64
-	notify map[string][]chan driver.Notification
-	clk    clock.Clock
+	mu      sync.Mutex
+	jobs    map[string]*driver.JobRow
+	queues  map[string]*driver.QueueRow
+	seq     uint64
+	notify  map[string][]chan driver.Notification
+	leaders map[string]memoryLeader
+	clk     clock.Clock
+}
+
+type memoryLeader struct {
+	workerID  string
+	expiresAt time.Time
 }
 
 // Option configures a memory Driver.
@@ -39,10 +46,11 @@ func WithClock(c clock.Clock) Option {
 // New creates a new in-memory Driver.
 func New(opts ...Option) *Driver {
 	d := &Driver{
-		jobs:   make(map[string]*driver.JobRow),
-		queues: make(map[string]*driver.QueueRow),
-		notify: make(map[string][]chan driver.Notification),
-		clk:    clock.Real{},
+		jobs:    make(map[string]*driver.JobRow),
+		queues:  make(map[string]*driver.QueueRow),
+		notify:  make(map[string][]chan driver.Notification),
+		leaders: make(map[string]memoryLeader),
+		clk:     clock.Real{},
 	}
 	for _, o := range opts {
 		o(d)
@@ -64,8 +72,10 @@ func (d *Driver) Capabilities() driver.Capabilities {
 
 func (d *Driver) Executor() driver.Executor         { return &executor{d: d} }
 func (d *Driver) UnwrapTx(_ NoTx) driver.ExecutorTx { return &txExecutor{executor: executor{d: d}} }
-func (d *Driver) Listener() driver.Listener         { return &listener{d: d} }
-func (d *Driver) Close() error                      { return nil }
+func (d *Driver) Listener() driver.Listener {
+	return &listener{d: d, subs: make(map[string]chan driver.Notification)}
+}
+func (d *Driver) Close() error { return nil }
 
 // --- executor ---
 
@@ -89,7 +99,7 @@ func (e *executor) JobInsertMany(_ context.Context, params []driver.JobInsertPar
 		}
 
 		e.d.seq++
-		id := fmt.Sprintf("mem_%d", e.d.seq)
+		id := "mem_" + strconv.FormatUint(e.d.seq, 10)
 		now := e.d.clk.Now()
 		runAt := p.RunAt
 		if runAt.IsZero() {
@@ -100,18 +110,19 @@ func (e *executor) JobInsertMany(_ context.Context, params []driver.JobInsertPar
 			state = driver.JobStateScheduled
 		}
 		row := &driver.JobRow{
-			ID:        id,
-			Queue:     p.Queue,
-			Kind:      p.Kind,
-			Args:      p.Args,
-			State:     state,
-			Priority:  p.Priority,
-			RunAt:     runAt,
-			CreatedAt: now,
-			MaxRetry:  p.MaxRetry,
-			Timeout:   p.Timeout,
-			Tags:      p.Tags,
-			UniqueKey: p.UniqueKey,
+			ID:         id,
+			Queue:      p.Queue,
+			Kind:       p.Kind,
+			Args:       p.Args,
+			State:      state,
+			Priority:   p.Priority,
+			RunAt:      runAt,
+			CreatedAt:  now,
+			MaxRetry:   p.MaxRetry,
+			Timeout:    p.Timeout,
+			Tags:       p.Tags,
+			UniqueKey:  p.UniqueKey,
+			PipelineID: p.PipelineID,
 		}
 		e.d.jobs[id] = row
 		e.d.ensureQueue(p.Queue, now)
@@ -131,6 +142,45 @@ func (e *executor) JobGetByID(_ context.Context, id string) (*driver.JobRow, err
 	}
 	cp := *row
 	return &cp, nil
+}
+
+func (e *executor) JobList(_ context.Context, params driver.JobListParams) ([]driver.JobRow, error) {
+	e.d.mu.Lock()
+	defer e.d.mu.Unlock()
+	rows := make([]driver.JobRow, 0, len(e.d.jobs))
+	for _, row := range e.d.jobs {
+		if params.Queue != "" && row.Queue != params.Queue || params.State != "" && row.State != params.State || params.Kind != "" && row.Kind != params.Kind || params.Cursor != "" && row.ID >= params.Cursor {
+			continue
+		}
+		rows = append(rows, *row)
+	}
+	sort.Slice(rows, func(i, j int) bool {
+		if !rows[i].CreatedAt.Equal(rows[j].CreatedAt) {
+			return rows[i].CreatedAt.After(rows[j].CreatedAt)
+		}
+		return rows[i].ID > rows[j].ID
+	})
+	limit := params.Limit
+	if limit <= 0 || limit > 1000 {
+		limit = 100
+	}
+	if len(rows) > limit {
+		rows = rows[:limit]
+	}
+	return rows, nil
+}
+
+func (e *executor) QueueStats(_ context.Context, queue string) (driver.QueueStats, error) {
+	e.d.mu.Lock()
+	defer e.d.mu.Unlock()
+	stats := driver.QueueStats{Queue: queue, States: make(map[driver.JobState]int64)}
+	for _, row := range e.d.jobs {
+		if row.Queue == queue {
+			stats.States[row.State]++
+			stats.Total++
+		}
+	}
+	return stats, nil
 }
 
 func (e *executor) JobFetchBatch(_ context.Context, params driver.FetchParams) ([]driver.JobRow, error) {
@@ -182,6 +232,22 @@ func (e *executor) JobFetchBatch(_ context.Context, params driver.FetchParams) (
 	return rows, nil
 }
 
+func (e *executor) JobRescueStuck(_ context.Context, params driver.JobRescueParams) (int64, error) {
+	e.d.mu.Lock()
+	defer e.d.mu.Unlock()
+	var rescued int64
+	for _, row := range e.d.jobs {
+		if row.Queue != params.Queue || row.State != driver.JobStateRunning || row.AttemptedAt == nil || row.AttemptedAt.After(params.Before) {
+			continue
+		}
+		row.State = driver.JobStateAvailable
+		row.AttemptedAt = nil
+		row.WorkerID = ""
+		rescued++
+	}
+	return rescued, nil
+}
+
 func (e *executor) JobSetStateIfRunning(_ context.Context, params driver.JobSetStateParams) error {
 	e.d.mu.Lock()
 	defer e.d.mu.Unlock()
@@ -189,7 +255,15 @@ func (e *executor) JobSetStateIfRunning(_ context.Context, params driver.JobSetS
 	if !ok || row.State != driver.JobStateRunning {
 		return nil
 	}
+	if params.Yield {
+		row.State = driver.JobStateAvailable
+		row.AttemptNum--
+		row.AttemptedAt = nil
+		row.WorkerID = ""
+		return nil
+	}
 	row.State = params.State
+	row.WorkerID = ""
 	if params.Err != nil {
 		row.Errors = append(row.Errors, driver.AttemptError{
 			At:      e.d.clk.Now(),
@@ -283,11 +357,24 @@ func (e *executor) QueueList(_ context.Context, _ driver.QueueListParams) ([]*dr
 	return rows, nil
 }
 
-func (e *executor) LeaderAttemptElect(_ context.Context, _ driver.LeaderElectParams) (bool, error) {
+func (e *executor) LeaderAttemptElect(_ context.Context, params driver.LeaderElectParams) (bool, error) {
+	e.d.mu.Lock()
+	defer e.d.mu.Unlock()
+	now := e.d.clk.Now()
+	current, ok := e.d.leaders[params.Name]
+	if ok && current.expiresAt.After(now) && current.workerID != params.WorkerID {
+		return false, nil
+	}
+	e.d.leaders[params.Name] = memoryLeader{workerID: params.WorkerID, expiresAt: now.Add(params.TTL)}
 	return true, nil
 }
 
-func (e *executor) LeaderResign(_ context.Context, _ string) error { return nil }
+func (e *executor) LeaderResign(_ context.Context, name string) error {
+	e.d.mu.Lock()
+	defer e.d.mu.Unlock()
+	delete(e.d.leaders, name)
+	return nil
+}
 
 // --- txExecutor ---
 
@@ -298,33 +385,56 @@ func (t *txExecutor) Rollback(_ context.Context) error { return nil }
 
 // --- listener ---
 
-type listener struct{ d *Driver }
+type listener struct {
+	d    *Driver
+	subs map[string]chan driver.Notification
+}
 
 func (l *listener) Listen(_ context.Context, queue string) (<-chan driver.Notification, error) {
 	l.d.mu.Lock()
 	defer l.d.mu.Unlock()
 	ch := make(chan driver.Notification, 16)
 	l.d.notify[queue] = append(l.d.notify[queue], ch)
+	l.subs[queue] = ch
 	return ch, nil
 }
 
 func (l *listener) Unlisten(_ context.Context, queue string) error {
 	l.d.mu.Lock()
 	defer l.d.mu.Unlock()
-	delete(l.d.notify, queue)
+	l.remove(queue)
 	return nil
 }
 
 func (l *listener) Close() error {
 	l.d.mu.Lock()
 	defer l.d.mu.Unlock()
-	for _, chans := range l.d.notify {
-		for _, ch := range chans {
-			close(ch)
+	for queue := range l.subs {
+		l.remove(queue)
+	}
+	return nil
+}
+
+// remove is called with d.mu held.
+func (l *listener) remove(queue string) {
+	owned := l.subs[queue]
+	if owned == nil {
+		return
+	}
+	channels := l.d.notify[queue]
+	for i, ch := range channels {
+		if ch == owned {
+			channels = append(channels[:i], channels[i+1:]...)
+			break
 		}
 	}
-	l.d.notify = make(map[string][]chan driver.Notification)
-	return nil
+	if len(channels) == 0 {
+		delete(l.d.notify, queue)
+	} else {
+		l.d.notify[queue] = channels
+	}
+	delete(l.subs, queue)
+	close(owned)
 }
 
 // --- helpers ---

@@ -10,8 +10,8 @@ import (
 	chdriver "github.com/ClickHouse/clickhouse-go/v2/lib/driver"
 	"github.com/google/uuid"
 
+	"github.com/kirimatt/goncordia/clock"
 	"github.com/kirimatt/goncordia/driver"
-	"github.com/kirimatt/goncordia/internal/clock"
 )
 
 // ---- executor ----
@@ -31,8 +31,17 @@ func (e *executor) JobInsertMany(ctx context.Context, params []driver.JobInsertP
 func (e *executor) JobGetByID(ctx context.Context, id string) (*driver.JobRow, error) {
 	return jobGetByID(ctx, e.conn, id)
 }
+func (e *executor) JobList(ctx context.Context, params driver.JobListParams) ([]driver.JobRow, error) {
+	return jobList(ctx, e.conn, params)
+}
+func (e *executor) QueueStats(ctx context.Context, queue string) (driver.QueueStats, error) {
+	return queueStats(ctx, e.conn, queue)
+}
 func (e *executor) JobFetchBatch(ctx context.Context, params driver.FetchParams) ([]driver.JobRow, error) {
 	return jobFetchBatch(ctx, e.conn, e.clk, params)
+}
+func (e *executor) JobRescueStuck(ctx context.Context, params driver.JobRescueParams) (int64, error) {
+	return jobRescueStuck(ctx, e.conn, params)
 }
 func (e *executor) JobSetStateIfRunning(ctx context.Context, params driver.JobSetStateParams) error {
 	return jobSetStateIfRunning(ctx, e.conn, e.clk, params)
@@ -169,6 +178,7 @@ type chJob struct {
 	Tags        []string
 	ErrorsJSON  string
 	Version     int64
+	PipelineID  string
 }
 
 func (j chJob) toRow() *driver.JobRow {
@@ -190,13 +200,14 @@ func (j chJob) toRow() *driver.JobRow {
 		WorkerID:    j.WorkerID,
 		Tags:        j.Tags,
 		Errors:      unmarshalErrors(j.ErrorsJSON),
+		PipelineID:  j.PipelineID,
 	}
 	return row
 }
 
 const selectJobCols = `id, queue, kind, args, state, priority, run_at, created_at,
 	attempted_at, finalized_at, attempt_num, max_retry, timeout_ms,
-	unique_key, worker_id, tags, errors_json, version`
+	unique_key, worker_id, tags, errors_json, version, pipeline_id`
 
 func scanJob(row chdriver.Row) (chJob, error) {
 	var j chJob
@@ -204,7 +215,7 @@ func scanJob(row chdriver.Row) (chJob, error) {
 		&j.ID, &j.Queue, &j.Kind, &j.Args, &j.State, &j.Priority,
 		&j.RunAt, &j.CreatedAt, &j.AttemptedAt, &j.FinalizedAt,
 		&j.AttemptNum, &j.MaxRetry, &j.TimeoutMs,
-		&j.UniqueKey, &j.WorkerID, &j.Tags, &j.ErrorsJSON, &j.Version,
+		&j.UniqueKey, &j.WorkerID, &j.Tags, &j.ErrorsJSON, &j.Version, &j.PipelineID,
 	)
 	return j, err
 }
@@ -220,12 +231,12 @@ func insertJobRow(ctx context.Context, conn chdriver.Conn, j chJob) error {
 		`INSERT INTO goncordia_jobs
 		(id,queue,kind,args,state,priority,run_at,created_at,
 		 attempted_at,finalized_at,attempt_num,max_retry,timeout_ms,
-		 unique_key,worker_id,tags,errors_json,version)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		 unique_key,worker_id,tags,errors_json,version,pipeline_id)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		j.ID, j.Queue, j.Kind, j.Args, j.State, j.Priority,
 		j.RunAt, j.CreatedAt, j.AttemptedAt, j.FinalizedAt,
 		j.AttemptNum, j.MaxRetry, j.TimeoutMs,
-		j.UniqueKey, j.WorkerID, j.Tags, j.ErrorsJSON, j.Version,
+		j.UniqueKey, j.WorkerID, j.Tags, j.ErrorsJSON, j.Version, j.PipelineID,
 	)
 }
 
@@ -281,6 +292,7 @@ func jobInsertMany(ctx context.Context, conn chdriver.Conn, clk clock.Clock, par
 			Tags:       tags,
 			ErrorsJSON: "[]",
 			Version:    1,
+			PipelineID: p.PipelineID,
 		}
 
 		if err := insertJobRow(ctx, conn, j); err != nil {
@@ -308,6 +320,71 @@ func jobGetByID(ctx context.Context, conn chdriver.Conn, id string) (*driver.Job
 		return nil, nil
 	}
 	return j.toRow(), nil
+}
+
+func jobList(ctx context.Context, conn chdriver.Conn, params driver.JobListParams) ([]driver.JobRow, error) {
+	query := `SELECT ` + selectJobCols + ` FROM goncordia_jobs FINAL WHERE 1=1`
+	var args []any
+	if params.Queue != "" {
+		query += ` AND queue=?`
+		args = append(args, params.Queue)
+	}
+	if params.State != "" {
+		query += ` AND state=?`
+		args = append(args, string(params.State))
+	}
+	if params.Kind != "" {
+		query += ` AND kind=?`
+		args = append(args, params.Kind)
+	}
+	if params.Cursor != "" {
+		query += ` AND id<?`
+		args = append(args, params.Cursor)
+	}
+	limit := params.Limit
+	if limit <= 0 || limit > 1000 {
+		limit = 100
+	}
+	query += ` ORDER BY created_at DESC, id DESC LIMIT ?`
+	args = append(args, limit)
+	rows, err := conn.Query(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var result []driver.JobRow
+	for rows.Next() {
+		var j chJob
+		if err := rows.Scan(
+			&j.ID, &j.Queue, &j.Kind, &j.Args, &j.State, &j.Priority,
+			&j.RunAt, &j.CreatedAt, &j.AttemptedAt, &j.FinalizedAt,
+			&j.AttemptNum, &j.MaxRetry, &j.TimeoutMs,
+			&j.UniqueKey, &j.WorkerID, &j.Tags, &j.ErrorsJSON, &j.Version, &j.PipelineID,
+		); err != nil {
+			return nil, err
+		}
+		result = append(result, *j.toRow())
+	}
+	return result, rows.Err()
+}
+
+func queueStats(ctx context.Context, conn chdriver.Conn, queue string) (driver.QueueStats, error) {
+	rows, err := conn.Query(ctx, `SELECT state, count() FROM goncordia_jobs FINAL WHERE queue=? GROUP BY state`, queue)
+	if err != nil {
+		return driver.QueueStats{}, err
+	}
+	defer rows.Close()
+	stats := driver.QueueStats{Queue: queue, States: make(map[driver.JobState]int64)}
+	for rows.Next() {
+		var state string
+		var count uint64
+		if err := rows.Scan(&state, &count); err != nil {
+			return driver.QueueStats{}, err
+		}
+		stats.States[driver.JobState(state)] = int64(count)
+		stats.Total += int64(count)
+	}
+	return stats, rows.Err()
 }
 
 // ---- JobFetchBatch ----
@@ -344,7 +421,7 @@ func jobFetchBatch(ctx context.Context, conn chdriver.Conn, clk clock.Clock, par
 			&j.ID, &j.Queue, &j.Kind, &j.Args, &j.State, &j.Priority,
 			&j.RunAt, &j.CreatedAt, &j.AttemptedAt, &j.FinalizedAt,
 			&j.AttemptNum, &j.MaxRetry, &j.TimeoutMs,
-			&j.UniqueKey, &j.WorkerID, &j.Tags, &j.ErrorsJSON, &j.Version,
+			&j.UniqueKey, &j.WorkerID, &j.Tags, &j.ErrorsJSON, &j.Version, &j.PipelineID,
 		); err != nil {
 			rows.Close()
 			return nil, err
@@ -403,13 +480,55 @@ func jobFetchBatch(ctx context.Context, conn chdriver.Conn, clk clock.Clock, par
 			&j.ID, &j.Queue, &j.Kind, &j.Args, &j.State, &j.Priority,
 			&j.RunAt, &j.CreatedAt, &j.AttemptedAt, &j.FinalizedAt,
 			&j.AttemptNum, &j.MaxRetry, &j.TimeoutMs,
-			&j.UniqueKey, &j.WorkerID, &j.Tags, &j.ErrorsJSON, &j.Version,
+			&j.UniqueKey, &j.WorkerID, &j.Tags, &j.ErrorsJSON, &j.Version, &j.PipelineID,
 		); err != nil {
 			return nil, err
 		}
 		result = append(result, *j.toRow())
 	}
 	return result, confirmRows.Err()
+}
+
+func jobRescueStuck(ctx context.Context, conn chdriver.Conn, params driver.JobRescueParams) (int64, error) {
+	rows, err := conn.Query(ctx,
+		`SELECT `+selectJobCols+` FROM goncordia_jobs FINAL
+		 WHERE queue=? AND state='running' AND attempted_at<=?`,
+		params.Queue, params.Before,
+	)
+	if err != nil {
+		return 0, err
+	}
+	var jobs []chJob
+	for rows.Next() {
+		var j chJob
+		if err := rows.Scan(
+			&j.ID, &j.Queue, &j.Kind, &j.Args, &j.State, &j.Priority,
+			&j.RunAt, &j.CreatedAt, &j.AttemptedAt, &j.FinalizedAt,
+			&j.AttemptNum, &j.MaxRetry, &j.TimeoutMs,
+			&j.UniqueKey, &j.WorkerID, &j.Tags, &j.ErrorsJSON, &j.Version, &j.PipelineID,
+		); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		jobs = append(jobs, j)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return 0, err
+	}
+	rows.Close()
+	var rescued int64
+	for _, j := range jobs {
+		j.State = string(driver.JobStateAvailable)
+		j.AttemptedAt = nil
+		j.WorkerID = ""
+		j.Version++
+		if err := insertJobRow(ctx, conn, j); err != nil {
+			return rescued, err
+		}
+		rescued++
+	}
+	return rescued, nil
 }
 
 // ---- JobSetStateIfRunning ----
@@ -421,6 +540,16 @@ func jobSetStateIfRunning(ctx context.Context, conn chdriver.Conn, clk clock.Clo
 	}
 	if j.State != string(driver.JobStateRunning) {
 		return nil
+	}
+
+	if params.Yield {
+		yielded := j
+		yielded.State = string(driver.JobStateAvailable)
+		yielded.AttemptNum = j.AttemptNum - 1
+		yielded.AttemptedAt = nil
+		yielded.WorkerID = ""
+		yielded.Version = j.Version + 1
+		return insertJobRow(ctx, conn, yielded)
 	}
 
 	now := clk.Now()

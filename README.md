@@ -28,11 +28,16 @@ tx.Commit(ctx)  // job and order appear atomically
 - **Priority queues** — higher priority processed first within a queue
 - **Unique jobs** — deduplicate by kind, args, queue, or time window
 - **Retry with backoff** — exponential (default), fixed, or custom `RetryPolicy`
+- **Crash recovery** — abandoned `running` jobs are automatically returned to the queue
+- **Execution controls** — global and per-kind concurrency, per-job timeouts, stable worker IDs
+- **Pipelines** — serialize jobs sharing a `PipelineID` within a worker-pool process
+- **Batch enqueue** — shared options or independent per-item options, with transactional variants
 - **Queue pause/resume** — drain a queue without stopping workers
 - **Push notifications** — LISTEN/NOTIFY (Postgres), Change Streams (MongoDB), Pub/Sub (Redis); polling fallback elsewhere
 - **SKIP LOCKED** — lock-free concurrent fetching on Postgres and MySQL
-- **Periodic / cron jobs** — `CronScheduler` with `Every(d)` or custom `ScheduleFunc`
-- **MockClock** — deterministic time control for tests; no `time.Sleep`
+- **Periodic / cron jobs** — lease-based single-leader scheduling across multiple instances
+- **Admin and metrics** — embeddable dashboard, JSON API, health probes, and Prometheus endpoint
+- **`clock.Manual`** — injected deterministic time for clients, workers, schedulers, and drivers
 
 ---
 
@@ -40,7 +45,7 @@ tx.Commit(ctx)  // job and order appear atomically
 
 | Driver | Package | Tx type | Atomic insert | Notes |
 |---|---|---|---|---|
-| PostgreSQL (pgx v5) | `driver/pgxv5` | `pgx.Tx` | ✅ | LISTEN/NOTIFY, advisory locks, SKIP LOCKED |
+| PostgreSQL (pgx v5) | `driver/pgxv5` | `pgx.Tx` | ✅ | LISTEN/NOTIFY, lease leadership, SKIP LOCKED |
 | PostgreSQL / MySQL / SQLite | `driver/stdlib` | `*sql.Tx` | ✅ | pgx stdlib, go-sql-driver/mysql, modernc sqlite |
 | gorm | `driver/gorm` | `*gorm.DB` | ✅ | thin adapter over stdlib |
 | bun | `driver/bun` | `bun.Tx` | ✅ | thin adapter over stdlib |
@@ -65,7 +70,7 @@ tx.Commit(ctx)  // job and order appear atomically
 | Unique jobs | ✅ | ✅ | ✅ | ❌ |
 | Priority queues | ✅ | ✅ | ✅ | ❌ |
 | Push notifications | ✅ LISTEN/NOTIFY, Change Streams, Pub/Sub | ✅ LISTEN/NOTIFY | ✅ Pub/Sub | ❌ polling |
-| Web UI | ❌ | ✅ (River UI, Pro) | ✅ (asynqmon) | ❌ |
+| Web UI | ✅ embeddable | ✅ (River UI, Pro) | ✅ (asynqmon) | ❌ |
 | Workflow primitives (chains, chords) | ❌ | ❌ | ❌ | ✅ |
 
 **Choose goncordia** when you want the transactional outbox pattern and don't want to introduce Redis or a dedicated Postgres instance — it works with whatever database your application already uses.
@@ -269,8 +274,8 @@ d.Migrate(ctx)  // creates tables (idempotent)
 client := cassandradriver.NewClient(d, goncordia.ClientConfig{})
 client.Enqueue(ctx, SendEmailArgs{To: "user@example.com", Subject: "Welcome"}, nil)
 
-// EnqueueTx is identical to Enqueue on Cassandra — no rollback guarantee.
-// Use idempotent workers and unique job options for deduplication.
+// EnqueueTx returns an unsupported-operation error on Cassandra.
+// Enqueue after the business transaction commits and keep workers idempotent.
 ```
 
 ### ClickHouse
@@ -314,7 +319,7 @@ d.Migrate(ctx)  // creates goncordia_jobs + goncordia_uniq + goncordia_queues + 
 client := dynamodbdriver.NewClient(d, goncordia.ClientConfig{})
 client.Enqueue(ctx, SendEmailArgs{To: "user@example.com", Subject: "Welcome"}, nil)
 
-// DynamoDB has no cross-table transactions. EnqueueTx behaves like Enqueue.
+// DynamoDB has no cross-table transactions. EnqueueTx returns an error.
 // Unique-key deduplication uses PutItem with attribute_not_exists condition.
 // Jobs are claimed with conditional UpdateItem — safe for concurrent workers.
 ```
@@ -401,12 +406,56 @@ client.Enqueue(ctx, SendEmailArgs{To: "user@example.com", Subject: "Welcome"}, &
 goncordia.WorkerConfig{
     Queues:          []string{"default", "critical"},
     Concurrency:     20,
+    WorkerID:        "mailer-eu-1",                     // generated when empty
     PollInterval:    500 * time.Millisecond,         // fallback when no push notifications
     RetryPolicy:     core.ExponentialRetry{Base: time.Second, Max: time.Hour},
     ShutdownTimeout: 30 * time.Second,
-    Clock:           clock.NewMock(time.Now()),       // omit in production; inject for tests
+    StuckJobTimeout: time.Hour,                       // negative disables rescue
+    RescueInterval: time.Minute,
+    Clock:           clock.NewManual(time.Now()),     // omit in production; inject for tests
+    ErrorHandler:    func(err error) { logger.Error("worker", "err", err) },
 }
+
+// Per-kind defaults and limits are configured at registration.
+core.RegisterWorker(registry, worker, core.WorkerOpts{
+    MaxRetry: 3, Timeout: 30 * time.Second, Concurrency: 4,
+})
 ```
+
+---
+
+## Batch enqueue and pipelines
+
+Use `EnqueueBatch` when each job needs independent options; `EnqueueBatchTx`
+keeps the whole batch inside the caller's native transaction.
+
+```go
+client.EnqueueBatch(ctx, []goncordia.InsertRequest{
+    {Args: ResizeImageArgs{ID: "cover"}, Opts: &core.InsertOpts{Priority: 10}},
+    {Args: IndexBookArgs{ID: "book-42"}, Opts: &core.InsertOpts{PipelineID: "book-42"}},
+})
+```
+
+Jobs with the same non-empty `PipelineID` run sequentially in claim order inside one
+`WorkerPool`. This is a process-local ordering guarantee; separate worker
+processes require application-level partitioning if they must share a pipeline.
+
+---
+
+## Admin dashboard, health, and metrics
+
+```go
+import "github.com/kirimatt/goncordia/admin"
+
+// Protect this route with your application's authentication/authorization.
+http.Handle("/jobs/", http.StripPrefix("/jobs", admin.New(d)))
+```
+
+The handler exposes the embedded dashboard, `/healthz`, `/readyz`, `/metrics`,
+and JSON routes under `/api`. It supports job filtering, cancel/delete/retry/
+reschedule, queue pause/resume, and per-state queue counts. On Redis, Cassandra,
+DynamoDB, and Firestore, administrative list/metric operations scan records and
+are intended for moderate operational use rather than high-frequency scraping.
 
 ---
 
@@ -429,6 +478,8 @@ cs := goncordia.NewCronScheduler(d, []goncordia.PeriodicJob{
     },
 }, goncordia.CronConfig{
     TickInterval: time.Second, // how often to check for due jobs
+    LeaderName:   "hourly-maintenance",
+    LeaderTTL:    30 * time.Second,
 })
 
 go cs.Start(ctx)   // blocks; cancel ctx to stop
@@ -454,7 +505,7 @@ sched := core.ScheduleFunc(func(last time.Time) time.Time {
 
 - The scheduler fires each job on the **first tick** after `Start`, then respects the interval.
 - `CronScheduler` only *enqueues* — workers run via `WorkerPool`.
-- Add `UniqueOpts` to `PeriodicJob.Opts` to prevent duplicate jobs if multiple scheduler instances run.
+- Multiple scheduler instances are safe: only the current lease holder enqueues jobs.
 
 ---
 
@@ -471,7 +522,7 @@ core.FixedRetry{Delay: 30 * time.Second}
 core.NoRetry{}
 
 // Custom
-import "github.com/kirimatt/goncordia/internal/clock"
+import "github.com/kirimatt/goncordia/clock"
 
 type MyPolicy struct{}
 func (MyPolicy) NextRetryAt(attempt int, err error, clk clock.Clock) time.Time {
@@ -487,14 +538,14 @@ Use the in-memory driver — no database, no Docker, deterministic time:
 
 ```go
 import (
+    "github.com/kirimatt/goncordia/clock"
     "github.com/kirimatt/goncordia/driver/memory"
-    "github.com/kirimatt/goncordia/internal/clock"
 )
 
-clk := clock.NewMock(time.Now())
+clk := clock.NewManual(time.Now())
 d   := memory.New(memory.WithClock(clk))
 
-client := goncordia.NewClient[memory.NoTx](d, goncordia.ClientConfig{})
+client := goncordia.NewClient[memory.NoTx](d, goncordia.ClientConfig{Clock: clk})
 wp     := goncordia.NewWorkerPool[memory.NoTx](d, registry, goncordia.WorkerConfig{Clock: clk})
 
 go wp.Start(ctx)
@@ -520,7 +571,7 @@ func (d *MyDriver) Listener() driver.Listener          { return nil } // nil = p
 func (d *MyDriver) Close() error                       { return nil }
 ```
 
-`driver.Executor` has 14 methods covering job CRUD, queue management, and leader election. See [`driver/driver.go`](driver/driver.go) for the full interface and [`driver/memory/memory.go`](driver/memory/memory.go) for a minimal reference implementation.
+See [`driver/driver.go`](driver/driver.go) for the full core interface and optional rescue/admin capabilities, and [`driver/memory/memory.go`](driver/memory/memory.go) for a reference implementation. Driver authors can reuse `driver/drivertest.Run` as a conformance suite.
 
 ---
 
@@ -687,6 +738,7 @@ wp := pgxdriver.NewWorkerPool(d, registry, goncordia.WorkerConfig{
             // optional — defaults to otel.GetTracerProvider() / otel.GetMeterProvider()
             otelgoncordia.WithTracerProvider(tp),
             otelgoncordia.WithMeterProvider(mp),
+            otelgoncordia.WithClock(clk), // optional; use the same Manual clock in tests
         ),
     },
 })
@@ -694,8 +746,9 @@ wp := pgxdriver.NewWorkerPool(d, registry, goncordia.WorkerConfig{
 
 Each job execution produces:
 
-- **Span** `goncordia.process` with attributes `goncordia.job.kind`, `goncordia.job.queue`, `goncordia.job.id`, `goncordia.job.attempt`
+- **Span** `goncordia.process` with job, worker, and pipeline attributes
 - **Histogram** `goncordia.job.duration` (seconds) — labelled by kind, queue, status
+- **Histogram** `goncordia.job.queue_time` (seconds) — time from enqueue to handler start
 - **Counter** `goncordia.job.count` — labelled by kind, queue, status (`ok` / `error`)
 
 Panics are recovered, converted to errors, and recorded on the span before re-triggering the retry policy — the worker pool always stays alive.
@@ -727,6 +780,8 @@ goncordia/
 ├── client.go              # Client[TTx] — Enqueue, EnqueueTx, Cancel
 ├── worker.go              # WorkerPool[TTx] — Start, Stop, JobMiddleware
 ├── cron.go                # CronScheduler[TTx] — periodic/cron job scheduling
+├── admin/                 # dashboard, JSON API, probes, Prometheus metrics
+├── clock/                 # injectable Real and Manual clocks
 ├── core/
 │   ├── job.go             # JobArgs, Worker, InsertOpts, WorkerOpts
 │   ├── registry.go        # type-erased worker dispatch
@@ -735,7 +790,7 @@ goncordia/
 ├── driver/
 │   ├── driver.go          # Driver[TTx], Executor, ExecutorTx, Listener interfaces
 │   ├── memory/            # in-memory (no persistence; for tests)
-│   ├── pgxv5/             # PostgreSQL via pgx v5 (LISTEN/NOTIFY, advisory locks)
+│   ├── pgxv5/             # PostgreSQL via pgx v5 (LISTEN/NOTIFY, lease leadership)
 │   ├── stdlib/            # PostgreSQL + MySQL + SQLite via database/sql
 │   ├── gorm/              # gorm adapter (wraps stdlib)
 │   ├── bun/               # bun adapter (wraps stdlib)
@@ -746,8 +801,7 @@ goncordia/
 │   ├── dynamodb/          # Amazon DynamoDB (conditional writes; at-least-once)
 │   └── firestore/         # Cloud Firestore (RunTransaction; ACID inserts)
 ├── gontest/               # test helpers (Tracker, WorkerHelper, MockClock)
-├── otel/                  # OpenTelemetry middleware (spans + metrics)
-└── internal/clock/        # Clock interface + MockClock
+└── otel/                  # OpenTelemetry middleware (spans + metrics)
 ```
 
 ---
@@ -765,4 +819,3 @@ goncordia/
 | DynamoDB | **None** — at-least-once | Conditional writes; no cross-table tx |
 | Firestore | Atomic with business tx | `RunTransaction` + `EnqueueTx` |
 | In-memory | Atomic (in-process) | Single mutex |
-

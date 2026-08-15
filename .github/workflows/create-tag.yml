@@ -25,8 +25,18 @@ jobs:
           fetch-depth: 0
 
       - name: Create and push tag
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
         run: |
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "Invalid semantic-version tag: $RELEASE_TAG" >&2
+            exit 1
+          fi
+          if git rev-parse --verify --quiet "refs/tags/$RELEASE_TAG"; then
+            echo "Tag already exists: $RELEASE_TAG" >&2
+            exit 1
+          fi
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git tag ${{ inputs.tag }}
-          git push origin ${{ inputs.tag }}
+          git tag -- "$RELEASE_TAG"
+          git push origin "refs/tags/$RELEASE_TAG"

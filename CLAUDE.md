@@ -98,7 +98,7 @@ No Docker, no database, deterministic time:
 ```go
 import (
     "github.com/kirimatt/goncordia/gontest"
-    "github.com/kirimatt/goncordia/internal/clock"
+    "github.com/kirimatt/goncordia/clock"
 )
 
 // Assert that business code enqueues the right job:
@@ -146,7 +146,9 @@ Push notification support by backend:
 
 ## At-least-once delivery for non-transactional backends
 
-Redis, Cassandra, ClickHouse, and DynamoDB do not support transactions. `EnqueueTx` on these backends behaves identically to `Enqueue` — there is no rollback if the surrounding business transaction fails. Use the post-commit enqueue pattern:
+Redis, Cassandra, ClickHouse, and DynamoDB do not support transactions. Their
+`EnqueueTx` method returns an unsupported-operation error. Use the post-commit
+enqueue pattern:
 
 ```go
 // Safe pattern for non-transactional backends
@@ -163,7 +165,20 @@ Workers on these backends must be **idempotent** — a job may be executed more 
 
 ## Common mistakes
 
-- **Redis / Cassandra / ClickHouse / DynamoDB**: `EnqueueTx` on these backends has no rollback guarantee — it behaves like `Enqueue`. Use the post-commit enqueue pattern for at-least-once delivery.
+- **Redis / Cassandra / ClickHouse / DynamoDB**: `EnqueueTx` is rejected. Use the post-commit enqueue pattern for at-least-once delivery.
 - **MongoDB**: requires a replica set; standalone MongoDB will fail at `New()`.
 - **SQLite**: set `db.SetMaxOpenConns(1)` — SQLite allows only one writer.
 - **Firestore**: `Migrate` is a no-op; create the composite index manually in Firebase console: collection `goncordia_jobs`, fields `queue ASC, state ASC, run_at ASC`.
+
+## Injected time
+
+Use `github.com/kirimatt/goncordia/clock`. Pass the same `clock.Manual` to the
+client, worker/scheduler config, and driver `WithClock` option in tests. Calling
+`Advance` fires due timers and tickers without sleeping.
+
+## Operations
+
+Mount `admin.New(driver)` behind application authentication for the dashboard,
+JSON job/queue actions, health/readiness probes, and Prometheus metrics. Workers
+automatically rescue stale running jobs; tune `StuckJobTimeout` and
+`RescueInterval` in `WorkerConfig`.

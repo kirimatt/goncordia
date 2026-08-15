@@ -34,10 +34,10 @@ import (
 	"time"
 
 	goncordia "github.com/kirimatt/goncordia"
+	"github.com/kirimatt/goncordia/clock"
 	"github.com/kirimatt/goncordia/core"
 	"github.com/kirimatt/goncordia/driver"
 	"github.com/kirimatt/goncordia/driver/memory"
-	"github.com/kirimatt/goncordia/internal/clock"
 )
 
 // NoTx is the transaction type for the test client.
@@ -53,6 +53,7 @@ type WorkerPool = goncordia.WorkerPool[memory.NoTx]
 // MockClock is a controllable fake clock for deterministic time in tests.
 // Use Advance to move time forward; inject into workers via WorkerConfig.Clock.
 type MockClock = clock.Mock
+type ManualClock = clock.Manual
 
 // NewMockClock returns a MockClock set to 2024-01-01 00:00:00 UTC.
 func NewMockClock() *MockClock {
@@ -63,7 +64,8 @@ func NewMockClock() *MockClock {
 // helpers over the job store. It is intentionally tied to the memory driver —
 // for integration tests against a real backend use that driver's test helpers.
 type Tracker struct {
-	d *memory.Driver
+	d   *memory.Driver
+	clk clock.Clock
 }
 
 // NewClient creates an in-memory test Client and Tracker that share the same job
@@ -88,13 +90,16 @@ func NewClientWithClock(t testing.TB, clk *MockClock) (*Client, *Tracker) {
 	t.Helper()
 	d := memory.New(memory.WithClock(clk))
 	t.Cleanup(func() { d.Close() })
-	return goncordia.NewClient[memory.NoTx](d, goncordia.ClientConfig{}), &Tracker{d: d}
+	return goncordia.NewClient[memory.NoTx](d, goncordia.ClientConfig{Clock: clk}), &Tracker{d: d, clk: clk}
 }
 
 // NewWorkerPool creates a WorkerPool backed by the same store as this Tracker.
 // The pool and tracker share state, so jobs enqueued via the paired Client are
 // visible to workers started via this pool.
 func (tr *Tracker) NewWorkerPool(registry *core.Registry, cfg goncordia.WorkerConfig) *WorkerPool {
+	if cfg.Clock == nil && tr.clk != nil {
+		cfg.Clock = tr.clk
+	}
 	return goncordia.NewWorkerPool[memory.NoTx](tr.d, registry, cfg)
 }
 
@@ -123,6 +128,7 @@ func Jobs[T core.JobArgs](tr *Tracker) []*core.Job[T] {
 			AttemptNum: row.AttemptNum,
 			MaxRetry:   row.MaxRetry,
 			CreatedAt:  row.CreatedAt,
+			WorkerID:   row.WorkerID,
 			Tags:       row.Tags,
 		})
 	}

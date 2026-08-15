@@ -1,13 +1,15 @@
 {
   "$schema": "https://context7.com/schema/context7.json",
   "projectTitle": "goncordia",
-  "description": "Transactional job queue engine for Go. One Driver[TTx] interface covers Postgres, MySQL, SQLite, MongoDB, Redis, Cassandra, ClickHouse, DynamoDB, Firestore, and in-memory. Implements the transactional outbox pattern via EnqueueTx.",
+  "description": "Transactional job queue engine for Go with 10 storage backends, crash recovery, pipelines, leader-safe scheduling, an admin dashboard, OpenTelemetry, and injected deterministic clocks.",
   "folders": [],
   "excludeFolders": ["bench"],
   "rules": [
     "Use EnqueueTx (not Enqueue) when inside a database transaction — this is the transactional outbox pattern and guarantees the job appears only if the transaction commits",
     "Use the in-memory driver (driver/memory) and gontest package for tests — no Docker or real database needed",
+    "Inject clock.Manual into the client, worker or scheduler, and driver in tests; Advance fires timers and tickers without sleeping",
     "Redis, Cassandra, ClickHouse, and DynamoDB do not support transactional rollback; use Enqueue after commit for these backends",
+    "Mount admin.New(driver) behind application authentication; it exposes mutating job and queue actions",
     "MongoDB requires a replica set — standalone MongoDB will fail at New()",
     "SQLite requires db.SetMaxOpenConns(1) — only one writer allowed",
     "Firestore requires a composite index created manually: collection goncordia_jobs, fields queue ASC + state ASC + run_at ASC"

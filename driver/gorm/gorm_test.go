@@ -11,9 +11,10 @@ import (
 	gormpkg "gorm.io/gorm"
 
 	"github.com/kirimatt/goncordia"
+	"github.com/kirimatt/goncordia/clock"
 	"github.com/kirimatt/goncordia/core"
+	"github.com/kirimatt/goncordia/driver/drivertest"
 	gormdriver "github.com/kirimatt/goncordia/driver/gorm"
-	"github.com/kirimatt/goncordia/internal/clock"
 )
 
 type EmailJob struct {
@@ -50,6 +51,7 @@ func newDriver(t *testing.T, opts ...gormdriver.Option) (*gormdriver.Driver, *go
 
 func TestGorm_EnqueueAndProcess(t *testing.T) {
 	d, _ := newDriver(t)
+	drivertest.Run(t, d.Executor())
 	ctx := context.Background()
 
 	var processed atomic.Int64

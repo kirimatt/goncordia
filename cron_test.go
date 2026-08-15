@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/kirimatt/goncordia"
+	"github.com/kirimatt/goncordia/clock"
 	"github.com/kirimatt/goncordia/core"
 	"github.com/kirimatt/goncordia/driver/memory"
 )
@@ -142,4 +143,39 @@ func TestCronScheduler_StopsOnContextCancel(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("Start did not return after ctx cancel")
 	}
+}
+
+func TestCronScheduler_UsesLeaderElection(t *testing.T) {
+	d := memory.New()
+	jobs := []goncordia.PeriodicJob{{Schedule: core.Every(time.Hour), Args: cronJob{N: 7}}}
+	config := goncordia.CronConfig{TickInterval: 10 * time.Millisecond, LeaderTTL: 100 * time.Millisecond}
+	first := goncordia.NewCronScheduler(d, jobs, config)
+	second := goncordia.NewCronScheduler(d, jobs, config)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go first.Start(ctx)  //nolint:errcheck
+	go second.Start(ctx) //nolint:errcheck
+	time.Sleep(80 * time.Millisecond)
+	if got := len(d.AllJobs()); got != 1 {
+		t.Fatalf("leader election enqueued %d jobs, want 1", got)
+	}
+}
+
+func TestCronScheduler_UsesInjectedManualClock(t *testing.T) {
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	manual := clock.NewManual(base)
+	d := memory.New(memory.WithClock(manual))
+	cs := goncordia.NewCronScheduler(d, []goncordia.PeriodicJob{
+		{Schedule: core.Every(time.Hour), Args: cronJob{N: 8}},
+	}, goncordia.CronConfig{TickInterval: time.Second, Clock: manual})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go cs.Start(ctx) //nolint:errcheck
+	waitForCondition(t, time.Second, func() bool { return manual.ActiveTimers() == 1 }, "cron ticker registration")
+
+	manual.Advance(time.Second)
+	waitForCondition(t, time.Second, func() bool { return len(d.AllJobs()) == 1 }, "first manual tick")
+	manual.Advance(time.Hour)
+	waitForCondition(t, time.Second, func() bool { return len(d.AllJobs()) == 2 }, "scheduled manual tick")
 }

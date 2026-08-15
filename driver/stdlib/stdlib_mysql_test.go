@@ -11,9 +11,10 @@ import (
 	_ "github.com/go-sql-driver/mysql"
 
 	"github.com/kirimatt/goncordia"
+	"github.com/kirimatt/goncordia/clock"
 	"github.com/kirimatt/goncordia/core"
+	"github.com/kirimatt/goncordia/driver/drivertest"
 	stdlibdriver "github.com/kirimatt/goncordia/driver/stdlib"
-	"github.com/kirimatt/goncordia/internal/clock"
 )
 
 func newMySQLDriver(t *testing.T, opts ...stdlibdriver.Option) *stdlibdriver.Driver {
@@ -27,7 +28,7 @@ func newMySQLDriver(t *testing.T, opts ...stdlibdriver.Option) *stdlibdriver.Dri
 
 	// Each test gets a fresh schema by using a unique DB name via a fresh migrate.
 	// Because we share the container we just drop/recreate tables.
-	if _, err := db.ExecContext(ctx, "DROP TABLE IF EXISTS goncordia_jobs, goncordia_queues"); err != nil {
+	if _, err := db.ExecContext(ctx, "DROP TABLE IF EXISTS goncordia_jobs, goncordia_queues, goncordia_leaders, goncordia_schema_migrations"); err != nil {
 		db.Close()
 		t.Fatalf("drop tables: %v", err)
 	}
@@ -43,6 +44,7 @@ func newMySQLDriver(t *testing.T, opts ...stdlibdriver.Option) *stdlibdriver.Dri
 
 func TestStdlibMySQL_EnqueueAndProcess(t *testing.T) {
 	d := newMySQLDriver(t)
+	drivertest.Run(t, d.Executor())
 	ctx := context.Background()
 
 	var processed atomic.Int64

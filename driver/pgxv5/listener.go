@@ -3,6 +3,7 @@ package pgxv5
 import (
 	"context"
 	"fmt"
+	"sync"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -13,6 +14,8 @@ import (
 // Each Listen call acquires a dedicated connection from the pool.
 type listener struct {
 	pool *pgxpool.Pool
+	mu   sync.Mutex
+	subs map[string]*subscription
 }
 
 type subscription struct {
@@ -38,14 +41,31 @@ func (l *listener) Listen(ctx context.Context, queue string) (<-chan driver.Noti
 	subCtx, cancel := context.WithCancel(ctx)
 
 	sub := &subscription{conn: conn, ch: ch, queue: queue, cancel: cancel}
-	go sub.receiveLoop(subCtx)
+	l.mu.Lock()
+	if l.subs == nil {
+		l.subs = make(map[string]*subscription)
+	}
+	previous := l.subs[queue]
+	l.subs[queue] = sub
+	l.mu.Unlock()
+	if previous != nil {
+		previous.cancel()
+	}
+	go l.receiveLoop(subCtx, sub)
 
 	return ch, nil
 }
 
-func (s *subscription) receiveLoop(ctx context.Context) {
+func (l *listener) receiveLoop(ctx context.Context, s *subscription) {
 	defer s.conn.Release()
 	defer close(s.ch)
+	defer func() {
+		l.mu.Lock()
+		if l.subs[s.queue] == s {
+			delete(l.subs, s.queue)
+		}
+		l.mu.Unlock()
+	}()
 
 	for {
 		n, err := s.conn.Conn().WaitForNotification(ctx)
@@ -62,13 +82,30 @@ func (s *subscription) receiveLoop(ctx context.Context) {
 	}
 }
 
-func (l *listener) Unlisten(ctx context.Context, queue string) error {
-	// Connections are released when their context is cancelled via Listen's subCtx.
-	// This method is provided for completeness; callers should cancel the Listen context.
+func (l *listener) Unlisten(_ context.Context, queue string) error {
+	l.mu.Lock()
+	sub := l.subs[queue]
+	delete(l.subs, queue)
+	l.mu.Unlock()
+	if sub != nil {
+		sub.cancel()
+	}
 	return nil
 }
 
-func (l *listener) Close() error { return nil }
+func (l *listener) Close() error {
+	l.mu.Lock()
+	subs := make([]*subscription, 0, len(l.subs))
+	for _, sub := range l.subs {
+		subs = append(subs, sub)
+	}
+	l.subs = make(map[string]*subscription)
+	l.mu.Unlock()
+	for _, sub := range subs {
+		sub.cancel()
+	}
+	return nil
+}
 
 // pgQuoteIdentifier wraps an identifier in double quotes and escapes internal quotes.
 func pgQuoteIdentifier(s string) string {

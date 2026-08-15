@@ -12,8 +12,8 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	"github.com/kirimatt/goncordia/clock"
 	"github.com/kirimatt/goncordia/driver"
-	"github.com/kirimatt/goncordia/internal/clock"
 )
 
 // errJobGone signals that a candidate job was already claimed by another worker.
@@ -40,6 +40,7 @@ type jobDoc struct {
 	Tags        []string   `firestore:"tags"`
 	Errors      []jobError `firestore:"errors"`
 	Version     int64      `firestore:"version"`
+	PipelineID  string     `firestore:"pipeline_id"`
 }
 
 type jobError struct {
@@ -80,8 +81,17 @@ func (e *executor) JobInsertMany(ctx context.Context, params []driver.JobInsertP
 func (e *executor) JobGetByID(ctx context.Context, id string) (*driver.JobRow, error) {
 	return jobGetByID(ctx, e.client, id)
 }
+func (e *executor) JobList(ctx context.Context, params driver.JobListParams) ([]driver.JobRow, error) {
+	return jobList(ctx, e.client, params)
+}
+func (e *executor) QueueStats(ctx context.Context, queue string) (driver.QueueStats, error) {
+	return queueStats(ctx, e.client, queue)
+}
 func (e *executor) JobFetchBatch(ctx context.Context, params driver.FetchParams) ([]driver.JobRow, error) {
 	return jobFetchBatch(ctx, e.client, e.clk, params)
+}
+func (e *executor) JobRescueStuck(ctx context.Context, params driver.JobRescueParams) (int64, error) {
+	return jobRescueStuck(ctx, e.client, params)
 }
 func (e *executor) JobSetStateIfRunning(ctx context.Context, params driver.JobSetStateParams) error {
 	return jobSetStateIfRunning(ctx, e.client, e.clk, params)
@@ -217,6 +227,7 @@ func jobInsertMany(ctx context.Context, client *firestore.Client, clk clock.Cloc
 			Tags:       tags,
 			Errors:     []jobError{},
 			Version:    1,
+			PipelineID: p.PipelineID,
 		}
 
 		jobRef := client.Collection(colJobs).Doc(id)
@@ -311,6 +322,7 @@ func jobInsertManyTx(ctx context.Context, client *firestore.Client, tx *firestor
 			Tags:       tags,
 			Errors:     []jobError{},
 			Version:    1,
+			PipelineID: p.PipelineID,
 		}
 		entries[i] = entry{
 			jobRef: client.Collection(colJobs).Doc(id),
@@ -364,6 +376,61 @@ func jobGetByID(ctx context.Context, client *firestore.Client, id string) (*driv
 		return nil, err
 	}
 	return docToRow(j), nil
+}
+
+func jobList(ctx context.Context, client *firestore.Client, params driver.JobListParams) ([]driver.JobRow, error) {
+	query := client.Collection(colJobs).Query
+	if params.Queue != "" {
+		query = query.Where("queue", "==", params.Queue)
+	}
+	if params.State != "" {
+		query = query.Where("state", "==", string(params.State))
+	}
+	if params.Kind != "" {
+		query = query.Where("kind", "==", params.Kind)
+	}
+	snaps, err := query.Documents(ctx).GetAll()
+	if err != nil {
+		return nil, err
+	}
+	rows := make([]driver.JobRow, 0, len(snaps))
+	for _, snap := range snaps {
+		var job jobDoc
+		if snap.DataTo(&job) != nil || params.Cursor != "" && job.ID >= params.Cursor {
+			continue
+		}
+		rows = append(rows, *docToRow(job))
+	}
+	sort.Slice(rows, func(i, j int) bool {
+		if !rows[i].CreatedAt.Equal(rows[j].CreatedAt) {
+			return rows[i].CreatedAt.After(rows[j].CreatedAt)
+		}
+		return rows[i].ID > rows[j].ID
+	})
+	limit := params.Limit
+	if limit <= 0 || limit > 1000 {
+		limit = 100
+	}
+	if len(rows) > limit {
+		rows = rows[:limit]
+	}
+	return rows, nil
+}
+
+func queueStats(ctx context.Context, client *firestore.Client, queue string) (driver.QueueStats, error) {
+	snaps, err := client.Collection(colJobs).Where("queue", "==", queue).Documents(ctx).GetAll()
+	if err != nil {
+		return driver.QueueStats{}, err
+	}
+	stats := driver.QueueStats{Queue: queue, States: make(map[driver.JobState]int64)}
+	for _, snap := range snaps {
+		var job jobDoc
+		if snap.DataTo(&job) == nil {
+			stats.States[driver.JobState(job.State)]++
+			stats.Total++
+		}
+	}
+	return stats, nil
 }
 
 // ---- JobFetchBatch ----
@@ -466,10 +533,52 @@ func jobFetchBatch(ctx context.Context, client *firestore.Client, clk clock.Cloc
 			Errors:      jobErrorsToRow(j.Errors),
 			UniqueKey:   j.UniqueKey,
 			WorkerID:    params.WorkerID,
+			PipelineID:  j.PipelineID,
 		}
 		claimed = append(claimed, row)
 	}
 	return claimed, nil
+}
+
+func jobRescueStuck(ctx context.Context, client *firestore.Client, params driver.JobRescueParams) (int64, error) {
+	snaps, err := client.Collection(colJobs).
+		Where("queue", "==", params.Queue).
+		Where("state", "==", string(driver.JobStateRunning)).
+		Where("attempted_at", "<=", params.Before).
+		Documents(ctx).GetAll()
+	if err != nil {
+		return 0, err
+	}
+	var rescued int64
+	for _, snap := range snaps {
+		err := client.RunTransaction(ctx, func(ctx context.Context, tx *firestore.Transaction) error {
+			current, err := tx.Get(snap.Ref)
+			if err != nil {
+				return err
+			}
+			var job jobDoc
+			if err := current.DataTo(&job); err != nil {
+				return err
+			}
+			if job.State != string(driver.JobStateRunning) || job.AttemptedAt.After(params.Before) {
+				return errJobGone
+			}
+			return tx.Update(snap.Ref, []firestore.Update{
+				{Path: "state", Value: string(driver.JobStateAvailable)},
+				{Path: "worker_id", Value: ""},
+				{Path: "attempted_at", Value: time.Time{}},
+				{Path: "version", Value: firestore.Increment(1)},
+			})
+		})
+		if errors.Is(err, errJobGone) {
+			continue
+		}
+		if err != nil {
+			return rescued, err
+		}
+		rescued++
+	}
+	return rescued, nil
 }
 
 // ---- JobSetStateIfRunning ----
@@ -493,6 +602,17 @@ func jobSetStateIfRunning(ctx context.Context, client *firestore.Client, clk clo
 		}
 
 		now := clk.Now()
+
+		if params.Yield {
+			return tx.Update(jobRef, []firestore.Update{
+				{Path: "state", Value: string(driver.JobStateAvailable)},
+				{Path: "worker_id", Value: ""},
+				{Path: "attempted_at", Value: time.Time{}},
+				{Path: "attempt_num", Value: firestore.Increment(-1)},
+				{Path: "version", Value: firestore.Increment(1)},
+			})
+		}
+
 		updates := []firestore.Update{
 			{Path: "worker_id", Value: ""},
 			{Path: "version", Value: firestore.Increment(1)},
@@ -522,6 +642,9 @@ func jobSetStateIfRunning(ctx context.Context, client *firestore.Client, clk clo
 				firestore.Update{Path: "state", Value: string(params.State)},
 				firestore.Update{Path: "finalized_at", Value: now.UTC()},
 			)
+			if j.UniqueKey != "" {
+				tx.Delete(client.Collection(colUniq).Doc(j.Queue + "#" + j.UniqueKey)) //nolint:errcheck
+			}
 		}
 
 		return tx.Update(jobRef, updates)
@@ -626,10 +749,10 @@ func queueGet(ctx context.Context, client *firestore.Client, clk clock.Clock, na
 }
 
 func queueSetPaused(ctx context.Context, client *firestore.Client, clk clock.Clock, name string, paused bool) error {
-	_, err := client.Collection(colQueues).Doc(name).Update(ctx, []firestore.Update{
-		{Path: "paused", Value: paused},
-		{Path: "updated_at", Value: clk.Now().UTC()},
-	})
+	now := clk.Now().UTC()
+	_, err := client.Collection(colQueues).Doc(name).Set(ctx, map[string]any{
+		"name": name, "paused": paused, "created_at": now, "updated_at": now,
+	}, firestore.MergeAll)
 	return err
 }
 
@@ -723,6 +846,7 @@ func docToRow(j jobDoc) *driver.JobRow {
 		WorkerID:   j.WorkerID,
 		Tags:       j.Tags,
 		Errors:     jobErrorsToRow(j.Errors),
+		PipelineID: j.PipelineID,
 	}
 	if !j.AttemptedAt.IsZero() {
 		t := j.AttemptedAt

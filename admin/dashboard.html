@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>goncordia admin</title>
+  <style>
+    :root{color-scheme:dark;--bg:#11100e;--panel:#1b1915;--line:#393329;--text:#f3eee3;--muted:#a9a091;--amber:#e4a83a;--red:#e26767}
+    *{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 ui-sans-serif,system-ui,sans-serif}
+    header,main{max-width:1200px;margin:auto;padding:24px} header{display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid var(--line)}
+    h1{font-size:20px;margin:0} h2{font-size:15px;margin:0 0 14px}.brand{color:var(--amber)}
+    .grid{display:grid;grid-template-columns:340px 1fr;gap:18px}.panel{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:18px}
+    input,select,button{background:#242019;color:var(--text);border:1px solid var(--line);border-radius:6px;padding:8px 10px}button{cursor:pointer}button:hover{border-color:var(--amber)}
+    form{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px}table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:9px;border-bottom:1px solid var(--line);vertical-align:top}th{color:var(--muted);font-weight:500}
+    .muted{color:var(--muted)}.state{color:var(--amber)}.actions{display:flex;gap:6px}.error{color:var(--red);white-space:pre-wrap}.queue{display:flex;justify-content:space-between;gap:8px;padding:10px 0;border-bottom:1px solid var(--line)}
+    code{font-size:12px;word-break:break-all}@media(max-width:800px){.grid{grid-template-columns:1fr}header,main{padding:16px}}
+  </style>
+</head>
+<body>
+<header><h1><span class="brand">goncordia</span> admin</h1><span id="health" class="muted">checking…</span></header>
+<main><div class="grid">
+  <section class="panel"><h2>Queues</h2><div id="queues"></div></section>
+  <section class="panel"><h2>Jobs</h2>
+    <form id="filters"><input name="queue" placeholder="queue"><input name="kind" placeholder="kind"><select name="state"><option value="">all states</option><option>available</option><option>running</option><option>scheduled</option><option>completed</option><option>discarded</option><option>cancelled</option></select><button>Refresh</button></form>
+    <div id="error" class="error"></div><table><thead><tr><th>ID / kind</th><th>Queue</th><th>State</th><th>Attempts</th><th>Actions</th></tr></thead><tbody id="jobs"></tbody></table>
+  </section>
+</div></main>
+<script>
+const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const urlpart=s=>encodeURIComponent(s).replace(/'/g,'%27');
+async function api(url,opts){const r=await fetch(url,opts);const body=await r.json().catch(()=>({}));if(!r.ok)throw new Error(body.error||r.statusText);return body}
+async function health(){try{const h=await api('healthz');document.querySelector('#health').textContent=`${h.driver} · ready`}catch(e){document.querySelector('#health').textContent='unavailable'}}
+async function queues(){const rows=await api('api/queues');document.querySelector('#queues').innerHTML=rows.map(q=>`<div class="queue"><div><strong>${esc(q.Name)}</strong><div class="muted">${q.stats?esc(q.stats.total)+' jobs':'stats unavailable'}</div></div><button onclick="queueAction('${urlpart(q.Name)}','${q.Paused?'resume':'pause'}')">${q.Paused?'Resume':'Pause'}</button></div>`).join('')||'<span class="muted">No queues</span>'}
+async function queueAction(q,a){await api(`api/queues/${q}/${a}`,{method:'POST'});await queues()}
+async function jobs(){const p=new URLSearchParams(new FormData(document.querySelector('#filters')));try{const rows=await api('api/jobs?'+p);document.querySelector('#error').textContent='';document.querySelector('#jobs').innerHTML=rows.map(j=>`<tr><td><code>${esc(j.ID)}</code><br>${esc(j.Kind)}</td><td>${esc(j.Queue)}</td><td class="state">${esc(j.State)}</td><td>${esc(j.AttemptNum)} / ${esc(j.MaxRetry)}</td><td><div class="actions"><button onclick="jobAction('${urlpart(j.ID)}','retry')">Retry</button><button onclick="jobAction('${urlpart(j.ID)}','cancel')">Cancel</button><button onclick="jobAction('${urlpart(j.ID)}','delete')">Delete</button></div></td></tr>`).join('')}catch(e){document.querySelector('#error').textContent=e.message}}
+async function jobAction(id,a){await api(`api/jobs/${id}/${a}`,{method:'POST'});await jobs();await queues()}
+document.querySelector('#filters').addEventListener('submit',e=>{e.preventDefault();jobs()});health();queues();jobs();setInterval(health,15000);
+</script>
+</body></html>

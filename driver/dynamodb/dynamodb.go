@@ -2,10 +2,9 @@
 //
 // # Transaction guarantees
 //
-// DynamoDB does not support multi-statement transactions that can wrap external
-// business operations. EnqueueTx is identical to Enqueue — there is NO atomicity
-// between your business operations and job insertion. Jobs are delivered
-// at-least-once when combined with idempotent workers.
+// DynamoDB does not support transactions that can wrap external business
+// operations. EnqueueTx is rejected; enqueue after the business operation commits.
+// Jobs are delivered at-least-once when combined with idempotent workers.
 //
 // Conditional writes (ConditionExpression) are used internally for atomic job
 // claiming and unique-key deduplication.
@@ -37,9 +36,9 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 
 	goncordia "github.com/kirimatt/goncordia"
+	"github.com/kirimatt/goncordia/clock"
 	"github.com/kirimatt/goncordia/core"
 	"github.com/kirimatt/goncordia/driver"
-	"github.com/kirimatt/goncordia/internal/clock"
 )
 
 const (
@@ -52,7 +51,7 @@ const (
 
 // NoTx is the transaction type for the DynamoDB driver.
 // DynamoDB's TransactWriteItems covers only DynamoDB operations and cannot
-// span external business transactions; EnqueueTx behaves like Enqueue.
+// span external business transactions; EnqueueTx is rejected.
 type NoTx struct{}
 
 // Driver implements driver.Driver[NoTx] backed by Amazon DynamoDB.

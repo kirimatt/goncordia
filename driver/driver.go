@@ -64,6 +64,20 @@ type ExecutorTx interface {
 	Rollback(ctx context.Context) error
 }
 
+// StuckJobRescuer is an optional executor capability implemented by drivers
+// that can atomically return abandoned running jobs to the available state.
+// WorkerPool detects this interface automatically.
+type StuckJobRescuer interface {
+	JobRescueStuck(ctx context.Context, params JobRescueParams) (int64, error)
+}
+
+// AdminExecutor is an optional executor capability used by the admin HTTP API
+// for filtered job inspection and queue-depth metrics.
+type AdminExecutor interface {
+	JobList(ctx context.Context, params JobListParams) ([]JobRow, error)
+	QueueStats(ctx context.Context, queue string) (QueueStats, error)
+}
+
 // baseExecutor groups the core data-access methods shared by both
 // transactional and non-transactional executors.
 type baseExecutor interface {
@@ -97,15 +111,16 @@ type baseExecutor interface {
 
 // JobInsertParams carries the data needed to enqueue a new job.
 type JobInsertParams struct {
-	Queue     string
-	Kind      string    // job type name, used to dispatch to the right worker
-	Args      []byte    // JSON-encoded job arguments
-	Priority  int       // higher = processed first; default 0
-	RunAt     time.Time // zero means "immediately"
-	UniqueKey string    // optional; prevents duplicate jobs with the same key+state
-	MaxRetry  int
-	Timeout   time.Duration
-	Tags      []string
+	Queue      string
+	Kind       string    // job type name, used to dispatch to the right worker
+	Args       []byte    // JSON-encoded job arguments
+	Priority   int       // higher = processed first; default 0
+	RunAt      time.Time // zero means "immediately"
+	UniqueKey  string    // optional; prevents duplicate jobs with the same key+state
+	MaxRetry   int
+	Timeout    time.Duration
+	Tags       []string
+	PipelineID string // optional; jobs with the same non-empty PipelineID run sequentially
 }
 
 // JobInsertResult is returned after a successful insert.
@@ -121,12 +136,24 @@ type FetchParams struct {
 	WorkerID string
 }
 
+// JobRescueParams selects abandoned jobs claimed before Before.
+type JobRescueParams struct {
+	Queue  string
+	Before time.Time
+}
+
 // JobSetStateParams transitions a running job to a new state.
 type JobSetStateParams struct {
 	ID      string
 	State   JobState
 	Err     *string   // serialized error for failed/retryable states
+	Attempt int       // attempt number associated with Err
 	RetryAt time.Time // populated when State == JobStateRetryable
+	// Yield returns the job to available without recording an error or counting
+	// an attempt. Used by the pipeline serialization mechanism when a job cannot
+	// run yet because another job with the same PipelineID is already running.
+	// When Yield is true all other fields except ID are ignored.
+	Yield bool
 }
 
 // RescheduleParams reschedules a job to run at a future time.
@@ -139,6 +166,32 @@ type RescheduleParams struct {
 type QueueListParams struct {
 	Limit  int
 	Cursor string
+}
+
+// JobListParams controls filtered administrative job listing.
+type JobListParams struct {
+	Queue  string
+	State  JobState
+	Kind   string
+	Limit  int
+	Cursor string
+}
+
+// QueueStats contains job counts by state for one queue.
+type QueueStats struct {
+	Queue  string             `json:"queue"`
+	States map[JobState]int64 `json:"states"`
+	Total  int64              `json:"total"`
+}
+
+// CountQueueStats builds queue statistics from canonical rows.
+func CountQueueStats(queue string, rows []JobRow) QueueStats {
+	stats := QueueStats{Queue: queue, States: make(map[JobState]int64)}
+	for _, row := range rows {
+		stats.States[row.State]++
+		stats.Total++
+	}
+	return stats
 }
 
 // LeaderElectParams carries the parameters for a leader election attempt.
@@ -169,6 +222,7 @@ type JobRow struct {
 	Errors      []AttemptError
 	UniqueKey   string
 	WorkerID    string
+	PipelineID  string // groups jobs that must not run concurrently
 }
 
 // AttemptError records a single failed attempt.

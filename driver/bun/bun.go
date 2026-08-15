@@ -27,10 +27,10 @@ import (
 	bundialect "github.com/uptrace/bun/dialect"
 
 	goncordia "github.com/kirimatt/goncordia"
+	"github.com/kirimatt/goncordia/clock"
 	"github.com/kirimatt/goncordia/core"
 	"github.com/kirimatt/goncordia/driver"
 	stdlibdriver "github.com/kirimatt/goncordia/driver/stdlib"
-	"github.com/kirimatt/goncordia/internal/clock"
 )
 
 // Driver implements driver.Driver[bun.Tx].

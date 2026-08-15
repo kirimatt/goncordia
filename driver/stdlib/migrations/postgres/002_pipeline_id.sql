@@ -1,0 +1,2 @@
+ALTER TABLE goncordia_jobs
+    ADD COLUMN IF NOT EXISTS pipeline_id TEXT NOT NULL DEFAULT '';

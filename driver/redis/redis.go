@@ -2,9 +2,9 @@
 //
 // # Transaction guarantees
 //
-// Redis does not support multi-statement transactions with rollback semantics.
-// EnqueueTx is identical to Enqueue — there is NO atomicity between
-// your business operations and job insertion. Jobs are delivered at-least-once
+// Redis does not support transactions that can wrap business-store writes.
+// EnqueueTx is rejected; enqueue after the business operation commits. Jobs are
+// delivered at-least-once
 // when combined with idempotent workers.
 //
 // For truly atomic "enqueue only if the business transaction commits" semantics,
@@ -26,13 +26,13 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	goncordia "github.com/kirimatt/goncordia"
+	"github.com/kirimatt/goncordia/clock"
 	"github.com/kirimatt/goncordia/core"
 	"github.com/kirimatt/goncordia/driver"
-	"github.com/kirimatt/goncordia/internal/clock"
 )
 
 // NoTx is the transaction type for the Redis driver.
-// Redis sessions have no rollback guarantee; EnqueueTx behaves like Enqueue.
+// Redis sessions have no rollback guarantee; EnqueueTx is rejected.
 type NoTx struct{}
 
 // Driver implements driver.Driver[NoTx] backed by Redis.

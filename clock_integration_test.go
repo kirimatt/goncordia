@@ -8,10 +8,10 @@ import (
 	"time"
 
 	"github.com/kirimatt/goncordia"
+	"github.com/kirimatt/goncordia/clock"
 	"github.com/kirimatt/goncordia/core"
 	"github.com/kirimatt/goncordia/driver"
 	memdriver "github.com/kirimatt/goncordia/driver/memory"
-	"github.com/kirimatt/goncordia/internal/clock"
 )
 
 // TestScheduledJobNotVisibleUntilRunAt verifies that a job with a future RunAt
