@@ -495,8 +495,19 @@ processes require application-level partitioning if they must share a pipeline.
 ```go
 import "github.com/kirimatt/goncordia/admin"
 
-// Protect this route with your application's authentication/authorization.
-http.Handle("/jobs/", http.StripPrefix("/jobs", admin.New(d)))
+handler := admin.New(d,
+    admin.WithReadOnly(false),
+    admin.WithAuthorizer(func(r *http.Request, operation admin.Operation) error {
+        if !validSession(r) {
+            return admin.ErrUnauthenticated
+        }
+        if operation == admin.OperationMutate && !canOperateJobs(r) {
+            return errors.New("forbidden")
+        }
+        return nil
+    }),
+)
+http.Handle("/jobs/", http.StripPrefix("/jobs", handler))
 ```
 
 The handler exposes the embedded dashboard, `/healthz`, `/readyz`, `/metrics`,
@@ -504,6 +515,29 @@ and JSON routes under `/api`. It supports job filtering, cancel/delete/retry/
 reschedule, queue pause/resume, and per-state queue counts. On Redis, Cassandra,
 DynamoDB, and Firestore, administrative list/metric operations scan records and
 are intended for moderate operational use rather than high-frequency scraping.
+
+The default JSON representation removes job arguments, unique keys, and panic
+stack traces. Use `admin.WithJobRedactor` only when an application has a safe,
+explicit policy for exposing or replacing those fields. `admin.WithReadOnly(true)`
+disables every mutation while retaining inspection and metrics. The authorization
+hook receives separate dashboard, read, mutate, metrics, and health operations;
+return `admin.ErrUnauthenticated` for HTTP 401 and any other error for HTTP 403.
+
+`/healthz` is a process liveness probe and does not touch storage. `/readyz`
+checks that the backing driver can answer a query and returns HTTP 503 when it
+cannot. Metrics are buffered until all queue statistics have been collected, so
+a collection failure returns 503 without a misleading partial Prometheus body.
+The embedded dashboard serves script and style assets separately under a strict
+Content Security Policy.
+
+Every mutation requires `X-Goncordia-Confirm` to exactly match the action name
+(`pause`, `resume`, `cancel`, `delete`, `retry`, or `reschedule`). This is an
+additional guard against accidental requests, not a substitute for authorization:
+
+```text
+POST /jobs/api/jobs/01J.../delete
+X-Goncordia-Confirm: delete
+```
 
 `GET /api/jobs` and `GET /api/queues` return a page envelope:
 

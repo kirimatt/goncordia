@@ -36,6 +36,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   an explicit time zone with daylight-saving support.
 - Durable periodic job IDs, persisted compare-and-swap schedule cursors, and
   `CronCatchUpAll`, `CronCatchUpLatest`, and `CronSkipMissed` policies.
+- Admin read-only mode, per-operation authorization hooks, and configurable job
+  response redaction with secure payload-hiding defaults.
 
 ### Changed
 - Pipeline and per-kind waiters no longer occupy global execution slots.
@@ -77,6 +79,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Panic failures now retain their runtime stack in `AttemptError.Trace` across
   every built-in backend. Queue-time metrics measure only time after a job is
   eligible, excluding intentional scheduled delay.
+- Admin mutations require an explicit action confirmation header. Liveness and
+  storage readiness are separate probes, metrics failures return 503 without
+  partial samples, and dashboard assets now comply with a strict CSP without
+  inline scripts or styles.
 
 ### Testing
 - Driver conformance now covers stale-worker fencing, heartbeat protection, and
@@ -93,6 +99,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   state validation.
 - Cross-driver conformance now verifies attempt stack-trace serialization, and
   retry jitter tests use an injected random source.
+- Added admin security and failure-mode tests for authorization, read-only mode,
+  payload redaction, explicit mutation confirmation, independent probes, strict
+  CSP assets, and all-or-nothing metrics output.
 
 ### Upgrade notes
 - SQL users must run `Migrate` before starting workers. Migration 004 replaces
@@ -115,6 +124,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `next_cursor`; the previous bare-array response is replaced by a page envelope.
 - Callers that previously relied on `Driver.Close` to close a supplied resource
   must now close that resource directly.
+- Admin API mutation clients must send `X-Goncordia-Confirm` with the action
+  name. Job arguments, unique keys, and panic traces are now redacted by default;
+  install an explicit `WithJobRedactor` policy if trusted clients require them.
 
 ---
 
