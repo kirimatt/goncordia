@@ -323,8 +323,8 @@ func (e *executor) QueueList(ctx context.Context, params driver.QueueListParams)
 func (e *executor) LeaderAttemptElect(ctx context.Context, params driver.LeaderElectParams) (bool, error) {
 	return leaderAttemptElect(ctx, e.rdb, e.clk, params)
 }
-func (e *executor) LeaderResign(ctx context.Context, name string) error {
-	return leaderResign(ctx, e.rdb, name)
+func (e *executor) LeaderResign(ctx context.Context, params driver.LeaderResignParams) error {
+	return leaderResign(ctx, e.rdb, params)
 }
 
 // ---- txExecutor ----
@@ -373,8 +373,8 @@ func (t *txExecutor) QueueList(ctx context.Context, params driver.QueueListParam
 func (t *txExecutor) LeaderAttemptElect(ctx context.Context, params driver.LeaderElectParams) (bool, error) {
 	return leaderAttemptElect(ctx, t.rdb, t.clk, params)
 }
-func (t *txExecutor) LeaderResign(ctx context.Context, name string) error {
-	return leaderResign(ctx, t.rdb, name)
+func (t *txExecutor) LeaderResign(ctx context.Context, params driver.LeaderResignParams) error {
+	return leaderResign(ctx, t.rdb, params)
 }
 
 // ---- core functions ----
@@ -624,7 +624,7 @@ func jobSetStateIfRunning(ctx context.Context, rdb *redis.Client, clk clock.Cloc
 					} else {
 						pipe.ZAdd(ctx, availKey(job.Queue), redis.Z{Score: priorityScore(job.Priority, retryAt), Member: params.ID})
 					}
-				case job.UniqueKey != "":
+				case job.UniqueKey != "" && !driver.IsPermanentUniqueKey(job.UniqueKey):
 					pipe.Del(ctx, uniqKey(job.UniqueKey))
 				}
 				return nil
@@ -658,7 +658,7 @@ func jobCancel(ctx context.Context, rdb *redis.Client, clk clock.Clock, id strin
 	now := clk.Now()
 	job.State = string(driver.JobStateCancelled)
 	job.FinalizedAtMs = millis(now.UnixMilli())
-	if job.UniqueKey != "" {
+	if job.UniqueKey != "" && !driver.IsPermanentUniqueKey(job.UniqueKey) {
 		rdb.Del(ctx, uniqKey(job.UniqueKey)) //nolint:errcheck
 	}
 
@@ -817,8 +817,15 @@ func leaderAttemptElect(ctx context.Context, rdb *redis.Client, clk clock.Clock,
 	return false, nil
 }
 
-func leaderResign(ctx context.Context, rdb *redis.Client, name string) error {
-	return rdb.Del(ctx, leaderKey(name)).Err()
+var resignLeaderScript = redis.NewScript(`
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+    return redis.call('DEL', KEYS[1])
+end
+return 0
+`)
+
+func leaderResign(ctx context.Context, rdb *redis.Client, params driver.LeaderResignParams) error {
+	return resignLeaderScript.Run(ctx, rdb, []string{leaderKey(params.Name)}, params.WorkerID).Err()
 }
 
 // ---- listener ----

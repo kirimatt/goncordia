@@ -277,5 +277,9 @@ func buildUniqueKey(args core.JobArgs, queue string, opts *core.UniqueOpts, now 
 		return "", fmt.Errorf("marshal canonical unique key: %w", err)
 	}
 	digest := sha256.Sum256(payload)
-	return fmt.Sprintf("u2_%x", digest[:]), nil
+	prefix := "u2_"
+	if opts.Forever {
+		prefix = "uf2_"
+	}
+	return fmt.Sprintf("%s%x", prefix, digest[:]), nil
 }

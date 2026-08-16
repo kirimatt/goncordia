@@ -73,8 +73,8 @@ func (e *executor) QueueList(ctx context.Context, params driver.QueueListParams)
 func (e *executor) LeaderAttemptElect(ctx context.Context, params driver.LeaderElectParams) (bool, error) {
 	return leaderAttemptElect(ctx, e.session, e.clk, params)
 }
-func (e *executor) LeaderResign(ctx context.Context, name string) error {
-	return leaderResign(ctx, e.session, name)
+func (e *executor) LeaderResign(ctx context.Context, params driver.LeaderResignParams) error {
+	return leaderResign(ctx, e.session, params)
 }
 
 // ---- txExecutor (no-op tx — Cassandra has no real transactions) ----
@@ -122,8 +122,8 @@ func (t *txExecutor) QueueList(ctx context.Context, params driver.QueueListParam
 func (t *txExecutor) LeaderAttemptElect(ctx context.Context, params driver.LeaderElectParams) (bool, error) {
 	return leaderAttemptElect(ctx, t.session, t.clk, params)
 }
-func (t *txExecutor) LeaderResign(ctx context.Context, name string) error {
-	return leaderResign(ctx, t.session, name)
+func (t *txExecutor) LeaderResign(ctx context.Context, params driver.LeaderResignParams) error {
+	return leaderResign(ctx, t.session, params)
 }
 
 // ---- job row ----
@@ -662,7 +662,7 @@ func jobSetStateIfRunning(ctx context.Context, session *gocql.Session, clk clock
 	if err := deleteRunningLookup(ctx, session, j); err != nil {
 		return err
 	}
-	if j.UniqueKey != "" {
+	if j.UniqueKey != "" && !driver.IsPermanentUniqueKey(j.UniqueKey) {
 		return session.Query(`DELETE FROM goncordia_uniq_v2 WHERE ukey=?`,
 			j.UniqueKey).WithContext(ctx).Exec()
 	}
@@ -705,7 +705,7 @@ func jobCancel(ctx context.Context, session *gocql.Session, clk clock.Clock, id 
 			j.Queue, j.RunAt, j.Priority, id).WithContext(ctx).Exec()
 	}
 
-	if j.UniqueKey != "" {
+	if j.UniqueKey != "" && !driver.IsPermanentUniqueKey(j.UniqueKey) {
 		_ = session.Query(`DELETE FROM goncordia_uniq_v2 WHERE ukey=?`,
 			j.UniqueKey).WithContext(ctx).Exec()
 	}
@@ -871,8 +871,10 @@ func leaderAttemptElect(ctx context.Context, session *gocql.Session, clk clock.C
 	return false, nil
 }
 
-func leaderResign(ctx context.Context, session *gocql.Session, name string) error {
-	return session.Query(`DELETE FROM goncordia_leaders WHERE name=?`, name).WithContext(ctx).Exec()
+func leaderResign(ctx context.Context, session *gocql.Session, params driver.LeaderResignParams) error {
+	_, err := session.Query(`DELETE FROM goncordia_leaders WHERE name=? IF worker_id=?`, params.Name, params.WorkerID).
+		WithContext(ctx).MapScanCAS(map[string]interface{}{})
+	return err
 }
 
 // compile-time checks

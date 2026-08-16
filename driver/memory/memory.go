@@ -387,10 +387,12 @@ func (e *executor) LeaderAttemptElect(_ context.Context, params driver.LeaderEle
 	return true, nil
 }
 
-func (e *executor) LeaderResign(_ context.Context, name string) error {
+func (e *executor) LeaderResign(_ context.Context, params driver.LeaderResignParams) error {
 	e.d.mu.Lock()
 	defer e.d.mu.Unlock()
-	delete(e.d.leaders, name)
+	if current, ok := e.d.leaders[params.Name]; ok && current.workerID == params.WorkerID {
+		delete(e.d.leaders, params.Name)
+	}
 	return nil
 }
 
@@ -475,9 +477,10 @@ func (d *Driver) broadcastNotify(queue string) {
 func (d *Driver) findUniqueJob(uniqueKey string) *driver.JobRow {
 	for _, j := range d.jobs {
 		if j.UniqueKey == uniqueKey &&
-			j.State != driver.JobStateCompleted &&
-			j.State != driver.JobStateDiscarded &&
-			j.State != driver.JobStateCancelled {
+			(driver.IsPermanentUniqueKey(uniqueKey) ||
+				j.State != driver.JobStateCompleted &&
+					j.State != driver.JobStateDiscarded &&
+					j.State != driver.JobStateCancelled) {
 			return j
 		}
 	}

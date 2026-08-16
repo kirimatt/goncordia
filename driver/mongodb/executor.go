@@ -126,8 +126,8 @@ func (e *executor) QueueList(ctx context.Context, params driver.QueueListParams)
 func (e *executor) LeaderAttemptElect(ctx context.Context, params driver.LeaderElectParams) (bool, error) {
 	return leaderAttemptElect(ctx, e.db, e.clk, params)
 }
-func (e *executor) LeaderResign(ctx context.Context, name string) error {
-	return leaderResign(ctx, e.db, name)
+func (e *executor) LeaderResign(ctx context.Context, params driver.LeaderResignParams) error {
+	return leaderResign(ctx, e.db, params)
 }
 
 // ---- txExecutor (transactional) ----
@@ -194,8 +194,8 @@ func (t *txExecutor) QueueList(ctx context.Context, params driver.QueueListParam
 func (t *txExecutor) LeaderAttemptElect(ctx context.Context, params driver.LeaderElectParams) (bool, error) {
 	return leaderAttemptElect(t.sc, t.db, t.clk, params)
 }
-func (t *txExecutor) LeaderResign(ctx context.Context, name string) error {
-	return leaderResign(t.sc, t.db, name)
+func (t *txExecutor) LeaderResign(ctx context.Context, params driver.LeaderResignParams) error {
+	return leaderResign(t.sc, t.db, params)
 }
 
 // ---- core functions ----
@@ -454,7 +454,18 @@ func jobSetStateIfRunning(ctx context.Context, db *mongo.Database, clk clock.Clo
 	switch params.State {
 	case driver.JobStateCompleted, driver.JobStateDiscarded, driver.JobStateCancelled:
 		set["finalized_at"] = now
-		unset["unique_key"] = "" // free uniqueness slot
+		var current struct {
+			UniqueKey string `bson:"unique_key"`
+		}
+		if err := db.Collection(jobsCollection).FindOne(ctx, filter,
+			options.FindOne().SetProjection(bson.M{"unique_key": 1})).Decode(&current); err == mongo.ErrNoDocuments {
+			return nil
+		} else if err != nil {
+			return err
+		}
+		if !driver.IsPermanentUniqueKey(current.UniqueKey) {
+			unset["unique_key"] = "" // free uniqueness slot
+		}
 	case driver.JobStateRetryable:
 		if !params.RetryAt.IsZero() {
 			set["run_at"] = params.RetryAt
@@ -490,16 +501,23 @@ func jobCancel(ctx context.Context, db *mongo.Database, clk clock.Clock, id stri
 	if err != nil {
 		return fmt.Errorf("invalid job id %q: %w", id, err)
 	}
-	_, err = db.Collection(jobsCollection).UpdateOne(ctx,
-		bson.M{
-			"_id":   oid,
-			"state": bson.M{"$in": bson.A{string(driver.JobStateAvailable), string(driver.JobStateScheduled)}},
-		},
-		bson.M{
-			"$set":   bson.M{"state": string(driver.JobStateCancelled), "finalized_at": clk.Now()},
-			"$unset": bson.M{"unique_key": ""},
-		},
-	)
+	filter := bson.M{
+		"_id": oid, "state": bson.M{"$in": bson.A{string(driver.JobStateAvailable), string(driver.JobStateScheduled)}},
+	}
+	var current struct {
+		UniqueKey string `bson:"unique_key"`
+	}
+	if err := db.Collection(jobsCollection).FindOne(ctx, filter,
+		options.FindOne().SetProjection(bson.M{"unique_key": 1})).Decode(&current); err == mongo.ErrNoDocuments {
+		return nil
+	} else if err != nil {
+		return err
+	}
+	update := bson.M{"$set": bson.M{"state": string(driver.JobStateCancelled), "finalized_at": clk.Now()}}
+	if !driver.IsPermanentUniqueKey(current.UniqueKey) {
+		update["$unset"] = bson.M{"unique_key": ""}
+	}
+	_, err = db.Collection(jobsCollection).UpdateOne(ctx, filter, update)
 	return err
 }
 
@@ -626,8 +644,8 @@ func leaderAttemptElect(ctx context.Context, db *mongo.Database, clk clock.Clock
 	return true, nil
 }
 
-func leaderResign(ctx context.Context, db *mongo.Database, name string) error {
-	_, err := db.Collection(leadersCollection).DeleteOne(ctx, bson.M{"_id": name})
+func leaderResign(ctx context.Context, db *mongo.Database, params driver.LeaderResignParams) error {
+	_, err := db.Collection(leadersCollection).DeleteOne(ctx, bson.M{"_id": params.Name, "worker_id": params.WorkerID})
 	return err
 }
 

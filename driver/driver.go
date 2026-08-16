@@ -6,8 +6,17 @@ package driver
 
 import (
 	"context"
+	"strings"
 	"time"
 )
+
+const permanentUniqueKeyPrefix = "uf2_"
+
+// IsPermanentUniqueKey reports whether key remains reserved after a terminal
+// transition. Explicit deletion still releases the key.
+func IsPermanentUniqueKey(key string) bool {
+	return strings.HasPrefix(key, permanentUniqueKeyPrefix)
+}
 
 // Driver is the top-level interface for a job queue storage backend.
 // TTx is the transaction type native to the backend library the user chose
@@ -113,7 +122,7 @@ type baseExecutor interface {
 	// --- Leader election (only called when Capabilities.AdvisoryLocks == false, others use DB-specific mechanisms) ---
 
 	LeaderAttemptElect(ctx context.Context, params LeaderElectParams) (elected bool, err error)
-	LeaderResign(ctx context.Context, name string) error
+	LeaderResign(ctx context.Context, params LeaderResignParams) error
 }
 
 // --- Parameter and result types ---
@@ -225,6 +234,12 @@ type LeaderElectParams struct {
 	Name     string
 	WorkerID string
 	TTL      time.Duration
+}
+
+// LeaderResignParams releases a lease only when WorkerID still owns it.
+type LeaderResignParams struct {
+	Name     string
+	WorkerID string
 }
 
 // --- Row types ---

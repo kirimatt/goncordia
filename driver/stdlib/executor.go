@@ -76,8 +76,8 @@ func (e *executor) QueueList(ctx context.Context, params driver.QueueListParams)
 func (e *executor) LeaderAttemptElect(ctx context.Context, params driver.LeaderElectParams) (bool, error) {
 	return leaderAttemptElect(ctx, e.db, e.dialect, e.clk, params)
 }
-func (e *executor) LeaderResign(ctx context.Context, name string) error {
-	return leaderResign(ctx, e.db, e.dialect, name)
+func (e *executor) LeaderResign(ctx context.Context, params driver.LeaderResignParams) error {
+	return leaderResign(ctx, e.db, e.dialect, params)
 }
 
 // txExecutor wraps *sql.Tx.
@@ -136,8 +136,8 @@ func (t *txExecutor) QueueList(ctx context.Context, params driver.QueueListParam
 func (t *txExecutor) LeaderAttemptElect(ctx context.Context, params driver.LeaderElectParams) (bool, error) {
 	return leaderAttemptElect(ctx, t.tx, t.dialect, t.clk, params)
 }
-func (t *txExecutor) LeaderResign(ctx context.Context, name string) error {
-	return leaderResign(ctx, t.tx, t.dialect, name)
+func (t *txExecutor) LeaderResign(ctx context.Context, params driver.LeaderResignParams) error {
+	return leaderResign(ctx, t.tx, t.dialect, params)
 }
 
 // savepointExecutor implements nested tx via SAVEPOINT for Postgres.
@@ -185,7 +185,7 @@ SET state        = $2,
     worker_id    = NULL,
     finalized_at = COALESCE($3, finalized_at),
     run_at       = COALESCE($4, run_at),
-    unique_key   = CASE WHEN $8 THEN NULL ELSE unique_key END,
+    unique_key   = CASE WHEN $8 AND unique_key NOT LIKE 'uf2_%' THEN NULL ELSE unique_key END,
     errors       = CASE WHEN $5::jsonb IS NOT NULL THEN errors || $5::jsonb ELSE errors END
 WHERE id = $1 AND state = 'running'
   AND ($6 = '' OR worker_id = $6)
@@ -197,7 +197,7 @@ SET state        = ?,
     worker_id    = NULL,
     finalized_at = COALESCE(?, finalized_at),
     run_at       = COALESCE(?, run_at),
-    unique_key   = CASE WHEN ? THEN NULL ELSE unique_key END
+    unique_key   = CASE WHEN ? AND unique_key NOT LIKE 'uf2_%' THEN NULL ELSE unique_key END
 WHERE id = ? AND state = 'running'
   AND (? = '' OR worker_id = ?)
   AND (? = 0 OR attempt_num = ?)`
@@ -215,7 +215,8 @@ WHERE id = ? AND state = 'running'
   AND (? = 0 OR attempt_num = ?)`
 
 const sqlJobCancel = `UPDATE goncordia_jobs
-SET state = 'cancelled', finalized_at = ?, unique_key = NULL
+SET state = 'cancelled', finalized_at = ?,
+    unique_key = CASE WHEN unique_key LIKE 'uf2_%' THEN unique_key ELSE NULL END
 WHERE id = ? AND state IN ('available', 'scheduled')`
 
 const sqlJobDelete = `DELETE FROM goncordia_jobs WHERE id = ?`
@@ -357,7 +358,6 @@ RETURNING id`)
 func findUniqueJob(ctx context.Context, q querier, d Dialect, uniqueKey string) (*driver.JobRow, error) {
 	query := d.q(`SELECT ` + selectJobCols + ` FROM goncordia_jobs
 WHERE unique_key = ?
-  AND state IN ('available', 'running', 'scheduled', 'retryable')
 LIMIT 1`)
 	j, err := scanJobRow(d, q.QueryRowContext(ctx, query, uniqueKey))
 	if err == sql.ErrNoRows {
@@ -686,8 +686,8 @@ WHERE name=? AND (expires_at<=? OR worker_id=?)`), params.WorkerID, expiresAt, p
 	return false, nil
 }
 
-func leaderResign(ctx context.Context, q querier, d Dialect, name string) error {
-	_, err := q.ExecContext(ctx, d.q(`DELETE FROM goncordia_leaders WHERE name=?`), name)
+func leaderResign(ctx context.Context, q querier, d Dialect, params driver.LeaderResignParams) error {
+	_, err := q.ExecContext(ctx, d.q(`DELETE FROM goncordia_leaders WHERE name=? AND worker_id=?`), params.Name, params.WorkerID)
 	return err
 }
 

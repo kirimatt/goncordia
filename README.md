@@ -395,6 +395,7 @@ client.Enqueue(ctx, SendEmailArgs{To: "user@example.com", Subject: "Welcome"}, &
         ByQueue: true,
         Key:     "welcome-email",           // optional caller-defined dimension
         ByPeriod: 24 * time.Hour,            // fixed UTC-aligned windows
+        Forever:  false,                     // true keeps the key after finalization
     },
 
     MaxRetry: &maxRetry,
@@ -409,6 +410,9 @@ the serialized arguments, a caller-defined value, and the start of a fixed UTC
 window respectively. The stored key is a bounded SHA-256 digest, so large job
 arguments or caller keys do not expand database indexes. Completed, discarded,
 and cancelled jobs release their key.
+
+Set `Forever` for durable idempotency keys that must survive completion,
+discard, or cancellation. An explicit job deletion still releases the key.
 
 ClickHouse uniqueness is best-effort because concurrent inserts cannot be
 serialized by `ReplacingMergeTree`. Cassandra uses an LWT reservation followed
@@ -533,6 +537,8 @@ sched := core.ScheduleFunc(func(last time.Time) time.Time {
 - The scheduler fires each job on the **first tick** after `Start`, then respects the interval.
 - `CronScheduler` only *enqueues* — workers run via `WorkerPool`.
 - Multiple scheduler instances are safe: only the current lease holder enqueues jobs.
+- Scheduler shutdown releases leadership only when that scheduler instance still
+  owns the lease; a stale instance cannot resign a newer leader.
 
 ---
 

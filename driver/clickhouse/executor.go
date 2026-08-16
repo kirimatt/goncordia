@@ -73,8 +73,8 @@ func (e *executor) QueueList(ctx context.Context, params driver.QueueListParams)
 func (e *executor) LeaderAttemptElect(ctx context.Context, params driver.LeaderElectParams) (bool, error) {
 	return leaderAttemptElect(ctx, e.conn, e.clk, params)
 }
-func (e *executor) LeaderResign(ctx context.Context, name string) error {
-	return leaderResign(ctx, e.conn, name)
+func (e *executor) LeaderResign(ctx context.Context, params driver.LeaderResignParams) error {
+	return leaderResign(ctx, e.conn, params)
 }
 
 // ---- txExecutor (no-op tx — ClickHouse has no transactions) ----
@@ -122,8 +122,8 @@ func (t *txExecutor) QueueList(ctx context.Context, params driver.QueueListParam
 func (t *txExecutor) LeaderAttemptElect(ctx context.Context, params driver.LeaderElectParams) (bool, error) {
 	return leaderAttemptElect(ctx, t.conn, t.clk, params)
 }
-func (t *txExecutor) LeaderResign(ctx context.Context, name string) error {
-	return leaderResign(ctx, t.conn, name)
+func (t *txExecutor) LeaderResign(ctx context.Context, params driver.LeaderResignParams) error {
+	return leaderResign(ctx, t.conn, params)
 }
 
 // ---- job row helpers ----
@@ -270,7 +270,7 @@ func jobInsertMany(ctx context.Context, conn chdriver.Conn, clk clock.Clock, par
 			var existing string
 			row := conn.QueryRow(ctx,
 				`SELECT id FROM goncordia_jobs FINAL
-					 WHERE unique_key=? AND state IN ('available','running','retryable','scheduled')
+					 WHERE unique_key=? AND (state IN ('available','running','retryable','scheduled') OR (startsWith(unique_key, 'uf2_') AND state != 'deleted'))
 				 LIMIT 1`,
 				p.UniqueKey)
 			if err := row.Scan(&existing); err == nil && existing != "" {
@@ -753,14 +753,17 @@ func leaderAttemptElect(ctx context.Context, conn chdriver.Conn, clk clock.Clock
 	return false, nil
 }
 
-func leaderResign(ctx context.Context, conn chdriver.Conn, name string) error {
+func leaderResign(ctx context.Context, conn chdriver.Conn, params driver.LeaderResignParams) error {
+	var workerID string
 	var ver int64
-	row := conn.QueryRow(ctx, `SELECT version FROM goncordia_leaders FINAL WHERE name=? LIMIT 1`, name)
-	_ = row.Scan(&ver)
+	row := conn.QueryRow(ctx, `SELECT worker_id, version FROM goncordia_leaders FINAL WHERE name=? LIMIT 1`, params.Name)
+	if err := row.Scan(&workerID, &ver); err != nil || workerID != params.WorkerID {
+		return nil
+	}
 	past := time.Unix(0, 0)
 	return conn.Exec(ctx,
 		`INSERT INTO goncordia_leaders (name, worker_id, expires_at, version) VALUES (?,'',?,?)`,
-		name, past, ver+1,
+		params.Name, past, ver+1,
 	)
 }
 

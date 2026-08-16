@@ -86,6 +86,9 @@ type UniqueOpts struct {
 	ByQueue bool
 	// ByPeriod deduplicates within fixed UTC windows aligned to this duration.
 	ByPeriod time.Duration
+	// Forever retains the uniqueness record after the job reaches a terminal
+	// state. Explicitly deleting the job releases it.
+	Forever bool
 }
 
 // WorkerOpts configures default behavior for a Worker registration.

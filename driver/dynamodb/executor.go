@@ -78,8 +78,8 @@ func (e *executor) QueueList(ctx context.Context, params driver.QueueListParams)
 func (e *executor) LeaderAttemptElect(ctx context.Context, params driver.LeaderElectParams) (bool, error) {
 	return leaderAttemptElect(ctx, e.svc, e.clk, params)
 }
-func (e *executor) LeaderResign(ctx context.Context, name string) error {
-	return leaderResign(ctx, e.svc, name)
+func (e *executor) LeaderResign(ctx context.Context, params driver.LeaderResignParams) error {
+	return leaderResign(ctx, e.svc, params)
 }
 
 // ---- txExecutor (no-op tx — DynamoDB has no cross-table transactions) ----
@@ -127,8 +127,8 @@ func (t *txExecutor) QueueList(ctx context.Context, params driver.QueueListParam
 func (t *txExecutor) LeaderAttemptElect(ctx context.Context, params driver.LeaderElectParams) (bool, error) {
 	return leaderAttemptElect(ctx, t.svc, t.clk, params)
 }
-func (t *txExecutor) LeaderResign(ctx context.Context, name string) error {
-	return leaderResign(ctx, t.svc, name)
+func (t *txExecutor) LeaderResign(ctx context.Context, params driver.LeaderResignParams) error {
+	return leaderResign(ctx, t.svc, params)
 }
 
 // ---- job row ----
@@ -757,7 +757,7 @@ func jobSetStateIfRunning(ctx context.Context, svc *dynamodb.Client, clk clock.C
 		}
 		return err
 	}
-	if params.State != driver.JobStateRetryable && j.UniqueKey != "" {
+	if params.State != driver.JobStateRetryable && j.UniqueKey != "" && !driver.IsPermanentUniqueKey(j.UniqueKey) {
 		_, err = svc.DeleteItem(ctx, &dynamodb.DeleteItemInput{
 			TableName: aws.String(tableUniq),
 			Key: map[string]types.AttributeValue{
@@ -816,7 +816,7 @@ func jobCancel(ctx context.Context, svc *dynamodb.Client, clk clock.Clock, id st
 		return err
 	}
 
-	if j.UniqueKey != "" {
+	if j.UniqueKey != "" && !driver.IsPermanentUniqueKey(j.UniqueKey) {
 		_, _ = svc.DeleteItem(ctx, &dynamodb.DeleteItemInput{
 			TableName: aws.String(tableUniq),
 			Key: map[string]types.AttributeValue{
@@ -1028,13 +1028,21 @@ func leaderAttemptElect(ctx context.Context, svc *dynamodb.Client, clk clock.Clo
 	return true, nil
 }
 
-func leaderResign(ctx context.Context, svc *dynamodb.Client, name string) error {
+func leaderResign(ctx context.Context, svc *dynamodb.Client, params driver.LeaderResignParams) error {
 	_, err := svc.DeleteItem(ctx, &dynamodb.DeleteItemInput{
 		TableName: aws.String(tableLeaders),
 		Key: map[string]types.AttributeValue{
-			"name": &types.AttributeValueMemberS{Value: name},
+			"name": &types.AttributeValueMemberS{Value: params.Name},
+		},
+		ConditionExpression: aws.String("worker_id = :wid"),
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":wid": &types.AttributeValueMemberS{Value: params.WorkerID},
 		},
 	})
+	var conflict *types.ConditionalCheckFailedException
+	if errors.As(err, &conflict) {
+		return nil
+	}
 	return err
 }
 

@@ -9,6 +9,7 @@ import (
 	"github.com/kirimatt/goncordia"
 	"github.com/kirimatt/goncordia/clock"
 	"github.com/kirimatt/goncordia/core"
+	"github.com/kirimatt/goncordia/driver"
 	"github.com/kirimatt/goncordia/driver/memory"
 )
 
@@ -81,6 +82,45 @@ func TestUniqueScopeAndBoundedKey(t *testing.T) {
 	}
 	if q1.UniqueSkip || q2.UniqueSkip || q1.Job.UniqueKey == q2.Job.UniqueKey {
 		t.Fatalf("queue-scoped unique results: q1=%+v q2=%+v", q1, q2)
+	}
+}
+
+func TestPermanentUniqueKeySurvivesFinalization(t *testing.T) {
+	d := memory.New()
+	client := goncordia.NewClient(d, goncordia.ClientConfig{})
+	ctx := context.Background()
+	opts := &core.InsertOpts{UniqueOpts: &core.UniqueOpts{Key: "periodic:daily-report:2026-08-16", Forever: true}}
+
+	first, err := client.Enqueue(ctx, EmailArgs{To: "report"}, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(first.Job.UniqueKey, "uf2_") || len(first.Job.UniqueKey) != 68 {
+		t.Fatalf("unexpected permanent key %q", first.Job.UniqueKey)
+	}
+	claimed, err := d.Executor().JobFetchBatch(ctx, driver.FetchParams{Queue: "default", Limit: 1, WorkerID: "worker"})
+	if err != nil || len(claimed) != 1 {
+		t.Fatalf("claim: jobs=%+v err=%v", claimed, err)
+	}
+	if err := d.Executor().JobSetStateIfRunning(ctx, driver.JobSetStateParams{
+		ID: first.Job.ID, State: driver.JobStateCompleted,
+		ExpectedWorkerID: claimed[0].WorkerID, ExpectedAttempt: claimed[0].AttemptNum,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	duplicate, err := client.Enqueue(ctx, EmailArgs{To: "report"}, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !duplicate.UniqueSkip {
+		t.Fatal("permanent unique key was released on completion")
+	}
+	if err := d.Executor().JobDelete(ctx, first.Job.ID); err != nil {
+		t.Fatal(err)
+	}
+	afterDelete, err := client.Enqueue(ctx, EmailArgs{To: "report"}, opts)
+	if err != nil || afterDelete.UniqueSkip {
+		t.Fatalf("explicit delete did not release key: result=%+v err=%v", afterDelete, err)
 	}
 }
 

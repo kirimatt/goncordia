@@ -22,6 +22,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Worker-returned `core.Discard`, `core.RetryAfter`, and `core.RetryAt`
   directives.
 - `UniqueOpts.Key` for caller-defined deduplication dimensions.
+- `UniqueOpts.Forever` for durable idempotency keys that survive terminal job
+  states until explicit deletion.
 
 ### Changed
 - Pipeline and per-kind waiters no longer occupy global execution slots.
@@ -41,11 +43,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Redis and DynamoDB now create a job and its uniqueness reservation atomically.
 - Every built-in driver enforces the same global canonical-key contract;
   ClickHouse remains best-effort under concurrent inserts.
+- Cron leader resignation is ownership-safe on every built-in driver, and the
+  scheduler releases its lease during shutdown without reusing the cancelled
+  run context.
 
 ### Testing
 - Driver conformance now covers stale-worker fencing, heartbeat protection, and
   global priority selection beyond a storage-ordered candidate subset, plus
-  uniqueness across queues.
+  uniqueness across queues, durable uniqueness after cancellation, and
+  ownership-safe leader resignation.
 - Added deterministic worker tests for heartbeat renewal, cancellation yield,
   bounded pending work, and pipeline/global-concurrency isolation.
 

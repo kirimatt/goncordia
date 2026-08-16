@@ -100,6 +100,15 @@ func (s *CronScheduler[TTx]) Start(ctx context.Context) error {
 	if !s.started.CompareAndSwap(false, true) {
 		return fmt.Errorf("cron scheduler already started")
 	}
+	defer func() {
+		resignCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		if err := s.client.driver.Executor().LeaderResign(resignCtx, driver.LeaderResignParams{
+			Name: s.config.LeaderName, WorkerID: s.config.WorkerID,
+		}); err != nil {
+			s.config.ErrorHandler(fmt.Errorf("cron leader resignation: %w", err))
+		}
+	}()
 	ticker := s.config.Clock.NewTicker(s.config.TickInterval)
 	defer ticker.Stop()
 

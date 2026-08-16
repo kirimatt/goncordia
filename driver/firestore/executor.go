@@ -123,8 +123,8 @@ func (e *executor) QueueList(ctx context.Context, params driver.QueueListParams)
 func (e *executor) LeaderAttemptElect(ctx context.Context, params driver.LeaderElectParams) (bool, error) {
 	return leaderAttemptElect(ctx, e.client, e.clk, params)
 }
-func (e *executor) LeaderResign(ctx context.Context, name string) error {
-	return leaderResign(ctx, e.client, name)
+func (e *executor) LeaderResign(ctx context.Context, params driver.LeaderResignParams) error {
+	return leaderResign(ctx, e.client, params)
 }
 
 // ---- txExecutor (wraps *firestore.Transaction from user's RunTransaction callback) ----
@@ -189,8 +189,8 @@ func (t *txExecutor) QueueList(ctx context.Context, params driver.QueueListParam
 func (t *txExecutor) LeaderAttemptElect(ctx context.Context, params driver.LeaderElectParams) (bool, error) {
 	return leaderAttemptElect(ctx, t.client, t.clk, params)
 }
-func (t *txExecutor) LeaderResign(ctx context.Context, name string) error {
-	return leaderResign(ctx, t.client, name)
+func (t *txExecutor) LeaderResign(ctx context.Context, params driver.LeaderResignParams) error {
+	return leaderResign(ctx, t.client, params)
 }
 
 // ---- JobInsertMany (non-tx) ----
@@ -674,7 +674,7 @@ func jobSetStateIfRunning(ctx context.Context, client *firestore.Client, clk clo
 				firestore.Update{Path: "state", Value: string(params.State)},
 				firestore.Update{Path: "finalized_at", Value: now.UTC()},
 			)
-			if j.UniqueKey != "" {
+			if j.UniqueKey != "" && !driver.IsPermanentUniqueKey(j.UniqueKey) {
 				tx.Delete(client.Collection(colUniq).Doc(j.UniqueKey)) //nolint:errcheck
 			}
 		}
@@ -710,7 +710,7 @@ func jobCancel(ctx context.Context, client *firestore.Client, clk clock.Clock, i
 		}); err != nil {
 			return err
 		}
-		if j.UniqueKey != "" {
+		if j.UniqueKey != "" && !driver.IsPermanentUniqueKey(j.UniqueKey) {
 			tx.Delete(client.Collection(colUniq).Doc(j.UniqueKey)) //nolint:errcheck
 		}
 		return nil
@@ -854,9 +854,25 @@ func leaderAttemptElect(ctx context.Context, client *firestore.Client, clk clock
 	return elected, err
 }
 
-func leaderResign(ctx context.Context, client *firestore.Client, name string) error {
-	_, err := client.Collection(colLeaders).Doc(name).Delete(ctx)
-	return err
+func leaderResign(ctx context.Context, client *firestore.Client, params driver.LeaderResignParams) error {
+	ref := client.Collection(colLeaders).Doc(params.Name)
+	return client.RunTransaction(ctx, func(ctx context.Context, tx *firestore.Transaction) error {
+		snap, err := tx.Get(ref)
+		if status.Code(err) == codes.NotFound {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		var current leaderDoc
+		if err := snap.DataTo(&current); err != nil {
+			return err
+		}
+		if current.WorkerID != params.WorkerID {
+			return nil
+		}
+		return tx.Delete(ref)
+	})
 }
 
 // ---- helpers ----

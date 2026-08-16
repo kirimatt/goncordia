@@ -111,8 +111,8 @@ func (e *executor) QueueList(ctx context.Context, params driver.QueueListParams)
 func (e *executor) LeaderAttemptElect(ctx context.Context, params driver.LeaderElectParams) (bool, error) {
 	return leaderAttemptElect(ctx, poolQuerier{e.pool}, e.clk, params)
 }
-func (e *executor) LeaderResign(ctx context.Context, name string) error {
-	return leaderResign(ctx, poolQuerier{e.pool}, name)
+func (e *executor) LeaderResign(ctx context.Context, params driver.LeaderResignParams) error {
+	return leaderResign(ctx, poolQuerier{e.pool}, params)
 }
 
 // txExecutor is the transactional executor (wraps pgx.Tx).
@@ -169,8 +169,8 @@ func (t *txExecutor) QueueList(ctx context.Context, params driver.QueueListParam
 func (t *txExecutor) LeaderAttemptElect(ctx context.Context, params driver.LeaderElectParams) (bool, error) {
 	return leaderAttemptElect(ctx, txQuerier{t.querier}, t.clk, params)
 }
-func (t *txExecutor) LeaderResign(ctx context.Context, name string) error {
-	return leaderResign(ctx, txQuerier{t.querier}, name)
+func (t *txExecutor) LeaderResign(ctx context.Context, params driver.LeaderResignParams) error {
+	return leaderResign(ctx, txQuerier{t.querier}, params)
 }
 
 // --- SQL implementations ---
@@ -241,7 +241,6 @@ SELECT id, queue, kind, args, state, priority, run_at, created_at,
        unique_key, worker_id, tags, errors, pipeline_id
 FROM goncordia_jobs
 WHERE unique_key = $1
-  AND state IN ('available', 'running', 'scheduled', 'retryable')
 LIMIT 1`
 	return scanJobRow(q.QueryRow(ctx, sql, uniqueKey))
 }
@@ -422,7 +421,7 @@ UPDATE goncordia_jobs SET
     worker_id    = NULL,
     finalized_at = COALESCE($3, finalized_at),
     run_at       = COALESCE($4, run_at),
-    unique_key   = CASE WHEN $8 THEN NULL ELSE unique_key END,
+    unique_key   = CASE WHEN $8 AND unique_key NOT LIKE 'uf2_%' THEN NULL ELSE unique_key END,
     errors       = CASE WHEN $5::jsonb IS NOT NULL
                         THEN errors || $5::jsonb
                         ELSE errors END
@@ -442,7 +441,8 @@ func jobCancel(ctx context.Context, q querier, clk clock.Clock, id string) error
 	now := clk.Now()
 	const sql = `
 UPDATE goncordia_jobs
-SET state = 'cancelled', finalized_at = $2, unique_key = NULL
+SET state = 'cancelled', finalized_at = $2,
+    unique_key = CASE WHEN unique_key LIKE 'uf2_%' THEN unique_key ELSE NULL END
 WHERE id = $1 AND state IN ('available', 'scheduled')`
 	_, err = q.Exec(ctx, sql, idInt, now)
 	return err
@@ -521,8 +521,8 @@ WHERE goncordia_leaders.expires_at <= $4
 	return tag.RowsAffected() > 0, nil
 }
 
-func leaderResign(ctx context.Context, q querier, name string) error {
-	_, err := q.Exec(ctx, `DELETE FROM goncordia_leaders WHERE name=$1`, name)
+func leaderResign(ctx context.Context, q querier, params driver.LeaderResignParams) error {
+	_, err := q.Exec(ctx, `DELETE FROM goncordia_leaders WHERE name=$1 AND worker_id=$2`, params.Name, params.WorkerID)
 	return err
 }
 

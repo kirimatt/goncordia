@@ -29,6 +29,31 @@ func Run(t *testing.T, exec driver.Executor) {
 	if err := exec.QueueResume(ctx, queue); err != nil {
 		t.Fatalf("resume queue: %v", err)
 	}
+	leaderName := "leader-" + queue
+	if elected, err := exec.LeaderAttemptElect(ctx, driver.LeaderElectParams{
+		Name: leaderName, WorkerID: "owner-a", TTL: time.Hour,
+	}); err != nil || !elected {
+		t.Fatalf("elect owner-a: elected=%v err=%v", elected, err)
+	}
+	if err := exec.LeaderResign(ctx, driver.LeaderResignParams{Name: leaderName, WorkerID: "owner-b"}); err != nil {
+		t.Fatalf("non-owner resign: %v", err)
+	}
+	if elected, err := exec.LeaderAttemptElect(ctx, driver.LeaderElectParams{
+		Name: leaderName, WorkerID: "owner-b", TTL: time.Hour,
+	}); err != nil || elected {
+		t.Fatalf("non-owner resignation released lease: elected=%v err=%v", elected, err)
+	}
+	if err := exec.LeaderResign(ctx, driver.LeaderResignParams{Name: leaderName, WorkerID: "owner-a"}); err != nil {
+		t.Fatalf("owner resign: %v", err)
+	}
+	if elected, err := exec.LeaderAttemptElect(ctx, driver.LeaderElectParams{
+		Name: leaderName, WorkerID: "owner-b", TTL: time.Hour,
+	}); err != nil || !elected {
+		t.Fatalf("elect after owner resign: elected=%v err=%v", elected, err)
+	}
+	t.Cleanup(func() {
+		_ = exec.LeaderResign(context.Background(), driver.LeaderResignParams{Name: leaderName, WorkerID: "owner-b"})
+	})
 
 	insert := driver.JobInsertParams{
 		Queue: queue, Kind: "conformance", Args: []byte(`{"value":1}`),
@@ -134,6 +159,31 @@ func Run(t *testing.T, exec driver.Executor) {
 		t.Fatalf("terminal job retained unique slot: results=%+v err=%v", reinserted, err)
 	}
 	t.Cleanup(func() { _ = exec.JobDelete(context.Background(), reinserted[0].Job.ID) })
+
+	permanent := driver.JobInsertParams{
+		Queue: queue, Kind: "permanent-unique", Args: []byte(`{"value":2}`),
+		RunAt: now, UniqueKey: "uf2_" + queue,
+	}
+	permanentResults, err := exec.JobInsertMany(ctx, []driver.JobInsertParams{permanent})
+	if err != nil || len(permanentResults) != 1 || permanentResults[0].Job == nil || permanentResults[0].UniqueSkip {
+		t.Fatalf("insert permanent unique job: results=%+v err=%v", permanentResults, err)
+	}
+	permanentID := permanentResults[0].Job.ID
+	if err := exec.JobCancel(ctx, permanentID); err != nil {
+		t.Fatalf("cancel permanent unique job: %v", err)
+	}
+	permanentDuplicate, err := exec.JobInsertMany(ctx, []driver.JobInsertParams{permanent})
+	if err != nil || len(permanentDuplicate) != 1 || !permanentDuplicate[0].UniqueSkip {
+		t.Fatalf("terminal permanent key was released: results=%+v err=%v", permanentDuplicate, err)
+	}
+	if err := exec.JobDelete(ctx, permanentID); err != nil {
+		t.Fatalf("delete permanent unique job: %v", err)
+	}
+	permanentAfterDelete, err := exec.JobInsertMany(ctx, []driver.JobInsertParams{permanent})
+	if err != nil || len(permanentAfterDelete) != 1 || permanentAfterDelete[0].UniqueSkip || permanentAfterDelete[0].Job == nil {
+		t.Fatalf("delete did not release permanent key: results=%+v err=%v", permanentAfterDelete, err)
+	}
+	t.Cleanup(func() { _ = exec.JobDelete(context.Background(), permanentAfterDelete[0].Job.ID) })
 
 	// A backend must choose priority globally across all due candidates, not
 	// merely sort a small storage-ordered subset after fetching it.
