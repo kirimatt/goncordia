@@ -76,6 +76,12 @@ func (e *executor) LeaderAttemptElect(ctx context.Context, params driver.LeaderE
 func (e *executor) LeaderResign(ctx context.Context, params driver.LeaderResignParams) error {
 	return leaderResign(ctx, e.session, params)
 }
+func (e *executor) ScheduleCursorGetOrCreate(ctx context.Context, params driver.ScheduleCursorCreateParams) (driver.ScheduleCursorResult, error) {
+	return scheduleCursorGetOrCreate(ctx, e.session, params)
+}
+func (e *executor) ScheduleCursorAdvance(ctx context.Context, params driver.ScheduleCursorAdvanceParams) (bool, error) {
+	return scheduleCursorAdvance(ctx, e.session, params)
+}
 
 // ---- txExecutor (no-op tx — Cassandra has no real transactions) ----
 
@@ -124,6 +130,12 @@ func (t *txExecutor) LeaderAttemptElect(ctx context.Context, params driver.Leade
 }
 func (t *txExecutor) LeaderResign(ctx context.Context, params driver.LeaderResignParams) error {
 	return leaderResign(ctx, t.session, params)
+}
+func (t *txExecutor) ScheduleCursorGetOrCreate(ctx context.Context, params driver.ScheduleCursorCreateParams) (driver.ScheduleCursorResult, error) {
+	return scheduleCursorGetOrCreate(ctx, t.session, params)
+}
+func (t *txExecutor) ScheduleCursorAdvance(ctx context.Context, params driver.ScheduleCursorAdvanceParams) (bool, error) {
+	return scheduleCursorAdvance(ctx, t.session, params)
 }
 
 // ---- job row ----
@@ -875,6 +887,25 @@ func leaderResign(ctx context.Context, session *gocql.Session, params driver.Lea
 	_, err := session.Query(`DELETE FROM goncordia_leaders WHERE name=? IF worker_id=?`, params.Name, params.WorkerID).
 		WithContext(ctx).MapScanCAS(map[string]interface{}{})
 	return err
+}
+
+func scheduleCursorGetOrCreate(ctx context.Context, session *gocql.Session, params driver.ScheduleCursorCreateParams) (driver.ScheduleCursorResult, error) {
+	initial := params.InitialAt.UTC()
+	applied, err := session.Query(`INSERT INTO goncordia_schedule_cursors (id, cursor_at) VALUES (?, ?) IF NOT EXISTS`,
+		params.ID, initial).WithContext(ctx).MapScanCAS(map[string]interface{}{})
+	if err != nil {
+		return driver.ScheduleCursorResult{}, err
+	}
+	var at time.Time
+	if err := session.Query(`SELECT cursor_at FROM goncordia_schedule_cursors WHERE id=?`, params.ID).WithContext(ctx).Scan(&at); err != nil {
+		return driver.ScheduleCursorResult{}, err
+	}
+	return driver.ScheduleCursorResult{At: at.UTC(), Created: applied}, nil
+}
+
+func scheduleCursorAdvance(ctx context.Context, session *gocql.Session, params driver.ScheduleCursorAdvanceParams) (bool, error) {
+	return session.Query(`UPDATE goncordia_schedule_cursors SET cursor_at=? WHERE id=? IF cursor_at=?`,
+		params.Next.UTC(), params.ID, params.Expected.UTC()).WithContext(ctx).MapScanCAS(map[string]interface{}{})
 }
 
 // compile-time checks

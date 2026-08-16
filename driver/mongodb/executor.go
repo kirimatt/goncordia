@@ -129,6 +129,12 @@ func (e *executor) LeaderAttemptElect(ctx context.Context, params driver.LeaderE
 func (e *executor) LeaderResign(ctx context.Context, params driver.LeaderResignParams) error {
 	return leaderResign(ctx, e.db, params)
 }
+func (e *executor) ScheduleCursorGetOrCreate(ctx context.Context, params driver.ScheduleCursorCreateParams) (driver.ScheduleCursorResult, error) {
+	return scheduleCursorGetOrCreate(ctx, e.db, params)
+}
+func (e *executor) ScheduleCursorAdvance(ctx context.Context, params driver.ScheduleCursorAdvanceParams) (bool, error) {
+	return scheduleCursorAdvance(ctx, e.db, params)
+}
 
 // ---- txExecutor (transactional) ----
 
@@ -196,6 +202,12 @@ func (t *txExecutor) LeaderAttemptElect(ctx context.Context, params driver.Leade
 }
 func (t *txExecutor) LeaderResign(ctx context.Context, params driver.LeaderResignParams) error {
 	return leaderResign(t.sc, t.db, params)
+}
+func (t *txExecutor) ScheduleCursorGetOrCreate(ctx context.Context, params driver.ScheduleCursorCreateParams) (driver.ScheduleCursorResult, error) {
+	return scheduleCursorGetOrCreate(t.sc, t.db, params)
+}
+func (t *txExecutor) ScheduleCursorAdvance(ctx context.Context, params driver.ScheduleCursorAdvanceParams) (bool, error) {
+	return scheduleCursorAdvance(t.sc, t.db, params)
 }
 
 // ---- core functions ----
@@ -647,6 +659,39 @@ func leaderAttemptElect(ctx context.Context, db *mongo.Database, clk clock.Clock
 func leaderResign(ctx context.Context, db *mongo.Database, params driver.LeaderResignParams) error {
 	_, err := db.Collection(leadersCollection).DeleteOne(ctx, bson.M{"_id": params.Name, "worker_id": params.WorkerID})
 	return err
+}
+
+type scheduleCursorDoc struct {
+	ID string    `bson:"_id"`
+	At time.Time `bson:"cursor_at"`
+}
+
+func scheduleCursorGetOrCreate(ctx context.Context, db *mongo.Database, params driver.ScheduleCursorCreateParams) (driver.ScheduleCursorResult, error) {
+	col := db.Collection(cursorsCollection)
+	initial := params.InitialAt.UTC()
+	created := true
+	_, err := col.InsertOne(ctx, scheduleCursorDoc{ID: params.ID, At: initial})
+	if err != nil {
+		if !mongo.IsDuplicateKeyError(err) {
+			return driver.ScheduleCursorResult{}, err
+		}
+		created = false
+	}
+	var doc scheduleCursorDoc
+	if err := col.FindOne(ctx, bson.M{"_id": params.ID}).Decode(&doc); err != nil {
+		return driver.ScheduleCursorResult{}, err
+	}
+	return driver.ScheduleCursorResult{At: doc.At.UTC(), Created: created}, nil
+}
+
+func scheduleCursorAdvance(ctx context.Context, db *mongo.Database, params driver.ScheduleCursorAdvanceParams) (bool, error) {
+	result, err := db.Collection(cursorsCollection).UpdateOne(ctx,
+		bson.M{"_id": params.ID, "cursor_at": params.Expected.UTC()},
+		bson.M{"$set": bson.M{"cursor_at": params.Next.UTC()}})
+	if err != nil {
+		return false, err
+	}
+	return result.ModifiedCount == 1, nil
 }
 
 // ---- helpers ----

@@ -114,6 +114,12 @@ func (e *executor) LeaderAttemptElect(ctx context.Context, params driver.LeaderE
 func (e *executor) LeaderResign(ctx context.Context, params driver.LeaderResignParams) error {
 	return leaderResign(ctx, poolQuerier{e.pool}, params)
 }
+func (e *executor) ScheduleCursorGetOrCreate(ctx context.Context, params driver.ScheduleCursorCreateParams) (driver.ScheduleCursorResult, error) {
+	return scheduleCursorGetOrCreate(ctx, poolQuerier{e.pool}, params)
+}
+func (e *executor) ScheduleCursorAdvance(ctx context.Context, params driver.ScheduleCursorAdvanceParams) (bool, error) {
+	return scheduleCursorAdvance(ctx, poolQuerier{e.pool}, params)
+}
 
 // txExecutor is the transactional executor (wraps pgx.Tx).
 type txExecutor struct {
@@ -171,6 +177,12 @@ func (t *txExecutor) LeaderAttemptElect(ctx context.Context, params driver.Leade
 }
 func (t *txExecutor) LeaderResign(ctx context.Context, params driver.LeaderResignParams) error {
 	return leaderResign(ctx, txQuerier{t.querier}, params)
+}
+func (t *txExecutor) ScheduleCursorGetOrCreate(ctx context.Context, params driver.ScheduleCursorCreateParams) (driver.ScheduleCursorResult, error) {
+	return scheduleCursorGetOrCreate(ctx, txQuerier{t.querier}, params)
+}
+func (t *txExecutor) ScheduleCursorAdvance(ctx context.Context, params driver.ScheduleCursorAdvanceParams) (bool, error) {
+	return scheduleCursorAdvance(ctx, txQuerier{t.querier}, params)
 }
 
 // --- SQL implementations ---
@@ -524,6 +536,28 @@ WHERE goncordia_leaders.expires_at <= $4
 func leaderResign(ctx context.Context, q querier, params driver.LeaderResignParams) error {
 	_, err := q.Exec(ctx, `DELETE FROM goncordia_leaders WHERE name=$1 AND worker_id=$2`, params.Name, params.WorkerID)
 	return err
+}
+
+func scheduleCursorGetOrCreate(ctx context.Context, q querier, params driver.ScheduleCursorCreateParams) (driver.ScheduleCursorResult, error) {
+	const insertSQL = `INSERT INTO goncordia_schedule_cursors (id, cursor_at) VALUES ($1, $2) ON CONFLICT (id) DO NOTHING`
+	tag, err := q.Exec(ctx, insertSQL, params.ID, params.InitialAt.UTC())
+	if err != nil {
+		return driver.ScheduleCursorResult{}, err
+	}
+	var at time.Time
+	if err := q.QueryRow(ctx, `SELECT cursor_at FROM goncordia_schedule_cursors WHERE id=$1`, params.ID).Scan(&at); err != nil {
+		return driver.ScheduleCursorResult{}, err
+	}
+	return driver.ScheduleCursorResult{At: at.UTC(), Created: tag.RowsAffected() == 1}, nil
+}
+
+func scheduleCursorAdvance(ctx context.Context, q querier, params driver.ScheduleCursorAdvanceParams) (bool, error) {
+	tag, err := q.Exec(ctx, `UPDATE goncordia_schedule_cursors SET cursor_at=$1 WHERE id=$2 AND cursor_at=$3`,
+		params.Next.UTC(), params.ID, params.Expected.UTC())
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() == 1, nil
 }
 
 // --- scan helpers ---

@@ -117,6 +117,13 @@ func (d *Driver) Migrate(ctx context.Context) error {
 			version    Int64
 		) ENGINE = ReplacingMergeTree(version)
 		ORDER BY name`,
+
+		`CREATE TABLE IF NOT EXISTS goncordia_schedule_cursors (
+			id        String,
+			cursor_at DateTime64(3, 'UTC'),
+			version   Int64
+		) ENGINE = ReplacingMergeTree(version)
+		ORDER BY id`,
 	}
 	for _, stmt := range stmts {
 		if err := d.conn.Exec(ctx, stmt); err != nil {

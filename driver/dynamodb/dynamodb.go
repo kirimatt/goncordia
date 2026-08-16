@@ -46,6 +46,7 @@ const (
 	tableUniq     = "goncordia_uniq"
 	tableQueues   = "goncordia_queues"
 	tableLeaders  = "goncordia_leaders"
+	tableCursors  = "goncordia_schedule_cursors"
 	gsiQueueState = "gsi_queue_state"
 )
 
@@ -129,6 +130,16 @@ func (d *Driver) Migrate(ctx context.Context) error {
 			},
 			KeySchema: []types.KeySchemaElement{
 				{AttributeName: aws.String("name"), KeyType: types.KeyTypeHash},
+			},
+		},
+		{
+			TableName:   aws.String(tableCursors),
+			BillingMode: types.BillingModePayPerRequest,
+			AttributeDefinitions: []types.AttributeDefinition{
+				{AttributeName: aws.String("id"), AttributeType: types.ScalarAttributeTypeS},
+			},
+			KeySchema: []types.KeySchemaElement{
+				{AttributeName: aws.String("id"), KeyType: types.KeyTypeHash},
 			},
 		},
 	}

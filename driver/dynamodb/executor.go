@@ -81,6 +81,12 @@ func (e *executor) LeaderAttemptElect(ctx context.Context, params driver.LeaderE
 func (e *executor) LeaderResign(ctx context.Context, params driver.LeaderResignParams) error {
 	return leaderResign(ctx, e.svc, params)
 }
+func (e *executor) ScheduleCursorGetOrCreate(ctx context.Context, params driver.ScheduleCursorCreateParams) (driver.ScheduleCursorResult, error) {
+	return scheduleCursorGetOrCreate(ctx, e.svc, params)
+}
+func (e *executor) ScheduleCursorAdvance(ctx context.Context, params driver.ScheduleCursorAdvanceParams) (bool, error) {
+	return scheduleCursorAdvance(ctx, e.svc, params)
+}
 
 // ---- txExecutor (no-op tx — DynamoDB has no cross-table transactions) ----
 
@@ -129,6 +135,12 @@ func (t *txExecutor) LeaderAttemptElect(ctx context.Context, params driver.Leade
 }
 func (t *txExecutor) LeaderResign(ctx context.Context, params driver.LeaderResignParams) error {
 	return leaderResign(ctx, t.svc, params)
+}
+func (t *txExecutor) ScheduleCursorGetOrCreate(ctx context.Context, params driver.ScheduleCursorCreateParams) (driver.ScheduleCursorResult, error) {
+	return scheduleCursorGetOrCreate(ctx, t.svc, params)
+}
+func (t *txExecutor) ScheduleCursorAdvance(ctx context.Context, params driver.ScheduleCursorAdvanceParams) (bool, error) {
+	return scheduleCursorAdvance(ctx, t.svc, params)
 }
 
 // ---- job row ----
@@ -1044,6 +1056,60 @@ func leaderResign(ctx context.Context, svc *dynamodb.Client, params driver.Leade
 		return nil
 	}
 	return err
+}
+
+func scheduleCursorGetOrCreate(ctx context.Context, svc *dynamodb.Client, params driver.ScheduleCursorCreateParams) (driver.ScheduleCursorResult, error) {
+	initial := params.InitialAt.UTC().Format(timeFmt)
+	created := true
+	_, err := svc.PutItem(ctx, &dynamodb.PutItemInput{
+		TableName: aws.String(tableCursors),
+		Item: map[string]types.AttributeValue{
+			"id": &types.AttributeValueMemberS{Value: params.ID}, "cursor_at": &types.AttributeValueMemberS{Value: initial},
+		},
+		ConditionExpression:      aws.String("attribute_not_exists(#id)"),
+		ExpressionAttributeNames: map[string]string{"#id": "id"},
+	})
+	if err != nil {
+		var conflict *types.ConditionalCheckFailedException
+		if !errors.As(err, &conflict) {
+			return driver.ScheduleCursorResult{}, err
+		}
+		created = false
+	}
+	out, err := svc.GetItem(ctx, &dynamodb.GetItemInput{
+		TableName:      aws.String(tableCursors),
+		Key:            map[string]types.AttributeValue{"id": &types.AttributeValueMemberS{Value: params.ID}},
+		ConsistentRead: aws.Bool(true),
+	})
+	if err != nil {
+		return driver.ScheduleCursorResult{}, err
+	}
+	value, ok := out.Item["cursor_at"].(*types.AttributeValueMemberS)
+	if !ok {
+		return driver.ScheduleCursorResult{}, fmt.Errorf("schedule cursor %q has no cursor_at", params.ID)
+	}
+	return driver.ScheduleCursorResult{At: parseTime(value.Value), Created: created}, nil
+}
+
+func scheduleCursorAdvance(ctx context.Context, svc *dynamodb.Client, params driver.ScheduleCursorAdvanceParams) (bool, error) {
+	_, err := svc.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName:           aws.String(tableCursors),
+		Key:                 map[string]types.AttributeValue{"id": &types.AttributeValueMemberS{Value: params.ID}},
+		UpdateExpression:    aws.String("SET cursor_at = :next"),
+		ConditionExpression: aws.String("cursor_at = :expected"),
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":next":     &types.AttributeValueMemberS{Value: params.Next.UTC().Format(timeFmt)},
+			":expected": &types.AttributeValueMemberS{Value: params.Expected.UTC().Format(timeFmt)},
+		},
+	})
+	if err != nil {
+		var conflict *types.ConditionalCheckFailedException
+		if errors.As(err, &conflict) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
 }
 
 // compile-time checks

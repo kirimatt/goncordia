@@ -123,6 +123,11 @@ type baseExecutor interface {
 
 	LeaderAttemptElect(ctx context.Context, params LeaderElectParams) (elected bool, err error)
 	LeaderResign(ctx context.Context, params LeaderResignParams) error
+
+	// --- Durable periodic schedule cursors ---
+
+	ScheduleCursorGetOrCreate(ctx context.Context, params ScheduleCursorCreateParams) (ScheduleCursorResult, error)
+	ScheduleCursorAdvance(ctx context.Context, params ScheduleCursorAdvanceParams) (advanced bool, err error)
 }
 
 // --- Parameter and result types ---
@@ -240,6 +245,25 @@ type LeaderElectParams struct {
 type LeaderResignParams struct {
 	Name     string
 	WorkerID string
+}
+
+// ScheduleCursorCreateParams initializes a durable schedule cursor if missing.
+type ScheduleCursorCreateParams struct {
+	ID        string
+	InitialAt time.Time
+}
+
+// ScheduleCursorResult returns the persisted cursor and whether it was created.
+type ScheduleCursorResult struct {
+	At      time.Time
+	Created bool
+}
+
+// ScheduleCursorAdvanceParams advances a cursor using compare-and-swap.
+type ScheduleCursorAdvanceParams struct {
+	ID       string
+	Expected time.Time
+	Next     time.Time
 }
 
 // --- Row types ---

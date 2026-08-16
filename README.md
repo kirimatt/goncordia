@@ -499,8 +499,11 @@ import "github.com/kirimatt/goncordia/core"
 
 cs := goncordia.NewCronScheduler(d, []goncordia.PeriodicJob{
     {
+        ID:       "hourly-cleanup", // stable ID enables durable cursor + deduplication
+        StartAt:  time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
         Schedule: core.Every(time.Hour),
         Args:     CleanupArgs{},
+        CatchUp:  goncordia.CronCatchUpAll,
     },
     {
         Schedule: core.Every(24 * time.Hour),
@@ -511,6 +514,7 @@ cs := goncordia.NewCronScheduler(d, []goncordia.PeriodicJob{
     TickInterval: time.Second, // how often to check for due jobs
     LeaderName:   "hourly-maintenance",
     LeaderTTL:    30 * time.Second,
+    MaxCatchUp:   100,
 })
 
 go cs.Start(ctx)   // blocks; cancel ctx to stop
@@ -550,6 +554,15 @@ Pass `nil` to use UTC. Invalid expressions return an error during setup.
 ### Notes
 
 - The scheduler fires each job on the **first tick** after `Start`, then respects the interval.
+- A job with an empty `ID` uses that legacy process-local behavior. For durable
+  scheduling, provide a stable `ID` and `StartAt`; the first occurrence is
+  `Schedule.Next(StartAt)`.
+- Durable cursors are persisted by the driver and advanced with compare-and-swap
+  after enqueue. Each occurrence uses a permanent uniqueness key, so leader
+  failover or a crash between enqueue and cursor advancement cannot duplicate it.
+- `CronCatchUpAll` enqueues missed occurrences up to `MaxCatchUp` per tick,
+  `CronCatchUpLatest` keeps only the latest, and `CronSkipMissed` drops old
+  occurrences while still enqueueing an occurrence reached on the current tick.
 - `CronScheduler` only *enqueues* — workers run via `WorkerPool`.
 - Multiple scheduler instances are safe: only the current lease holder enqueues jobs.
 - Scheduler shutdown releases leadership only when that scheduler instance still

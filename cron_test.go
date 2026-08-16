@@ -179,3 +179,80 @@ func TestCronScheduler_UsesInjectedManualClock(t *testing.T) {
 	manual.Advance(time.Hour)
 	waitForCondition(t, time.Second, func() bool { return len(d.AllJobs()) == 2 }, "scheduled manual tick")
 }
+
+func TestCronScheduler_DurableCursorSurvivesFailover(t *testing.T) {
+	start := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	manual := clock.NewManual(start.Add(3 * time.Hour))
+	d := memory.New(memory.WithClock(manual))
+	job := goncordia.PeriodicJob{
+		ID: "hourly-report", StartAt: start, CatchUp: goncordia.CronCatchUpAll,
+		Schedule: core.Every(time.Hour), Args: cronJob{N: 10},
+	}
+	config := goncordia.CronConfig{
+		TickInterval: time.Second, Clock: manual, LeaderName: "durable-test", WorkerID: "first",
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	first := goncordia.NewCronScheduler(d, []goncordia.PeriodicJob{job}, config)
+	done := make(chan error, 1)
+	go func() { done <- first.Start(ctx) }()
+	waitForCondition(t, time.Second, func() bool { return manual.ActiveTimers() == 1 }, "first durable ticker")
+	manual.Advance(time.Second)
+	waitForCondition(t, time.Second, func() bool { return len(d.AllJobs()) == 3 }, "durable catch-up")
+	cancel()
+	waitForCondition(t, time.Second, func() bool { return manual.ActiveTimers() == 0 }, "first durable stop")
+	<-done
+
+	config.WorkerID = "second"
+	second := goncordia.NewCronScheduler(d, []goncordia.PeriodicJob{job}, config)
+	ctx, cancel = context.WithCancel(context.Background())
+	defer cancel()
+	go second.Start(ctx) //nolint:errcheck
+	waitForCondition(t, time.Second, func() bool { return manual.ActiveTimers() == 1 }, "second durable ticker")
+	manual.Advance(time.Second)
+	time.Sleep(10 * time.Millisecond)
+	if got := len(d.AllJobs()); got != 3 {
+		t.Fatalf("failover duplicated occurrences: got %d jobs, want 3", got)
+	}
+	manual.Advance(time.Hour)
+	waitForCondition(t, time.Second, func() bool { return len(d.AllJobs()) == 4 }, "post-failover occurrence")
+}
+
+func TestCronScheduler_CatchUpPolicies(t *testing.T) {
+	start := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	t.Run("latest", func(t *testing.T) {
+		manual := clock.NewManual(start.Add(3 * time.Hour))
+		d := memory.New(memory.WithClock(manual))
+		cs := goncordia.NewCronScheduler(d, []goncordia.PeriodicJob{{
+			ID: "latest", StartAt: start, CatchUp: goncordia.CronCatchUpLatest,
+			Schedule: core.Every(time.Hour), Args: cronJob{N: 20},
+		}}, goncordia.CronConfig{TickInterval: time.Second, Clock: manual})
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		go cs.Start(ctx) //nolint:errcheck
+		waitForCondition(t, time.Second, func() bool { return manual.ActiveTimers() == 1 }, "latest ticker")
+		manual.Advance(time.Second)
+		waitForCondition(t, time.Second, func() bool { return len(d.AllJobs()) == 1 }, "latest catch-up")
+	})
+
+	t.Run("skip", func(t *testing.T) {
+		manual := clock.NewManual(start.Add(3*time.Hour + 30*time.Minute))
+		d := memory.New(memory.WithClock(manual))
+		cs := goncordia.NewCronScheduler(d, []goncordia.PeriodicJob{{
+			ID: "skip", StartAt: start, CatchUp: goncordia.CronSkipMissed,
+			Schedule: core.Every(time.Hour), Args: cronJob{N: 30},
+		}}, goncordia.CronConfig{TickInterval: time.Second, Clock: manual})
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		go cs.Start(ctx) //nolint:errcheck
+		waitForCondition(t, time.Second, func() bool { return manual.ActiveTimers() == 1 }, "skip ticker")
+		manual.Advance(time.Second)
+		time.Sleep(10 * time.Millisecond)
+		if got := len(d.AllJobs()); got != 0 {
+			t.Fatalf("skip enqueued backlog: got %d jobs", got)
+		}
+		manual.Advance(30 * time.Minute)
+		waitForCondition(t, time.Second, func() bool { return len(d.AllJobs()) == 1 }, "next current occurrence")
+	})
+}

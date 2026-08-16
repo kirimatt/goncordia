@@ -54,6 +54,35 @@ func Run(t *testing.T, exec driver.Executor) {
 	t.Cleanup(func() {
 		_ = exec.LeaderResign(context.Background(), driver.LeaderResignParams{Name: leaderName, WorkerID: "owner-b"})
 	})
+	cursorID := "cursor-" + queue
+	initialCursor := now.Truncate(time.Second)
+	cursor, err := exec.ScheduleCursorGetOrCreate(ctx, driver.ScheduleCursorCreateParams{ID: cursorID, InitialAt: initialCursor})
+	if err != nil || !cursor.Created || !cursor.At.Equal(initialCursor) {
+		t.Fatalf("create schedule cursor: cursor=%+v err=%v", cursor, err)
+	}
+	cursorAgain, err := exec.ScheduleCursorGetOrCreate(ctx, driver.ScheduleCursorCreateParams{
+		ID: cursorID, InitialAt: initialCursor.Add(-time.Hour),
+	})
+	if err != nil || cursorAgain.Created || !cursorAgain.At.Equal(initialCursor) {
+		t.Fatalf("reload schedule cursor: cursor=%+v err=%v", cursorAgain, err)
+	}
+	advanced, err := exec.ScheduleCursorAdvance(ctx, driver.ScheduleCursorAdvanceParams{
+		ID: cursorID, Expected: initialCursor.Add(-time.Hour), Next: initialCursor.Add(time.Hour),
+	})
+	if err != nil || advanced {
+		t.Fatalf("stale schedule cursor advance: advanced=%v err=%v", advanced, err)
+	}
+	nextCursor := initialCursor.Add(time.Hour)
+	advanced, err = exec.ScheduleCursorAdvance(ctx, driver.ScheduleCursorAdvanceParams{
+		ID: cursorID, Expected: initialCursor, Next: nextCursor,
+	})
+	if err != nil || !advanced {
+		t.Fatalf("advance schedule cursor: advanced=%v err=%v", advanced, err)
+	}
+	cursorAgain, err = exec.ScheduleCursorGetOrCreate(ctx, driver.ScheduleCursorCreateParams{ID: cursorID, InitialAt: initialCursor})
+	if err != nil || !cursorAgain.At.Equal(nextCursor) {
+		t.Fatalf("read advanced schedule cursor: cursor=%+v err=%v", cursorAgain, err)
+	}
 
 	insert := driver.JobInsertParams{
 		Queue: queue, Kind: "conformance", Args: []byte(`{"value":1}`),

@@ -34,6 +34,7 @@ const (
 	jobsCollection    = "goncordia_jobs"
 	queuesCollection  = "goncordia_queues"
 	leadersCollection = "goncordia_leaders"
+	cursorsCollection = "goncordia_schedule_cursors"
 )
 
 // Driver implements driver.Driver[mongo.SessionContext].

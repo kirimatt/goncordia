@@ -46,6 +46,7 @@ const (
 	colUniq    = "goncordia_uniq"
 	colQueues  = "goncordia_queues"
 	colLeaders = "goncordia_leaders"
+	colCursors = "goncordia_schedule_cursors"
 )
 
 // Driver implements driver.Driver[*firestore.Transaction] backed by Cloud Firestore.

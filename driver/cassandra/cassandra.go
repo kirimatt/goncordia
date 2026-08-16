@@ -134,6 +134,11 @@ func (d *Driver) Migrate(ctx context.Context) error {
 			job_id text
 		)`,
 
+		`CREATE TABLE IF NOT EXISTS goncordia_schedule_cursors (
+			id        text PRIMARY KEY,
+			cursor_at timestamp
+		)`,
+
 		// Leader election. Row TTL is set per insert to expire stale leaders.
 		`CREATE TABLE IF NOT EXISTS goncordia_leaders (
 			name       text PRIMARY KEY,

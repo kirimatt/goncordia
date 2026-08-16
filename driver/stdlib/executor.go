@@ -79,6 +79,12 @@ func (e *executor) LeaderAttemptElect(ctx context.Context, params driver.LeaderE
 func (e *executor) LeaderResign(ctx context.Context, params driver.LeaderResignParams) error {
 	return leaderResign(ctx, e.db, e.dialect, params)
 }
+func (e *executor) ScheduleCursorGetOrCreate(ctx context.Context, params driver.ScheduleCursorCreateParams) (driver.ScheduleCursorResult, error) {
+	return scheduleCursorGetOrCreate(ctx, e.db, e.dialect, params)
+}
+func (e *executor) ScheduleCursorAdvance(ctx context.Context, params driver.ScheduleCursorAdvanceParams) (bool, error) {
+	return scheduleCursorAdvance(ctx, e.db, e.dialect, params)
+}
 
 // txExecutor wraps *sql.Tx.
 type txExecutor struct {
@@ -138,6 +144,12 @@ func (t *txExecutor) LeaderAttemptElect(ctx context.Context, params driver.Leade
 }
 func (t *txExecutor) LeaderResign(ctx context.Context, params driver.LeaderResignParams) error {
 	return leaderResign(ctx, t.tx, t.dialect, params)
+}
+func (t *txExecutor) ScheduleCursorGetOrCreate(ctx context.Context, params driver.ScheduleCursorCreateParams) (driver.ScheduleCursorResult, error) {
+	return scheduleCursorGetOrCreate(ctx, t.tx, t.dialect, params)
+}
+func (t *txExecutor) ScheduleCursorAdvance(ctx context.Context, params driver.ScheduleCursorAdvanceParams) (bool, error) {
+	return scheduleCursorAdvance(ctx, t.tx, t.dialect, params)
 }
 
 // savepointExecutor implements nested tx via SAVEPOINT for Postgres.
@@ -689,6 +701,39 @@ WHERE name=? AND (expires_at<=? OR worker_id=?)`), params.WorkerID, expiresAt, p
 func leaderResign(ctx context.Context, q querier, d Dialect, params driver.LeaderResignParams) error {
 	_, err := q.ExecContext(ctx, d.q(`DELETE FROM goncordia_leaders WHERE name=? AND worker_id=?`), params.Name, params.WorkerID)
 	return err
+}
+
+func scheduleCursorGetOrCreate(ctx context.Context, q querier, d Dialect, params driver.ScheduleCursorCreateParams) (driver.ScheduleCursorResult, error) {
+	initial := params.InitialAt.UTC()
+	var result sql.Result
+	var err error
+	switch d {
+	case Postgres:
+		result, err = q.ExecContext(ctx, `INSERT INTO goncordia_schedule_cursors (id, cursor_at) VALUES ($1,$2) ON CONFLICT (id) DO NOTHING`, params.ID, initial)
+	case MySQL:
+		result, err = q.ExecContext(ctx, `INSERT IGNORE INTO goncordia_schedule_cursors (id, cursor_at) VALUES (?,?)`, params.ID, initial)
+	default:
+		result, err = q.ExecContext(ctx, `INSERT OR IGNORE INTO goncordia_schedule_cursors (id, cursor_at) VALUES (?,?)`, params.ID, initial)
+	}
+	if err != nil {
+		return driver.ScheduleCursorResult{}, err
+	}
+	created, _ := result.RowsAffected()
+	var at time.Time
+	if err := q.QueryRowContext(ctx, d.q(`SELECT cursor_at FROM goncordia_schedule_cursors WHERE id=?`), params.ID).Scan(&at); err != nil {
+		return driver.ScheduleCursorResult{}, err
+	}
+	return driver.ScheduleCursorResult{At: at.UTC(), Created: created == 1}, nil
+}
+
+func scheduleCursorAdvance(ctx context.Context, q querier, d Dialect, params driver.ScheduleCursorAdvanceParams) (bool, error) {
+	result, err := q.ExecContext(ctx, d.q(`UPDATE goncordia_schedule_cursors SET cursor_at=? WHERE id=? AND cursor_at=?`),
+		params.Next.UTC(), params.ID, params.Expected.UTC())
+	if err != nil {
+		return false, err
+	}
+	rows, err := result.RowsAffected()
+	return rows == 1, err
 }
 
 // --- scan helpers ---

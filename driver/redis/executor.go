@@ -22,6 +22,7 @@ import (
 const (
 	jobKeyPrefix = "goncordia:job:"
 	queuesSetKey = "goncordia:queues"
+	cursorsKey   = "goncordia:schedule:cursors"
 )
 
 func availKey(q string) string      { return "goncordia:q:" + q + ":avail" }
@@ -326,6 +327,12 @@ func (e *executor) LeaderAttemptElect(ctx context.Context, params driver.LeaderE
 func (e *executor) LeaderResign(ctx context.Context, params driver.LeaderResignParams) error {
 	return leaderResign(ctx, e.rdb, params)
 }
+func (e *executor) ScheduleCursorGetOrCreate(ctx context.Context, params driver.ScheduleCursorCreateParams) (driver.ScheduleCursorResult, error) {
+	return scheduleCursorGetOrCreate(ctx, e.rdb, params)
+}
+func (e *executor) ScheduleCursorAdvance(ctx context.Context, params driver.ScheduleCursorAdvanceParams) (bool, error) {
+	return scheduleCursorAdvance(ctx, e.rdb, params)
+}
 
 // ---- txExecutor ----
 
@@ -375,6 +382,12 @@ func (t *txExecutor) LeaderAttemptElect(ctx context.Context, params driver.Leade
 }
 func (t *txExecutor) LeaderResign(ctx context.Context, params driver.LeaderResignParams) error {
 	return leaderResign(ctx, t.rdb, params)
+}
+func (t *txExecutor) ScheduleCursorGetOrCreate(ctx context.Context, params driver.ScheduleCursorCreateParams) (driver.ScheduleCursorResult, error) {
+	return scheduleCursorGetOrCreate(ctx, t.rdb, params)
+}
+func (t *txExecutor) ScheduleCursorAdvance(ctx context.Context, params driver.ScheduleCursorAdvanceParams) (bool, error) {
+	return scheduleCursorAdvance(ctx, t.rdb, params)
 }
 
 // ---- core functions ----
@@ -826,6 +839,36 @@ return 0
 
 func leaderResign(ctx context.Context, rdb *redis.Client, params driver.LeaderResignParams) error {
 	return resignLeaderScript.Run(ctx, rdb, []string{leaderKey(params.Name)}, params.WorkerID).Err()
+}
+
+var advanceCursorScript = redis.NewScript(`
+if redis.call('HGET', KEYS[1], ARGV[1]) ~= ARGV[2] then return 0 end
+redis.call('HSET', KEYS[1], ARGV[1], ARGV[3])
+return 1
+`)
+
+func scheduleCursorGetOrCreate(ctx context.Context, rdb *redis.Client, params driver.ScheduleCursorCreateParams) (driver.ScheduleCursorResult, error) {
+	initial := strconv.FormatInt(params.InitialAt.UTC().UnixNano(), 10)
+	created, err := rdb.HSetNX(ctx, cursorsKey, params.ID, initial).Result()
+	if err != nil {
+		return driver.ScheduleCursorResult{}, err
+	}
+	value, err := rdb.HGet(ctx, cursorsKey, params.ID).Result()
+	if err != nil {
+		return driver.ScheduleCursorResult{}, err
+	}
+	nanos, err := strconv.ParseInt(value, 10, 64)
+	if err != nil {
+		return driver.ScheduleCursorResult{}, fmt.Errorf("parse schedule cursor: %w", err)
+	}
+	return driver.ScheduleCursorResult{At: time.Unix(0, nanos).UTC(), Created: created}, nil
+}
+
+func scheduleCursorAdvance(ctx context.Context, rdb *redis.Client, params driver.ScheduleCursorAdvanceParams) (bool, error) {
+	result, err := advanceCursorScript.Run(ctx, rdb, []string{cursorsKey}, params.ID,
+		strconv.FormatInt(params.Expected.UTC().UnixNano(), 10),
+		strconv.FormatInt(params.Next.UTC().UnixNano(), 10)).Int64()
+	return result == 1, err
 }
 
 // ---- listener ----

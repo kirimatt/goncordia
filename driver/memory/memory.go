@@ -27,6 +27,7 @@ type Driver struct {
 	seq     uint64
 	notify  map[string][]chan driver.Notification
 	leaders map[string]memoryLeader
+	cursors map[string]time.Time
 	clk     clock.Clock
 }
 
@@ -50,6 +51,7 @@ func New(opts ...Option) *Driver {
 		queues:  make(map[string]*driver.QueueRow),
 		notify:  make(map[string][]chan driver.Notification),
 		leaders: make(map[string]memoryLeader),
+		cursors: make(map[string]time.Time),
 		clk:     clock.Real{},
 	}
 	for _, o := range opts {
@@ -394,6 +396,28 @@ func (e *executor) LeaderResign(_ context.Context, params driver.LeaderResignPar
 		delete(e.d.leaders, params.Name)
 	}
 	return nil
+}
+
+func (e *executor) ScheduleCursorGetOrCreate(_ context.Context, params driver.ScheduleCursorCreateParams) (driver.ScheduleCursorResult, error) {
+	e.d.mu.Lock()
+	defer e.d.mu.Unlock()
+	if at, ok := e.d.cursors[params.ID]; ok {
+		return driver.ScheduleCursorResult{At: at}, nil
+	}
+	at := params.InitialAt.UTC()
+	e.d.cursors[params.ID] = at
+	return driver.ScheduleCursorResult{At: at, Created: true}, nil
+}
+
+func (e *executor) ScheduleCursorAdvance(_ context.Context, params driver.ScheduleCursorAdvanceParams) (bool, error) {
+	e.d.mu.Lock()
+	defer e.d.mu.Unlock()
+	current, ok := e.d.cursors[params.ID]
+	if !ok || !current.Equal(params.Expected) {
+		return false, nil
+	}
+	e.d.cursors[params.ID] = params.Next.UTC()
+	return true, nil
 }
 
 // --- txExecutor ---

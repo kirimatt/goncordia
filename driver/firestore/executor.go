@@ -126,6 +126,12 @@ func (e *executor) LeaderAttemptElect(ctx context.Context, params driver.LeaderE
 func (e *executor) LeaderResign(ctx context.Context, params driver.LeaderResignParams) error {
 	return leaderResign(ctx, e.client, params)
 }
+func (e *executor) ScheduleCursorGetOrCreate(ctx context.Context, params driver.ScheduleCursorCreateParams) (driver.ScheduleCursorResult, error) {
+	return scheduleCursorGetOrCreate(ctx, e.client, params)
+}
+func (e *executor) ScheduleCursorAdvance(ctx context.Context, params driver.ScheduleCursorAdvanceParams) (bool, error) {
+	return scheduleCursorAdvance(ctx, e.client, params)
+}
 
 // ---- txExecutor (wraps *firestore.Transaction from user's RunTransaction callback) ----
 
@@ -191,6 +197,12 @@ func (t *txExecutor) LeaderAttemptElect(ctx context.Context, params driver.Leade
 }
 func (t *txExecutor) LeaderResign(ctx context.Context, params driver.LeaderResignParams) error {
 	return leaderResign(ctx, t.client, params)
+}
+func (t *txExecutor) ScheduleCursorGetOrCreate(ctx context.Context, params driver.ScheduleCursorCreateParams) (driver.ScheduleCursorResult, error) {
+	return scheduleCursorGetOrCreate(ctx, t.client, params)
+}
+func (t *txExecutor) ScheduleCursorAdvance(ctx context.Context, params driver.ScheduleCursorAdvanceParams) (bool, error) {
+	return scheduleCursorAdvance(ctx, t.client, params)
 }
 
 // ---- JobInsertMany (non-tx) ----
@@ -873,6 +885,53 @@ func leaderResign(ctx context.Context, client *firestore.Client, params driver.L
 		}
 		return tx.Delete(ref)
 	})
+}
+
+type scheduleCursorDoc struct {
+	At time.Time `firestore:"cursor_at"`
+}
+
+func scheduleCursorGetOrCreate(ctx context.Context, client *firestore.Client, params driver.ScheduleCursorCreateParams) (driver.ScheduleCursorResult, error) {
+	ref := client.Collection(colCursors).Doc(params.ID)
+	var result driver.ScheduleCursorResult
+	err := client.RunTransaction(ctx, func(ctx context.Context, tx *firestore.Transaction) error {
+		snap, err := tx.Get(ref)
+		if status.Code(err) == codes.NotFound {
+			result = driver.ScheduleCursorResult{At: params.InitialAt.UTC(), Created: true}
+			return tx.Create(ref, scheduleCursorDoc{At: result.At})
+		}
+		if err != nil {
+			return err
+		}
+		var doc scheduleCursorDoc
+		if err := snap.DataTo(&doc); err != nil {
+			return err
+		}
+		result.At = doc.At.UTC()
+		return nil
+	})
+	return result, err
+}
+
+func scheduleCursorAdvance(ctx context.Context, client *firestore.Client, params driver.ScheduleCursorAdvanceParams) (bool, error) {
+	ref := client.Collection(colCursors).Doc(params.ID)
+	advanced := false
+	err := client.RunTransaction(ctx, func(ctx context.Context, tx *firestore.Transaction) error {
+		snap, err := tx.Get(ref)
+		if err != nil {
+			return err
+		}
+		var doc scheduleCursorDoc
+		if err := snap.DataTo(&doc); err != nil {
+			return err
+		}
+		if !doc.At.Equal(params.Expected) {
+			return nil
+		}
+		advanced = true
+		return tx.Update(ref, []firestore.Update{{Path: "cursor_at", Value: params.Next.UTC()}})
+	})
+	return advanced, err
 }
 
 // ---- helpers ----

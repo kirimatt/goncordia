@@ -76,6 +76,12 @@ func (e *executor) LeaderAttemptElect(ctx context.Context, params driver.LeaderE
 func (e *executor) LeaderResign(ctx context.Context, params driver.LeaderResignParams) error {
 	return leaderResign(ctx, e.conn, params)
 }
+func (e *executor) ScheduleCursorGetOrCreate(ctx context.Context, params driver.ScheduleCursorCreateParams) (driver.ScheduleCursorResult, error) {
+	return scheduleCursorGetOrCreate(ctx, e.conn, params)
+}
+func (e *executor) ScheduleCursorAdvance(ctx context.Context, params driver.ScheduleCursorAdvanceParams) (bool, error) {
+	return scheduleCursorAdvance(ctx, e.conn, params)
+}
 
 // ---- txExecutor (no-op tx — ClickHouse has no transactions) ----
 
@@ -124,6 +130,12 @@ func (t *txExecutor) LeaderAttemptElect(ctx context.Context, params driver.Leade
 }
 func (t *txExecutor) LeaderResign(ctx context.Context, params driver.LeaderResignParams) error {
 	return leaderResign(ctx, t.conn, params)
+}
+func (t *txExecutor) ScheduleCursorGetOrCreate(ctx context.Context, params driver.ScheduleCursorCreateParams) (driver.ScheduleCursorResult, error) {
+	return scheduleCursorGetOrCreate(ctx, t.conn, params)
+}
+func (t *txExecutor) ScheduleCursorAdvance(ctx context.Context, params driver.ScheduleCursorAdvanceParams) (bool, error) {
+	return scheduleCursorAdvance(ctx, t.conn, params)
 }
 
 // ---- job row helpers ----
@@ -765,6 +777,33 @@ func leaderResign(ctx context.Context, conn chdriver.Conn, params driver.LeaderR
 		`INSERT INTO goncordia_leaders (name, worker_id, expires_at, version) VALUES (?,'',?,?)`,
 		params.Name, past, ver+1,
 	)
+}
+
+func scheduleCursorGetOrCreate(ctx context.Context, conn chdriver.Conn, params driver.ScheduleCursorCreateParams) (driver.ScheduleCursorResult, error) {
+	var at time.Time
+	var version int64
+	err := conn.QueryRow(ctx, `SELECT cursor_at, version FROM goncordia_schedule_cursors FINAL WHERE id=? LIMIT 1`, params.ID).Scan(&at, &version)
+	if err == nil {
+		return driver.ScheduleCursorResult{At: at.UTC()}, nil
+	}
+	initial := params.InitialAt.UTC()
+	if err := conn.Exec(ctx, `INSERT INTO goncordia_schedule_cursors (id, cursor_at, version) VALUES (?,?,1)`, params.ID, initial); err != nil {
+		return driver.ScheduleCursorResult{}, err
+	}
+	return driver.ScheduleCursorResult{At: initial, Created: true}, nil
+}
+
+func scheduleCursorAdvance(ctx context.Context, conn chdriver.Conn, params driver.ScheduleCursorAdvanceParams) (bool, error) {
+	var at time.Time
+	var version int64
+	if err := conn.QueryRow(ctx, `SELECT cursor_at, version FROM goncordia_schedule_cursors FINAL WHERE id=? LIMIT 1`, params.ID).Scan(&at, &version); err != nil {
+		return false, err
+	}
+	if !at.Equal(params.Expected) {
+		return false, nil
+	}
+	return true, conn.Exec(ctx, `INSERT INTO goncordia_schedule_cursors (id, cursor_at, version) VALUES (?,?,?)`,
+		params.ID, params.Next.UTC(), version+1)
 }
 
 // compile-time checks
