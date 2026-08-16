@@ -532,6 +532,21 @@ sched := core.ScheduleFunc(func(last time.Time) time.Time {
 })
 ```
 
+### Cron expressions and time zones
+
+```go
+newYork, _ := time.LoadLocation("America/New_York")
+weekdayMorning, err := core.Cron("30 9 * * 1-5", newYork)
+
+cs := goncordia.NewCronScheduler(d, []goncordia.PeriodicJob{
+    {Schedule: weekdayMorning, Args: ReportArgs{}},
+}, goncordia.CronConfig{})
+```
+
+`core.Cron` accepts standard five-field expressions and evaluates calendar
+boundaries in the supplied location, including daylight-saving transitions.
+Pass `nil` to use UTC. Invalid expressions return an error during setup.
+
 ### Notes
 
 - The scheduler fires each job on the **first tick** after `Start`, then respects the interval.

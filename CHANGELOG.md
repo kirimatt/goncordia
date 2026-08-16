@@ -24,6 +24,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `UniqueOpts.Key` for caller-defined deduplication dimensions.
 - `UniqueOpts.Forever` for durable idempotency keys that survive terminal job
   states until explicit deletion.
+- `core.Cron` for validated standard five-field cron expressions evaluated in
+  an explicit time zone with daylight-saving support.
 
 ### Changed
 - Pipeline and per-kind waiters no longer occupy global execution slots.
