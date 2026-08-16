@@ -4,6 +4,15 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to publish or recover (e.g. v0.16.0)'
+        required: true
+        type: string
+
+env:
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
 
 permissions:
   contents: write
@@ -14,15 +23,14 @@ jobs:
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
+          ref: ${{ inputs.tag || github.ref_name }}
           fetch-depth: 0
       - name: Validate release metadata
-        run: ./scripts/check-release.sh "${GITHUB_REF_NAME}"
+        run: ./scripts/check-release.sh "$RELEASE_TAG"
       - name: Extract changelog notes
-        env:
-          RELEASE_TAG: ${{ github.ref_name }}
         run: |
           awk -v tag="$RELEASE_TAG" '
-            $0 == "## [" tag "]" || index($0, "## [" tag "] — ") == 1 { found=1; next }
+            index($0, "## [" tag "] — ") == 1 { found=1; next }
             found && /^---$/ { exit }
             found { print }
           ' CHANGELOG.md > release-notes.md
@@ -30,5 +38,4 @@ jobs:
       - name: Publish GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ github.ref_name }}
         run: gh release create "$RELEASE_TAG" --verify-tag --title "$RELEASE_TAG" --notes-file release-notes.md
