@@ -23,13 +23,13 @@ jobs:
       - name: Format check
         run: test -z "$(gofmt -l .)"
       - name: Workflow lint
-        run: go run github.com/rhysd/actionlint/cmd/actionlint@${ACTIONLINT_VERSION}
+        run: go run "github.com/rhysd/actionlint/cmd/actionlint@${ACTIONLINT_VERSION}"
       - name: Module files are tidy
         run: go mod tidy -diff
       - name: Vet
         run: go vet ./...
       - name: Staticcheck
-        run: go run honnef.co/go/tools/cmd/staticcheck@${STATICCHECK_VERSION} ./...
+        run: go run "honnef.co/go/tools/cmd/staticcheck@${STATICCHECK_VERSION}" ./...
       - name: Release metadata
         run: ./scripts/check-release.sh
       - name: Core coverage threshold
@@ -61,4 +61,4 @@ jobs:
           go-version-file: go.mod
           cache: true
       - name: Govulncheck
-        run: go run golang.org/x/vuln/cmd/govulncheck@${GOVULNCHECK_VERSION} ./...
+        run: go run "golang.org/x/vuln/cmd/govulncheck@${GOVULNCHECK_VERSION}" ./...
