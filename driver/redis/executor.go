@@ -80,6 +80,7 @@ type redisAttemptErr struct {
 	AtMs    int64  `json:"at_ms"`
 	Attempt int    `json:"attempt"`
 	Message string `json:"message"`
+	Trace   string `json:"trace,omitempty"`
 }
 
 func jobToRow(j redisJob) *driver.JobRow {
@@ -113,6 +114,7 @@ func jobToRow(j redisJob) *driver.JobRow {
 			At:      time.UnixMilli(e.AtMs).UTC(),
 			Attempt: e.Attempt,
 			Error:   e.Message,
+			Trace:   e.Trace,
 		})
 	}
 	return row
@@ -609,9 +611,13 @@ func jobSetStateIfRunning(ctx context.Context, rdb *redis.Client, clk clock.Cloc
 				job.WorkerID = ""
 			} else {
 				if params.Err != nil {
-					job.Errors = append(job.Errors, redisAttemptErr{
+					stored := redisAttemptErr{
 						AtMs: now.UnixMilli(), Attempt: job.AttemptNum, Message: *params.Err,
-					})
+					}
+					if params.Trace != nil {
+						stored.Trace = *params.Trace
+					}
+					job.Errors = append(job.Errors, stored)
 				}
 				if params.State == driver.JobStateRetryable {
 					retryAt := params.RetryAt

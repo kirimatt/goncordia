@@ -2,6 +2,7 @@ package core
 
 import (
 	"errors"
+	"math/rand/v2"
 	"time"
 
 	"github.com/kirimatt/goncordia/clock"
@@ -19,6 +20,12 @@ type ExponentialRetry struct {
 	Base time.Duration
 	// Max caps the calculated delay. Default: 24 hours.
 	Max time.Duration
+	// Jitter randomizes the delay by this fraction in both directions. Values
+	// above 1 are treated as 1; zero disables jitter.
+	Jitter float64
+	// Random returns a value in [0,1) for jitter. Tests can inject a
+	// deterministic source. Default: rand.Float64.
+	Random func() float64
 }
 
 // DefaultRetryPolicy is the out-of-the-box exponential backoff.
@@ -46,6 +53,33 @@ func (r ExponentialRetry) NextRetryAt(attempt int, _ error, clk clock.Clock) tim
 	}
 	if delay > max {
 		delay = max
+	}
+	jitter := r.Jitter
+	if jitter < 0 {
+		jitter = 0
+	}
+	if jitter > 1 {
+		jitter = 1
+	}
+	if jitter > 0 {
+		random := r.Random
+		if random == nil {
+			random = rand.Float64
+		}
+		value := random()
+		if value < 0 {
+			value = 0
+		}
+		if value > 1 {
+			value = 1
+		}
+		factor := 1 - jitter + 2*jitter*value
+		jittered := float64(delay) * factor
+		if jittered >= float64(max) {
+			delay = max
+		} else {
+			delay = time.Duration(jittered)
+		}
 	}
 	return clk.Now().Add(delay)
 }

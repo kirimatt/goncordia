@@ -40,6 +40,8 @@ type Job[T JobArgs] struct {
 	MaxRetry int
 	// CreatedAt is when the job was first enqueued.
 	CreatedAt time.Time
+	// RunAt is when the job became eligible to run.
+	RunAt time.Time
 	// WorkerID identifies the worker pool that claimed this attempt.
 	WorkerID string
 	// Tags are optional labels attached to the job at enqueue time.

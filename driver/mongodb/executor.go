@@ -41,6 +41,7 @@ type attemptError struct {
 	At      time.Time `bson:"at"`
 	Attempt int       `bson:"attempt"`
 	Message string    `bson:"message"`
+	Trace   string    `bson:"trace,omitempty"`
 }
 
 type queueDoc struct {
@@ -496,11 +497,15 @@ func jobSetStateIfRunning(ctx context.Context, db *mongo.Database, clk clock.Clo
 	}
 
 	if params.Err != nil {
-		push["errors"] = attemptError{
+		stored := attemptError{
 			At:      now,
 			Attempt: params.Attempt,
 			Message: *params.Err,
 		}
+		if params.Trace != nil {
+			stored.Trace = *params.Trace
+		}
+		push["errors"] = stored
 	}
 
 	update := bson.M{"$set": set}
@@ -729,7 +734,7 @@ func scheduleCursorAdvance(ctx context.Context, db *mongo.Database, params drive
 func docToRow(doc jobDoc) *driver.JobRow {
 	var errs []driver.AttemptError
 	for _, e := range doc.Errors {
-		errs = append(errs, driver.AttemptError{At: e.At, Attempt: e.Attempt, Error: e.Message})
+		errs = append(errs, driver.AttemptError{At: e.At, Attempt: e.Attempt, Error: e.Message, Trace: e.Trace})
 	}
 
 	var timeout time.Duration

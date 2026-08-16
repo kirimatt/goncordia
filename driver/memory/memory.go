@@ -295,10 +295,15 @@ func (e *executor) JobSetStateIfRunning(_ context.Context, params driver.JobSetS
 	row.State = params.State
 	row.WorkerID = ""
 	if params.Err != nil {
+		trace := ""
+		if params.Trace != nil {
+			trace = *params.Trace
+		}
 		row.Errors = append(row.Errors, driver.AttemptError{
 			At:      e.d.clk.Now(),
 			Attempt: row.AttemptNum,
 			Error:   *params.Err,
+			Trace:   trace,
 		})
 	}
 	if params.State == driver.JobStateRetryable && !params.RetryAt.IsZero() {

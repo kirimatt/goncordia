@@ -166,6 +166,7 @@ type storedError struct {
 	At      int64  `json:"at_ms"`
 	Attempt int    `json:"attempt"`
 	Error   string `json:"error"`
+	Trace   string `json:"trace,omitempty"`
 }
 
 func marshalErrors(errs []driver.AttemptError) string {
@@ -174,7 +175,7 @@ func marshalErrors(errs []driver.AttemptError) string {
 	}
 	out := make([]storedError, len(errs))
 	for i, e := range errs {
-		out[i] = storedError{At: e.At.UnixMilli(), Attempt: e.Attempt, Error: e.Error}
+		out[i] = storedError{At: e.At.UnixMilli(), Attempt: e.Attempt, Error: e.Error, Trace: e.Trace}
 	}
 	b, _ := json.Marshal(out)
 	return string(b)
@@ -190,7 +191,7 @@ func unmarshalErrors(s string) []driver.AttemptError {
 	}
 	out := make([]driver.AttemptError, len(stored))
 	for i, e := range stored {
-		out[i] = driver.AttemptError{At: time.UnixMilli(e.At).UTC(), Attempt: e.Attempt, Error: e.Error}
+		out[i] = driver.AttemptError{At: time.UnixMilli(e.At).UTC(), Attempt: e.Attempt, Error: e.Error, Trace: e.Trace}
 	}
 	return out
 }
@@ -641,11 +642,15 @@ func jobSetStateIfRunning(ctx context.Context, session *gocql.Session, clk clock
 	now := clk.Now()
 	newErrors := unmarshalErrors(j.ErrorsJSON)
 	if params.Err != nil {
-		newErrors = append(newErrors, driver.AttemptError{
+		stored := driver.AttemptError{
 			At:      now,
 			Attempt: j.AttemptNum,
 			Error:   *params.Err,
-		})
+		}
+		if params.Trace != nil {
+			stored.Trace = *params.Trace
+		}
+		newErrors = append(newErrors, stored)
 	}
 	errJSON := marshalErrors(newErrors)
 

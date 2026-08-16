@@ -592,6 +592,9 @@ func jobSetStateIfRunning(ctx context.Context, q querier, d Dialect, clk clock.C
 	var errJSON *string
 	if params.Err != nil {
 		entry := driver.AttemptError{At: clk.Now(), Attempt: params.Attempt, Error: *params.Err}
+		if params.Trace != nil {
+			entry.Trace = *params.Trace
+		}
 		b, _ := json.Marshal(entry)
 		s := string(b)
 		if d == Postgres {

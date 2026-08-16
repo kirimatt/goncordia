@@ -636,8 +636,11 @@ Pass `nil` to use UTC. Invalid expressions return an error during setup.
 ## Retry policies
 
 ```go
-// Exponential backoff (default): 1s, 2s, 4s, … capped at Max
-core.ExponentialRetry{Base: time.Second, Max: 24 * time.Hour}
+// Exponential backoff: 1s, 2s, 4s, … capped at Max, with ±20% jitter
+core.ExponentialRetry{Base: time.Second, Max: 24 * time.Hour, Jitter: 0.2}
+
+// Tests can inject deterministic randomization:
+core.ExponentialRetry{Base: time.Second, Jitter: 0.2, Random: func() float64 { return 0.5 }}
 
 // Fixed delay
 core.FixedRetry{Delay: 30 * time.Second}
@@ -859,9 +862,20 @@ go get github.com/kirimatt/goncordia/otel
 ```go
 import otelgoncordia "github.com/kirimatt/goncordia/otel"
 
+instrumentation := otelgoncordia.NewInstrumentation(
+    otelgoncordia.WithTracerProvider(tp),
+    otelgoncordia.WithMeterProvider(mp),
+    otelgoncordia.WithClock(clk),
+)
+
+client := pgxdriver.NewClient(d, goncordia.ClientConfig{
+    Observer: instrumentation,
+})
+
 wp := pgxdriver.NewWorkerPool(d, registry, goncordia.WorkerConfig{
     Queues:      []string{"default"},
     Concurrency: 10,
+    Observer:    instrumentation,
     Middleware: []goncordia.JobMiddleware{
         otelgoncordia.NewMiddleware(
             // optional — defaults to otel.GetTracerProvider() / otel.GetMeterProvider()
@@ -873,14 +887,22 @@ wp := pgxdriver.NewWorkerPool(d, registry, goncordia.WorkerConfig{
 })
 ```
 
-Each job execution produces:
+The instrumentation produces:
 
+- **Span** `goncordia.enqueue` with driver, batch, queue/kind, and outcome attributes
 - **Span** `goncordia.process` with job, worker, and pipeline attributes
+- **Histogram** `goncordia.enqueue.duration` (seconds) — storage latency by driver/status
 - **Histogram** `goncordia.job.duration` (seconds) — labelled by kind, queue, status
-- **Histogram** `goncordia.job.queue_time` (seconds) — time from enqueue to handler start
+- **Histogram** `goncordia.job.queue_time` (seconds) — time from eligibility
+  (`max(created_at, run_at)`) to handler start; scheduled waiting is excluded
+- **Histogram** `goncordia.job.schedule_lag` (seconds) — scheduled `run_at` to claim
+- **Counter** `goncordia.job.heartbeat.count` — heartbeat outcomes (`ok`/`stale`/`error`)
+- **Counter** `goncordia.job.lease_rescued` — expired claims returned to queues
 - **Counter** `goncordia.job.count` — labelled by kind, queue, status (`ok` / `error`)
 
-Panics are recovered, converted to errors, and recorded on the span before re-triggering the retry policy — the worker pool always stays alive.
+Panics are recovered, converted to errors, recorded on the span, and persisted
+with their stack trace in `driver.AttemptError.Trace` before retry/discard. The
+worker pool always stays alive.
 
 You can also add your own middleware for logging or custom metrics:
 

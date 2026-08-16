@@ -417,7 +417,7 @@ WHERE id = $1 AND state = 'running'
 		return err
 	}
 
-	errJSON := encodeError(params.Err, params.Attempt, clk)
+	errJSON := encodeError(params.Err, params.Trace, params.Attempt, clk)
 
 	var finalizedAt *time.Time
 	terminal := false
@@ -668,11 +668,14 @@ func scanQueueRow(s scanner) (*driver.QueueRow, error) {
 }
 
 // encodeError serialises a single error into a JSONB array element for appending.
-func encodeError(errStr *string, attempt int, clk clock.Clock) []byte {
+func encodeError(errStr, trace *string, attempt int, clk clock.Clock) []byte {
 	if errStr == nil {
 		return nil
 	}
 	entry := driver.AttemptError{At: clk.Now(), Attempt: attempt, Error: *errStr}
+	if trace != nil {
+		entry.Trace = *trace
+	}
 	b, _ := json.Marshal([]driver.AttemptError{entry})
 	return b
 }

@@ -66,6 +66,38 @@ func TestMiddleware_SuccessfulJob(t *testing.T) {
 	wp.Stop()
 }
 
+func TestInstrumentation_ClientAndWorkerObservers(t *testing.T) {
+	instrumentation := otelgoncordia.NewInstrumentation(
+		otelgoncordia.WithTracerProvider(nooptrace.NewTracerProvider()),
+		otelgoncordia.WithMeterProvider(noop.NewMeterProvider()),
+	)
+	d := memory.New()
+	registry := core.NewRegistry()
+	ran := make(chan struct{}, 1)
+	core.RegisterWorker(registry, core.WorkerFunc[emailJob](func(_ context.Context, _ *core.Job[emailJob]) error {
+		ran <- struct{}{}
+		return nil
+	}), core.WorkerOpts{})
+	pool := goncordia.NewWorkerPool(d, registry, goncordia.WorkerConfig{
+		PollInterval: 5 * time.Millisecond,
+		Observer:     instrumentation,
+		Middleware:   []goncordia.JobMiddleware{otelgoncordia.NewMiddleware()},
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go pool.Start(ctx) //nolint:errcheck
+	client := goncordia.NewClient(d, goncordia.ClientConfig{Observer: instrumentation})
+	if _, err := client.Enqueue(ctx, emailJob{To: "observed@test.com"}, nil); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-ran:
+	case <-time.After(time.Second):
+		t.Fatal("instrumented job did not run")
+	}
+	pool.Stop()
+}
+
 func TestMiddleware_FailingJob(t *testing.T) {
 	var attempts atomic.Int64
 	wp, d := newPool(t,

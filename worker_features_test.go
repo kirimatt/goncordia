@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -47,6 +48,37 @@ func TestNoRetryDiscardsAfterFirstFailure(t *testing.T) {
 		t.Fatalf("attempts=%d, want 1", got)
 	}
 	pool.Stop()
+}
+
+func TestWorkerPersistsPanicStackTrace(t *testing.T) {
+	d := memory.New()
+	client := goncordia.NewClient(d, goncordia.ClientConfig{})
+	registry := core.NewRegistry()
+	core.RegisterWorker(registry, core.WorkerFunc[featureArgs](func(context.Context, *core.Job[featureArgs]) error {
+		panic("boom")
+	}), core.WorkerOpts{})
+	if _, err := client.Enqueue(context.Background(), featureArgs{}, nil); err != nil {
+		t.Fatal(err)
+	}
+	pool := goncordia.NewWorkerPool(d, registry, goncordia.WorkerConfig{
+		PollInterval: 5 * time.Millisecond, RetryPolicy: core.NoRetry{},
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go pool.Start(ctx) //nolint:errcheck
+	waitForCondition(t, time.Second, func() bool {
+		jobs := d.AllJobs()
+		return len(jobs) == 1 && jobs[0].State == driver.JobStateDiscarded
+	}, "panic discard")
+	pool.Stop()
+	job := d.AllJobs()[0]
+	if len(job.Errors) != 1 || job.Errors[0].Error != "panic: boom" {
+		t.Fatalf("panic errors=%+v", job.Errors)
+	}
+	if !strings.Contains(job.Errors[0].Trace, "TestWorkerPersistsPanicStackTrace") ||
+		!strings.Contains(job.Errors[0].Trace, "runtime/debug.Stack") {
+		t.Fatalf("panic trace missing call stack: %q", job.Errors[0].Trace)
+	}
 }
 
 func TestWorkerHonorsRetryDirectives(t *testing.T) {

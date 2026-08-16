@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"runtime/debug"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -58,6 +59,8 @@ type WorkerConfig struct {
 	// Middleware is applied around each job execution in order (outermost first).
 	// Use it to add tracing, logging, or metrics without modifying job handlers.
 	Middleware []JobMiddleware
+	// Observer receives claim, heartbeat, and rescue lifecycle events.
+	Observer WorkerObserver
 	// ErrorHandler receives asynchronous fetch, rescue, and state-transition errors.
 	// Default: slog.Error.
 	ErrorHandler func(error)
@@ -328,6 +331,9 @@ func (p *WorkerPool[TTx]) fetchAndDispatch(ctx context.Context) {
 
 		for i := range rows {
 			row := rows[i]
+			if p.config.Observer != nil {
+				p.config.Observer.JobClaimed(ctx, row)
+			}
 			pipelineReady, pipelineDone := p.pipelineGate(row.PipelineID)
 			p.pending <- struct{}{}
 			p.wg.Add(1)
@@ -433,6 +439,7 @@ func (p *WorkerPool[TTx]) processRow(ctx context.Context, exec driver.Executor, 
 		AttemptNum: row.AttemptNum,
 		MaxRetry:   maxRetry,
 		CreatedAt:  row.CreatedAt,
+		RunAt:      row.RunAt,
 		WorkerID:   row.WorkerID,
 		Tags:       row.Tags,
 		PipelineID: row.PipelineID,
@@ -444,12 +451,7 @@ func (p *WorkerPool[TTx]) processRow(ctx context.Context, exec driver.Executor, 
 	handler = func(ctx context.Context, job *core.RawJob) (err error) {
 		defer func() {
 			if r := recover(); r != nil {
-				switch v := r.(type) {
-				case error:
-					err = v
-				default:
-					err = &panicError{val: v}
-				}
+				err = newPanicError(r)
 			}
 		}()
 		return p.registry.Process(ctx, job)
@@ -494,9 +496,10 @@ func (p *WorkerPool[TTx]) processRow(ctx context.Context, exec driver.Executor, 
 	}
 
 	errStr := jobErr.Error()
+	trace := panicTrace(jobErr)
 	if _, discard := core.AsDiscard(jobErr); discard {
 		p.setState(ctx, exec, fencedStateParams(row, driver.JobSetStateParams{
-			State: driver.JobStateDiscarded, Err: &errStr, Attempt: row.AttemptNum,
+			State: driver.JobStateDiscarded, Err: &errStr, Trace: trace, Attempt: row.AttemptNum,
 		}))
 		return
 	}
@@ -505,6 +508,7 @@ func (p *WorkerPool[TTx]) processRow(ctx context.Context, exec driver.Executor, 
 		p.setState(ctx, exec, fencedStateParams(row, driver.JobSetStateParams{
 			State:   driver.JobStateDiscarded,
 			Err:     &errStr,
+			Trace:   trace,
 			Attempt: row.AttemptNum,
 		}))
 		return
@@ -523,6 +527,7 @@ func (p *WorkerPool[TTx]) processRow(ctx context.Context, exec driver.Executor, 
 		p.setState(ctx, exec, fencedStateParams(row, driver.JobSetStateParams{
 			State:   driver.JobStateDiscarded,
 			Err:     &errStr,
+			Trace:   trace,
 			Attempt: row.AttemptNum,
 		}))
 		return
@@ -530,6 +535,7 @@ func (p *WorkerPool[TTx]) processRow(ctx context.Context, exec driver.Executor, 
 	p.setState(ctx, exec, fencedStateParams(row, driver.JobSetStateParams{
 		State:   driver.JobStateRetryable,
 		Err:     &errStr,
+		Trace:   trace,
 		Attempt: row.AttemptNum,
 		RetryAt: retryAt,
 	}))
@@ -560,9 +566,13 @@ func (p *WorkerPool[TTx]) startHeartbeat(ctx context.Context, exec driver.Execut
 			case <-p.shutdownCh:
 				return
 			case <-ticker.C():
-				renewed, err := heartbeater.JobHeartbeat(claimCtx, driver.JobHeartbeatParams{
+				params := driver.JobHeartbeatParams{
 					ID: row.ID, WorkerID: row.WorkerID, Attempt: row.AttemptNum, At: p.config.Clock.Now(),
-				})
+				}
+				renewed, err := heartbeater.JobHeartbeat(claimCtx, params)
+				if p.config.Observer != nil {
+					p.config.Observer.JobHeartbeat(claimCtx, HeartbeatEvent{Job: row, Renewed: renewed, Err: err})
+				}
 				if err != nil {
 					p.reportError(fmt.Errorf("heartbeat job %s: %w", row.ID, err))
 					continue
@@ -583,12 +593,7 @@ func (p *WorkerPool[TTx]) startHeartbeat(ctx context.Context, exec driver.Execut
 func callHandler(ctx context.Context, job *core.RawJob, handler func(context.Context, *core.RawJob) error) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
-			switch v := r.(type) {
-			case error:
-				err = v
-			default:
-				err = &panicError{val: v}
-			}
+			err = newPanicError(r)
 		}
 	}()
 	return handler(ctx, job)
@@ -613,7 +618,11 @@ func (p *WorkerPool[TTx]) rescueStuck(ctx context.Context) {
 	}
 	before := p.config.Clock.Now().Add(-p.config.StuckJobTimeout)
 	for _, queue := range p.config.Queues {
-		if _, err := rescuer.JobRescueStuck(ctx, driver.JobRescueParams{Queue: queue, Before: before}); err != nil {
+		rescued, err := rescuer.JobRescueStuck(ctx, driver.JobRescueParams{Queue: queue, Before: before})
+		if p.config.Observer != nil {
+			p.config.Observer.JobsRescued(ctx, RescueEvent{Queue: queue, Before: before, Rescued: rescued, Err: err})
+		}
+		if err != nil {
 			p.reportError(fmt.Errorf("rescue queue %q: %w", queue, err))
 		}
 	}
@@ -625,10 +634,26 @@ func (p *WorkerPool[TTx]) reportError(err error) {
 	}
 }
 
-type panicError struct{ val any }
+type panicError struct {
+	val   any
+	stack string
+}
+
+func newPanicError(value any) *panicError {
+	return &panicError{val: value, stack: string(debug.Stack())}
+}
 
 func (e *panicError) Error() string {
 	return "panic: " + anyToString(e.val)
+}
+
+func panicTrace(err error) *string {
+	var panicErr *panicError
+	if !errors.As(err, &panicErr) || panicErr.stack == "" {
+		return nil
+	}
+	trace := panicErr.stack
+	return &trace
 }
 
 func anyToString(v any) string {

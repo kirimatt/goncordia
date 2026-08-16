@@ -13,6 +13,29 @@ import (
 	"github.com/kirimatt/goncordia/driver/memory"
 )
 
+type recordingClientObserver struct {
+	start  goncordia.EnqueueStart
+	finish goncordia.EnqueueFinish
+}
+
+func (o *recordingClientObserver) StartEnqueue(ctx context.Context, start goncordia.EnqueueStart) (context.Context, func(goncordia.EnqueueFinish)) {
+	o.start = start
+	return ctx, func(finish goncordia.EnqueueFinish) { o.finish = finish }
+}
+
+func TestClientObserverReceivesEnqueueOutcome(t *testing.T) {
+	d := memory.New()
+	observer := &recordingClientObserver{}
+	client := goncordia.NewClient(d, goncordia.ClientConfig{Observer: observer})
+	if _, err := client.Enqueue(context.Background(), EmailArgs{To: "observed"}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if observer.start.Driver != "memory" || observer.start.Count != 1 || observer.start.Queue != "default" ||
+		observer.start.Kind != "send_email" || observer.start.Transactional || observer.finish.Inserted != 1 || observer.finish.Err != nil {
+		t.Fatalf("start=%+v finish=%+v", observer.start, observer.finish)
+	}
+}
+
 func TestEnqueueBatchUsesPerItemOptions(t *testing.T) {
 	d := memory.New()
 	client := goncordia.NewClient(d, goncordia.ClientConfig{})

@@ -180,6 +180,7 @@ type JobSetStateParams struct {
 	ID               string
 	State            JobState
 	Err              *string   // serialized error for failed/retryable states
+	Trace            *string   // optional panic stack trace retained with Err
 	Attempt          int       // attempt number associated with Err
 	RetryAt          time.Time // populated when State == JobStateRetryable
 	ExpectedWorkerID string    // optional fencing precondition

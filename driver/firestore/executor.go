@@ -47,6 +47,7 @@ type jobError struct {
 	At      time.Time `firestore:"at"`
 	Attempt int       `firestore:"attempt"`
 	Message string    `firestore:"message"`
+	Trace   string    `firestore:"trace,omitempty"`
 }
 
 type queueDoc struct {
@@ -676,11 +677,15 @@ func jobSetStateIfRunning(ctx context.Context, client *firestore.Client, clk clo
 		}
 
 		if params.Err != nil {
-			newErrors := append(j.Errors, jobError{
+			stored := jobError{
 				At:      now,
 				Attempt: j.AttemptNum,
 				Message: *params.Err,
-			})
+			}
+			if params.Trace != nil {
+				stored.Trace = *params.Trace
+			}
+			newErrors := append(j.Errors, stored)
 			updates = append(updates, firestore.Update{Path: "errors", Value: newErrors})
 		}
 
@@ -1009,7 +1014,7 @@ func jobErrorsToRow(errs []jobError) []driver.AttemptError {
 	}
 	out := make([]driver.AttemptError, len(errs))
 	for i, e := range errs {
-		out[i] = driver.AttemptError{At: e.At, Attempt: e.Attempt, Error: e.Message}
+		out[i] = driver.AttemptError{At: e.At, Attempt: e.Attempt, Error: e.Message, Trace: e.Trace}
 	}
 	return out
 }

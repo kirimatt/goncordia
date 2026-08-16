@@ -178,11 +178,17 @@ func Run(t *testing.T, exec driver.Executor) {
 	if err != nil || current == nil || current.State != driver.JobStateRunning || current.AttemptNum != claimed.AttemptNum {
 		t.Fatalf("stale worker overwrote current claim: row=%+v err=%v", current, err)
 	}
+	completionErr, completionTrace := "conformance failure context", "conformance stack trace"
 	if err := exec.JobSetStateIfRunning(ctx, driver.JobSetStateParams{
 		ID: id, State: driver.JobStateCompleted,
+		Err: &completionErr, Trace: &completionTrace, Attempt: claimed.AttemptNum,
 		ExpectedWorkerID: claimed.WorkerID, ExpectedAttempt: claimed.AttemptNum,
 	}); err != nil {
 		t.Fatalf("complete: %v", err)
+	}
+	completed, err := exec.JobGetByID(ctx, id)
+	if err != nil || completed == nil || len(completed.Errors) != 1 || completed.Errors[0].Trace != completionTrace {
+		t.Fatalf("persist attempt trace: row=%+v err=%v", completed, err)
 	}
 	reinserted, err := exec.JobInsertMany(ctx, []driver.JobInsertParams{insert})
 	if err != nil || len(reinserted) != 1 || reinserted[0].UniqueSkip || reinserted[0].Job == nil {

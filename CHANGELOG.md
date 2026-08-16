@@ -23,6 +23,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `driver.QueuePage` response types.
 - A portable `Maintenance` service with retention pruning, partial-result bulk
   retry/cancel/delete, and paginated dead-letter inspection/replay.
+- Configurable symmetric retry jitter with an injectable deterministic random
+  source.
+- Enqueue/worker observer hooks and OpenTelemetry enqueue spans, enqueue
+  duration, scheduled-lag, heartbeat, and rescued-lease metrics.
 - Worker-returned `core.Discard`, `core.RetryAfter`, and `core.RetryAt`
   directives.
 - `UniqueOpts.Key` for caller-defined deduplication dimensions.
@@ -70,6 +74,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - SQL migrations are serialized across application instances with PostgreSQL/
   MySQL advisory locks and a SQLite immediate transaction. Concurrent DynamoDB
   migration calls now wait for tables another instance is creating.
+- Panic failures now retain their runtime stack in `AttemptError.Trace` across
+  every built-in backend. Queue-time metrics measure only time after a job is
+  eligible, excluding intentional scheduled delay.
 
 ### Testing
 - Driver conformance now covers stale-worker fencing, heartbeat protection, and
@@ -84,6 +91,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added deterministic maintenance tests driven entirely by an injected manual
   clock, including retention cutoffs, partial bulk failures, and dead-letter
   state validation.
+- Cross-driver conformance now verifies attempt stack-trace serialization, and
+  retry jitter tests use an injected random source.
 
 ### Upgrade notes
 - SQL users must run `Migrate` before starting workers. Migration 004 replaces

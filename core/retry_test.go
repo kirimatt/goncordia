@@ -52,6 +52,33 @@ func TestExponentialRetryDoesNotOverflow(t *testing.T) {
 	}
 }
 
+func TestExponentialRetryInjectedJitter(t *testing.T) {
+	clk := clock.NewMock(time.Date(2026, 8, 16, 0, 0, 0, 0, time.UTC))
+	policy := core.ExponentialRetry{
+		Base: time.Second, Max: time.Hour, Jitter: 0.25,
+		Random: func() float64 { return 0 },
+	}
+	if got := policy.NextRetryAt(3, nil, clk).Sub(clk.Now()); got != 3*time.Second {
+		t.Fatalf("low jitter delay=%s, want 3s", got)
+	}
+	policy.Random = func() float64 { return 1 }
+	if got := policy.NextRetryAt(3, nil, clk).Sub(clk.Now()); got != 5*time.Second {
+		t.Fatalf("high jitter delay=%s, want 5s", got)
+	}
+}
+
+func TestExponentialRetryJitterDoesNotOverflow(t *testing.T) {
+	clk := clock.NewMock(time.Unix(0, 0))
+	max := time.Duration(1<<63 - 1)
+	policy := core.ExponentialRetry{
+		Base: max/2 + 1, Max: max, Jitter: 1,
+		Random: func() float64 { return 1 },
+	}
+	if got := policy.NextRetryAt(2, nil, clk).Sub(clk.Now()); got != max {
+		t.Fatalf("jitter overflowed delay=%s, want %s", got, max)
+	}
+}
+
 func TestRetryDirectivesUnwrap(t *testing.T) {
 	cause := errors.New("temporary")
 	if directive, ok := core.AsRetry(core.RetryAfter(time.Minute, cause)); !ok || directive.After != time.Minute || !errors.Is(directive, cause) {
