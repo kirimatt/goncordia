@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	goncordia "github.com/kirimatt/goncordia"
 	"github.com/kirimatt/goncordia/clock"
@@ -91,7 +92,8 @@ type Option func(*Driver)
 // WithClock injects a custom clock (for testing).
 func WithClock(c clock.Clock) Option { return func(d *Driver) { d.clk = c } }
 
-// New creates a Driver from an existing *sql.DB.
+// New creates a Driver from an existing *sql.DB. The caller retains ownership
+// of db and must close it after the driver is no longer in use.
 // Call Migrate to create the schema before starting workers.
 func New(db *sql.DB, dialect Dialect, opts ...Option) *Driver {
 	d := &Driver{db: db, dialect: dialect, clk: clock.Real{}}
@@ -103,7 +105,75 @@ func New(db *sql.DB, dialect Dialect, opts ...Option) *Driver {
 
 // Migrate runs embedded SQL migrations for the configured dialect.
 func (d *Driver) Migrate(ctx context.Context) error {
-	if _, err := d.db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS goncordia_schema_migrations (
+	conn, err := d.db.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("acquire migration connection for %s: %w", d.dialect, err)
+	}
+	defer conn.Close()
+
+	if d.dialect == SQLite {
+		if _, err := conn.ExecContext(ctx, `PRAGMA busy_timeout = 30000`); err != nil {
+			return fmt.Errorf("configure sqlite migration lock: %w", err)
+		}
+		if _, err := conn.ExecContext(ctx, `BEGIN IMMEDIATE`); err != nil {
+			return fmt.Errorf("acquire sqlite migration lock: %w", err)
+		}
+		if err := d.migrateWith(ctx, conn, func(version string, statements []string) error {
+			for _, stmt := range statements {
+				if _, err := conn.ExecContext(ctx, stmt); err != nil {
+					return err
+				}
+			}
+			_, err := conn.ExecContext(ctx,
+				d.dialect.q(`INSERT INTO goncordia_schema_migrations (version) VALUES (?)`), version)
+			return err
+		}); err != nil {
+			rollbackCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_, _ = conn.ExecContext(rollbackCtx, `ROLLBACK`)
+			return err
+		}
+		if _, err := conn.ExecContext(ctx, `COMMIT`); err != nil {
+			return fmt.Errorf("commit sqlite migrations: %w", err)
+		}
+		return nil
+	}
+
+	unlock, err := acquireMigrationLock(ctx, conn, d.dialect)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	return d.migrateWith(ctx, conn, func(version string, statements []string) error {
+		tx, err := conn.BeginTx(ctx, nil)
+		if err != nil {
+			return fmt.Errorf("begin migration %s: %w", version, err)
+		}
+		for _, stmt := range statements {
+			if _, err := tx.ExecContext(ctx, stmt); err != nil {
+				_ = tx.Rollback()
+				return fmt.Errorf("apply migration %s: %w", version, err)
+			}
+		}
+		if _, err := tx.ExecContext(ctx,
+			d.dialect.q(`INSERT INTO goncordia_schema_migrations (version) VALUES (?)`), version); err != nil {
+			_ = tx.Rollback()
+			return fmt.Errorf("record migration %s: %w", version, err)
+		}
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("commit migration %s: %w", version, err)
+		}
+		return nil
+	})
+}
+
+type migrationQueryExecer interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}
+
+func (d *Driver) migrateWith(ctx context.Context, q migrationQueryExecer, apply func(string, []string) error) error {
+	if _, err := q.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS goncordia_schema_migrations (
 		version VARCHAR(255) PRIMARY KEY,
 		applied_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 	)`); err != nil {
@@ -119,7 +189,7 @@ func (d *Driver) Migrate(ctx context.Context) error {
 			continue
 		}
 		var applied int
-		if err := d.db.QueryRowContext(ctx,
+		if err := q.QueryRowContext(ctx,
 			d.dialect.q(`SELECT COUNT(*) FROM goncordia_schema_migrations WHERE version = ?`),
 			e.Name(),
 		).Scan(&applied); err != nil {
@@ -132,29 +202,40 @@ func (d *Driver) Migrate(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("read migration %s: %w", e.Name(), err)
 		}
-		tx, err := d.db.BeginTx(ctx, nil)
-		if err != nil {
-			return fmt.Errorf("begin migration %s: %w", e.Name(), err)
-		}
-		// Split on semicolons to run each statement individually.
-		for _, stmt := range splitStatements(string(sqlBytes)) {
-			if _, err := tx.ExecContext(ctx, stmt); err != nil {
-				_ = tx.Rollback()
-				return fmt.Errorf("apply migration %s: %w", e.Name(), err)
-			}
-		}
-		if _, err := tx.ExecContext(ctx,
-			d.dialect.q(`INSERT INTO goncordia_schema_migrations (version) VALUES (?)`),
-			e.Name(),
-		); err != nil {
-			_ = tx.Rollback()
-			return fmt.Errorf("record migration %s: %w", e.Name(), err)
-		}
-		if err := tx.Commit(); err != nil {
-			return fmt.Errorf("commit migration %s: %w", e.Name(), err)
+		if err := apply(e.Name(), splitStatements(string(sqlBytes))); err != nil {
+			return err
 		}
 	}
 	return nil
+}
+
+func acquireMigrationLock(ctx context.Context, conn *sql.Conn, dialect Dialect) (func(), error) {
+	switch dialect {
+	case Postgres:
+		if _, err := conn.ExecContext(ctx, `SELECT pg_advisory_lock(hashtext('goncordia_schema_migrations'))`); err != nil {
+			return nil, fmt.Errorf("acquire postgres migration lock: %w", err)
+		}
+		return func() {
+			releaseCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_, _ = conn.ExecContext(releaseCtx, `SELECT pg_advisory_unlock(hashtext('goncordia_schema_migrations'))`)
+		}, nil
+	case MySQL:
+		var acquired sql.NullInt64
+		if err := conn.QueryRowContext(ctx, `SELECT GET_LOCK('goncordia_schema_migrations', 60)`).Scan(&acquired); err != nil {
+			return nil, fmt.Errorf("acquire mysql migration lock: %w", err)
+		}
+		if !acquired.Valid || acquired.Int64 != 1 {
+			return nil, fmt.Errorf("acquire mysql migration lock: timed out")
+		}
+		return func() {
+			releaseCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_, _ = conn.ExecContext(releaseCtx, `SELECT RELEASE_LOCK('goncordia_schema_migrations')`)
+		}, nil
+	default:
+		return func() {}, nil
+	}
 }
 
 func (d *Driver) Name() string { return d.dialect.String() }
@@ -180,7 +261,7 @@ func (d *Driver) UnwrapTx(tx *sql.Tx) driver.ExecutorTx {
 // Listener returns nil — stdlib driver uses polling, not push notifications.
 func (d *Driver) Listener() driver.Listener { return nil }
 
-func (d *Driver) Close() error { return d.db.Close() }
+func (d *Driver) Close() error { return nil }
 
 // splitStatements splits a SQL file into individual statements on semicolons,
 // skipping empty/whitespace-only statements.

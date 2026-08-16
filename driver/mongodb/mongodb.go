@@ -34,6 +34,7 @@ const (
 	jobsCollection    = "goncordia_jobs"
 	queuesCollection  = "goncordia_queues"
 	leadersCollection = "goncordia_leaders"
+	cursorsCollection = "goncordia_schedule_cursors"
 )
 
 // Driver implements driver.Driver[mongo.SessionContext].
@@ -49,7 +50,8 @@ type Option func(*Driver)
 // WithClock injects a custom clock (useful for tests).
 func WithClock(c clock.Clock) Option { return func(d *Driver) { d.clk = c } }
 
-// New creates a Driver connected to the given *mongo.Client.
+// New creates a Driver connected to the given *mongo.Client. The caller retains
+// ownership of client and must disconnect it after the driver is no longer in use.
 // dbName is the database that will hold the goncordia collections.
 // Returns an error if the server is not a replica set member (transactions require replica set).
 func New(ctx context.Context, client *mongo.Client, dbName string, opts ...Option) (*Driver, error) {
@@ -87,6 +89,15 @@ func (d *Driver) Migrate(ctx context.Context) error {
 			},
 			Options: options.Index().
 				SetName("goncordia_jobs_unique_key").
+				SetUnique(true).
+				SetPartialFilterExpression(bson.M{
+					"unique_key": bson.M{"$exists": true},
+				}),
+		},
+		{
+			Keys: bson.D{{Key: "unique_key", Value: 1}},
+			Options: options.Index().
+				SetName("goncordia_jobs_unique_key_v2").
 				SetUnique(true).
 				SetPartialFilterExpression(bson.M{
 					"unique_key": bson.M{"$exists": true},
@@ -140,7 +151,7 @@ func (d *Driver) UnwrapTx(sc mongo.SessionContext) driver.ExecutorTx {
 }
 
 func (d *Driver) Listener() driver.Listener { return &listener{db: d.db} }
-func (d *Driver) Close() error              { return d.client.Disconnect(context.Background()) }
+func (d *Driver) Close() error              { return nil }
 
 // Client is a type alias so callers never write goncordia.Client[mongo.SessionContext].
 type Client = goncordia.Client[mongo.SessionContext]

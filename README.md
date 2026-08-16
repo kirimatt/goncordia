@@ -55,7 +55,7 @@ tx.Commit(ctx)  // job and order appear atomically
 | ClickHouse 23+ | `driver/clickhouse` | `NoTx` | ❌ | ReplacingMergeTree; at-least-once |
 | Amazon DynamoDB | `driver/dynamodb` | `NoTx` | ❌ | conditional writes; at-least-once |
 | Cloud Firestore | `driver/firestore` | `*firestore.Transaction` | ✅ | RunTransaction; composite index required |
-| In-memory | `driver/memory` | `memory.NoTx` | ✅ | no persistence; for tests |
+| In-memory | `driver/memory` | `memory.NoTx` | ❌ | synchronized operations, no rollback; for tests |
 
 ---
 
@@ -88,7 +88,7 @@ tx.Commit(ctx)  // job and order appear atomically
 Requires Go 1.26.6 or newer.
 
 ```bash
-go get github.com/kirimatt/goncordia@v0.15.0
+go get github.com/kirimatt/goncordia@v0.16.0
 ```
 
 Pick a driver:
@@ -140,6 +140,7 @@ import (
 )
 
 pool, _ := pgxpool.New(ctx, os.Getenv("DATABASE_URL"))
+defer pool.Close()
 d := pgxdriver.New(pool)
 d.Migrate(ctx)
 
@@ -185,6 +186,7 @@ import (
 )
 
 client, _ := mongo.Connect(ctx, options.Client().ApplyURI(os.Getenv("MONGO_URI")))
+defer client.Disconnect(ctx)
 d, err := mongodriver.New(ctx, client, "myapp")  // fails if not a replica set
 d.Migrate(ctx)
 
@@ -247,6 +249,7 @@ import (
 )
 
 rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379"})
+defer rdb.Close()
 d := redisdriver.New(rdb)
 d.Migrate(ctx)  // pings Redis to verify connectivity
 
@@ -292,6 +295,7 @@ conn, _ := clickhouse.Open(&clickhouse.Options{
     Addr: []string{"localhost:9000"},
     Auth: clickhouse.Auth{Database: "myapp"},
 })
+defer conn.Close()
 
 d := clickhousedriver.New(conn)
 d.Migrate(ctx)  // creates ReplacingMergeTree tables (idempotent)
@@ -335,6 +339,7 @@ import (
 )
 
 fsClient, _ := firestore.NewClient(ctx, "my-gcp-project")
+defer fsClient.Close()
 d := firestoredriver.New(fsClient)
 // Migrate is a no-op; create composite index in Firebase console:
 //   collection: goncordia_jobs, fields: queue (ASC), state (ASC), run_at (ASC)
@@ -359,11 +364,23 @@ import (
 )
 
 db, _ := sql.Open("sqlite", "./jobs.db")
+defer db.Close()
 db.SetMaxOpenConns(1)  // SQLite: single writer
 
 d := stdlibdriver.New(db, stdlibdriver.SQLite)
 d.Migrate(ctx)
 ```
+
+All driver constructors are non-owning: a client, pool, connection, database,
+or session passed to `New` remains the caller's responsibility. `Driver.Close`
+only releases resources created internally by a driver and never closes the
+supplied resource.
+
+`Migrate` may be called concurrently during a rolling deployment. PostgreSQL
+and MySQL use database advisory locks, while SQLite holds an immediate write
+transaction across the complete migration set. Cassandra, ClickHouse, MongoDB,
+DynamoDB, Redis, and Firestore use idempotent server-side schema operations;
+DynamoDB also waits for tables created by another instance to become active.
 
 ---
 
@@ -393,12 +410,31 @@ client.Enqueue(ctx, SendEmailArgs{To: "user@example.com", Subject: "Welcome"}, &
     UniqueOpts: &core.UniqueOpts{            // deduplicate
         ByArgs:  true,
         ByQueue: true,
+        Key:     "welcome-email",           // optional caller-defined dimension
+        ByPeriod: 24 * time.Hour,            // fixed UTC-aligned windows
+        Forever:  false,                     // true keeps the key after finalization
     },
 
     MaxRetry: &maxRetry,
     Tags:     []string{"user:42"},
 })
 ```
+
+Unique jobs are global by default: the same canonical key is rejected even if
+the second enqueue targets another queue. Set `ByQueue` to include the queue in
+the key and allow one active job per queue. `ByArgs`, `Key`, and `ByPeriod` add
+the serialized arguments, a caller-defined value, and the start of a fixed UTC
+window respectively. The stored key is a bounded SHA-256 digest, so large job
+arguments or caller keys do not expand database indexes. Completed, discarded,
+and cancelled jobs release their key.
+
+Set `Forever` for durable idempotency keys that must survive completion,
+discard, or cancellation. An explicit job deletion still releases the key.
+
+ClickHouse uniqueness is best-effort because concurrent inserts cannot be
+serialized by `ReplacingMergeTree`. Cassandra uses an LWT reservation followed
+by job writes; failed writes are compensated, but a process crash between them
+can leave an orphaned reservation that must be removed operationally.
 
 ---
 
@@ -408,12 +444,14 @@ client.Enqueue(ctx, SendEmailArgs{To: "user@example.com", Subject: "Welcome"}, &
 goncordia.WorkerConfig{
     Queues:          []string{"default", "critical"},
     Concurrency:     20,
-    WorkerID:        "mailer-eu-1",                     // generated when empty
+    MaxPending:      80,                             // claimed jobs waiting/running; defaults to 4x concurrency
+    WorkerID:        "mailer-eu-1",                  // generated when empty
     PollInterval:    500 * time.Millisecond,         // fallback when no push notifications
     RetryPolicy:     core.ExponentialRetry{Base: time.Second, Max: time.Hour},
     ShutdownTimeout: 30 * time.Second,
     StuckJobTimeout: time.Hour,                       // negative disables rescue
     RescueInterval: time.Minute,
+    HeartbeatInterval: 20 * time.Minute,              // defaults to one third of StuckJobTimeout
     Clock:           clock.NewManual(time.Now()),     // omit in production; inject for tests
     ErrorHandler:    func(err error) { logger.Error("worker", "err", err) },
 }
@@ -423,6 +461,14 @@ core.RegisterWorker(registry, worker, core.WorkerOpts{
     MaxRetry: 3, Timeout: 30 * time.Second, Concurrency: 4,
 })
 ```
+
+Running claims are fenced by worker ID and attempt number. Active and waiting
+claims heartbeat while they are owned, so rescue does not duplicate a healthy
+long-running job. Cancelling the pool context yields an interrupted claim back
+to the queue without consuming an attempt.
+
+Across all built-in drivers, due jobs are selected by `priority DESC`, then
+`run_at ASC`, `created_at ASC`, and `id ASC`.
 
 ---
 
@@ -449,8 +495,19 @@ processes require application-level partitioning if they must share a pipeline.
 ```go
 import "github.com/kirimatt/goncordia/admin"
 
-// Protect this route with your application's authentication/authorization.
-http.Handle("/jobs/", http.StripPrefix("/jobs", admin.New(d)))
+handler := admin.New(d,
+    admin.WithReadOnly(false),
+    admin.WithAuthorizer(func(r *http.Request, operation admin.Operation) error {
+        if !validSession(r) {
+            return admin.ErrUnauthenticated
+        }
+        if operation == admin.OperationMutate && !canOperateJobs(r) {
+            return errors.New("forbidden")
+        }
+        return nil
+    }),
+)
+http.Handle("/jobs/", http.StripPrefix("/jobs", handler))
 ```
 
 The handler exposes the embedded dashboard, `/healthz`, `/readyz`, `/metrics`,
@@ -458,6 +515,75 @@ and JSON routes under `/api`. It supports job filtering, cancel/delete/retry/
 reschedule, queue pause/resume, and per-state queue counts. On Redis, Cassandra,
 DynamoDB, and Firestore, administrative list/metric operations scan records and
 are intended for moderate operational use rather than high-frequency scraping.
+
+The default JSON representation removes job arguments, unique keys, and panic
+stack traces. Use `admin.WithJobRedactor` only when an application has a safe,
+explicit policy for exposing or replacing those fields. `admin.WithReadOnly(true)`
+disables every mutation while retaining inspection and metrics. The authorization
+hook receives separate dashboard, read, mutate, metrics, and health operations;
+return `admin.ErrUnauthenticated` for HTTP 401 and any other error for HTTP 403.
+
+`/healthz` is a process liveness probe and does not touch storage. `/readyz`
+checks that the backing driver can answer a query and returns HTTP 503 when it
+cannot. Metrics are buffered until all queue statistics have been collected, so
+a collection failure returns 503 without a misleading partial Prometheus body.
+The embedded dashboard serves script and style assets separately under a strict
+Content Security Policy.
+
+Every mutation requires `X-Goncordia-Confirm` to exactly match the action name
+(`pause`, `resume`, `cancel`, `delete`, `retry`, or `reschedule`). This is an
+additional guard against accidental requests, not a substitute for authorization:
+
+```text
+POST /jobs/api/jobs/01J.../delete
+X-Goncordia-Confirm: delete
+```
+
+`GET /api/jobs` and `GET /api/queues` return a page envelope:
+
+```json
+{"items": [], "next_cursor": "opaque-value", "has_more": true}
+```
+
+Pass `next_cursor` back as the `cursor` query parameter. Cursors are opaque and
+versioned; callers must not parse or construct them. Job cursors preserve the
+stable `created_at DESC, id DESC` order, including ties, and queue cursors use
+queue-name order. Invalid cursors return HTTP 400. Driver errors map consistently:
+not found to 404, conflict or stale claim to 409, and unsupported operations to
+501. Applications can classify the same errors with `errors.Is` and
+`driver.ErrNotFound`, `driver.ErrConflict`, `driver.ErrStaleClaim`,
+`driver.ErrUnsupported`, or `driver.ErrInvalidCursor`.
+
+---
+
+## Retention, bulk actions, and dead letters
+
+The portable maintenance service works with every built-in driver and uses the
+same injected-clock model as clients, workers, and schedulers:
+
+```go
+maintenance := goncordia.NewMaintenance(d, goncordia.MaintenanceConfig{
+    Clock: appClock,
+})
+
+result, err := maintenance.Prune(ctx, goncordia.RetentionPolicy{
+    Completed: 30 * 24 * time.Hour,
+    Discarded: 90 * 24 * time.Hour,
+    Cancelled: 7 * 24 * time.Hour,
+})
+
+cancelled, err := maintenance.BulkCancel(ctx, jobIDs)
+retried, err := maintenance.BulkRetry(ctx, jobIDs, time.Time{}) // now via Clock
+deleted, err := maintenance.BulkDelete(ctx, jobIDs)
+
+page, err := maintenance.DeadLetterList(ctx, driver.JobListParams{Limit: 100})
+replayed, err := maintenance.DeadLetterReplay(ctx, jobIDs, time.Time{})
+```
+
+Bulk operations preserve partial progress in `BulkResult`; their returned error
+joins per-job failures, so `errors.Is` still recognizes typed driver errors.
+Dead-letter replay first verifies that each job is still discarded. Retention
+durations of zero disable that state, and negative durations are rejected.
 
 ---
 
@@ -470,8 +596,11 @@ import "github.com/kirimatt/goncordia/core"
 
 cs := goncordia.NewCronScheduler(d, []goncordia.PeriodicJob{
     {
+        ID:       "hourly-cleanup", // stable ID enables durable cursor + deduplication
+        StartAt:  time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
         Schedule: core.Every(time.Hour),
         Args:     CleanupArgs{},
+        CatchUp:  goncordia.CronCatchUpAll,
     },
     {
         Schedule: core.Every(24 * time.Hour),
@@ -482,6 +611,7 @@ cs := goncordia.NewCronScheduler(d, []goncordia.PeriodicJob{
     TickInterval: time.Second, // how often to check for due jobs
     LeaderName:   "hourly-maintenance",
     LeaderTTL:    30 * time.Second,
+    MaxCatchUp:   100,
 })
 
 go cs.Start(ctx)   // blocks; cancel ctx to stop
@@ -503,25 +633,59 @@ sched := core.ScheduleFunc(func(last time.Time) time.Time {
 })
 ```
 
+### Cron expressions and time zones
+
+```go
+newYork, _ := time.LoadLocation("America/New_York")
+weekdayMorning, err := core.Cron("30 9 * * 1-5", newYork)
+
+cs := goncordia.NewCronScheduler(d, []goncordia.PeriodicJob{
+    {Schedule: weekdayMorning, Args: ReportArgs{}},
+}, goncordia.CronConfig{})
+```
+
+`core.Cron` accepts standard five-field expressions and evaluates calendar
+boundaries in the supplied location, including daylight-saving transitions.
+Pass `nil` to use UTC. Invalid expressions return an error during setup.
+
 ### Notes
 
 - The scheduler fires each job on the **first tick** after `Start`, then respects the interval.
+- A job with an empty `ID` uses that legacy process-local behavior. For durable
+  scheduling, provide a stable `ID` and `StartAt`; the first occurrence is
+  `Schedule.Next(StartAt)`.
+- Durable cursors are persisted by the driver and advanced with compare-and-swap
+  after enqueue. Each occurrence uses a permanent uniqueness key, so leader
+  failover or a crash between enqueue and cursor advancement cannot duplicate it.
+- `CronCatchUpAll` enqueues missed occurrences up to `MaxCatchUp` per tick,
+  `CronCatchUpLatest` keeps only the latest, and `CronSkipMissed` drops old
+  occurrences while still enqueueing an occurrence reached on the current tick.
 - `CronScheduler` only *enqueues* — workers run via `WorkerPool`.
 - Multiple scheduler instances are safe: only the current lease holder enqueues jobs.
+- Scheduler shutdown releases leadership only when that scheduler instance still
+  owns the lease; a stale instance cannot resign a newer leader.
 
 ---
 
 ## Retry policies
 
 ```go
-// Exponential backoff (default): 1s, 2s, 4s, … capped at Max
-core.ExponentialRetry{Base: time.Second, Max: 24 * time.Hour}
+// Exponential backoff: 1s, 2s, 4s, … capped at Max, with ±20% jitter
+core.ExponentialRetry{Base: time.Second, Max: 24 * time.Hour, Jitter: 0.2}
+
+// Tests can inject deterministic randomization:
+core.ExponentialRetry{Base: time.Second, Jitter: 0.2, Random: func() float64 { return 0.5 }}
 
 // Fixed delay
 core.FixedRetry{Delay: 30 * time.Second}
 
 // No retry — discard immediately
 core.NoRetry{}
+
+// Per-attempt directives returned by a worker
+return core.Discard(err)                   // permanent failure
+return core.RetryAfter(30*time.Second, err)
+return core.RetryAt(nextWindow, err)
 
 // Custom
 import "github.com/kirimatt/goncordia/clock"
@@ -573,7 +737,7 @@ func (d *MyDriver) Listener() driver.Listener          { return nil } // nil = p
 func (d *MyDriver) Close() error                       { return nil }
 ```
 
-See [`driver/driver.go`](driver/driver.go) for the full core interface and optional rescue/admin capabilities, and [`driver/memory/memory.go`](driver/memory/memory.go) for a reference implementation. Driver authors can reuse `driver/drivertest.Run` for the base contract and `driver/drivertest.RunScheduled` with an injected `clock.Manual` for scheduled-job conformance.
+See [`driver/driver.go`](driver/driver.go) for the full core interface and optional rescue/admin capabilities, and [`driver/memory/memory.go`](driver/memory/memory.go) for a reference implementation. Driver authors can reuse `driver/drivertest.Run` for the base contract and `driver/drivertest.RunScheduled` with an injected `clock.Manual` for scheduled-job conformance. The base contract includes opaque job/queue pagination, deterministic ordering, invalid-cursor classification, fencing, and typed stale-claim behavior.
 
 ---
 
@@ -732,9 +896,20 @@ go get github.com/kirimatt/goncordia/otel
 ```go
 import otelgoncordia "github.com/kirimatt/goncordia/otel"
 
+instrumentation := otelgoncordia.NewInstrumentation(
+    otelgoncordia.WithTracerProvider(tp),
+    otelgoncordia.WithMeterProvider(mp),
+    otelgoncordia.WithClock(clk),
+)
+
+client := pgxdriver.NewClient(d, goncordia.ClientConfig{
+    Observer: instrumentation,
+})
+
 wp := pgxdriver.NewWorkerPool(d, registry, goncordia.WorkerConfig{
     Queues:      []string{"default"},
     Concurrency: 10,
+    Observer:    instrumentation,
     Middleware: []goncordia.JobMiddleware{
         otelgoncordia.NewMiddleware(
             // optional — defaults to otel.GetTracerProvider() / otel.GetMeterProvider()
@@ -746,14 +921,22 @@ wp := pgxdriver.NewWorkerPool(d, registry, goncordia.WorkerConfig{
 })
 ```
 
-Each job execution produces:
+The instrumentation produces:
 
+- **Span** `goncordia.enqueue` with driver, batch, queue/kind, and outcome attributes
 - **Span** `goncordia.process` with job, worker, and pipeline attributes
+- **Histogram** `goncordia.enqueue.duration` (seconds) — storage latency by driver/status
 - **Histogram** `goncordia.job.duration` (seconds) — labelled by kind, queue, status
-- **Histogram** `goncordia.job.queue_time` (seconds) — time from enqueue to handler start
+- **Histogram** `goncordia.job.queue_time` (seconds) — time from eligibility
+  (`max(created_at, run_at)`) to handler start; scheduled waiting is excluded
+- **Histogram** `goncordia.job.schedule_lag` (seconds) — scheduled `run_at` to claim
+- **Counter** `goncordia.job.heartbeat.count` — heartbeat outcomes (`ok`/`stale`/`error`)
+- **Counter** `goncordia.job.lease_rescued` — expired claims returned to queues
 - **Counter** `goncordia.job.count` — labelled by kind, queue, status (`ok` / `error`)
 
-Panics are recovered, converted to errors, and recorded on the span before re-triggering the retry policy — the worker pool always stays alive.
+Panics are recovered, converted to errors, recorded on the span, and persisted
+with their stack trace in `driver.AttemptError.Trace` before retry/discard. The
+worker pool always stays alive.
 
 You can also add your own middleware for logging or custom metrics:
 

@@ -2,12 +2,14 @@ package goncordia_test
 
 import (
 	"context"
+	"errors"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/kirimatt/goncordia"
 	"github.com/kirimatt/goncordia/core"
+	"github.com/kirimatt/goncordia/driver"
 	memdriver "github.com/kirimatt/goncordia/driver/memory"
 )
 
@@ -83,19 +85,18 @@ func TestEnqueueAndProcess(t *testing.T) {
 	}
 }
 
-func TestEnqueueTx(t *testing.T) {
+func TestMemoryEnqueueTxUnsupported(t *testing.T) {
 	d := memdriver.New()
 	client := goncordia.NewClient(d, goncordia.ClientConfig{})
 	ctx := context.Background()
 
-	// EnqueueTx with in-memory driver (no-op tx)
 	tx := memdriver.NoTx{}
-	result, err := client.EnqueueTx(ctx, tx, EmailArgs{To: "a@b.com", Subject: "Tx test"}, nil)
-	if err != nil {
-		t.Fatalf("EnqueueTx failed: %v", err)
+	_, err := client.EnqueueTx(ctx, tx, EmailArgs{To: "a@b.com", Subject: "Tx test"}, nil)
+	if !errors.Is(err, driver.ErrUnsupported) {
+		t.Fatalf("EnqueueTx error=%v, want ErrUnsupported", err)
 	}
-	if result.Job == nil {
-		t.Fatal("expected non-nil job result")
+	if _, err := d.Executor().Begin(ctx); !errors.Is(err, driver.ErrUnsupported) {
+		t.Fatalf("Begin error=%v, want ErrUnsupported", err)
 	}
 }
 

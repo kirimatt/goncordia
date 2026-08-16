@@ -1,6 +1,11 @@
 package core
 
-import "time"
+import (
+	"fmt"
+	"time"
+
+	cronlib "github.com/robfig/cron/v3"
+)
 
 // Schedule determines when a periodic job should next run.
 type Schedule interface {
@@ -26,4 +31,31 @@ func (s everySchedule) Next(last time.Time) time.Time {
 		return time.Time{} // zero → fire immediately
 	}
 	return last.Add(s.d)
+}
+
+type cronSchedule struct {
+	schedule cronlib.Schedule
+	location *time.Location
+}
+
+// Cron parses a standard five-field cron expression (minute, hour,
+// day-of-month, month, day-of-week). location controls calendar evaluation and
+// daylight-saving transitions; nil means UTC. Like Every, a Cron schedule fires
+// immediately on its first scheduler tick, then follows the expression.
+func Cron(expression string, location *time.Location) (Schedule, error) {
+	parsed, err := cronlib.ParseStandard(expression)
+	if err != nil {
+		return nil, fmt.Errorf("parse cron expression %q: %w", expression, err)
+	}
+	if location == nil {
+		location = time.UTC
+	}
+	return cronSchedule{schedule: parsed, location: location}, nil
+}
+
+func (s cronSchedule) Next(last time.Time) time.Time {
+	if last.IsZero() {
+		return time.Time{}
+	}
+	return s.schedule.Next(last.In(s.location))
 }

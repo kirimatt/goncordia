@@ -47,7 +47,8 @@ type Option func(*Driver)
 // WithClock injects a custom clock (useful for tests).
 func WithClock(c clock.Clock) Option { return func(d *Driver) { d.clk = c } }
 
-// New creates a Driver wrapping the given *redis.Client.
+// New creates a Driver wrapping the given *redis.Client. The caller retains
+// ownership of rdb and must close it after the driver is no longer in use.
 // Call Migrate to verify the connection before starting workers.
 func New(rdb *redis.Client, opts ...Option) *Driver {
 	d := &Driver{rdb: rdb, clk: clock.Real{}}
@@ -88,7 +89,7 @@ func (d *Driver) Listener() driver.Listener {
 	return &listener{rdb: d.rdb}
 }
 
-func (d *Driver) Close() error { return d.rdb.Close() }
+func (d *Driver) Close() error { return nil }
 
 // Client is a type alias so callers never write goncordia.Client[NoTx].
 type Client = goncordia.Client[NoTx]

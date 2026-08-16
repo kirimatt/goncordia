@@ -19,19 +19,25 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           ref: ${{ inputs.ref }}
           fetch-depth: 0
+
+      - name: Validate release metadata
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: ./scripts/check-release.sh "$RELEASE_TAG"
+
+      - name: Require a commit from main
+        run: |
+          git fetch origin main
+          git merge-base --is-ancestor HEAD origin/main
 
       - name: Create and push tag
         env:
           RELEASE_TAG: ${{ inputs.tag }}
         run: |
-          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]]; then
-            echo "Invalid semantic-version tag: $RELEASE_TAG" >&2
-            exit 1
-          fi
           if git rev-parse --verify --quiet "refs/tags/$RELEASE_TAG"; then
             echo "Tag already exists: $RELEASE_TAG" >&2
             exit 1

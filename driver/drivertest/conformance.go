@@ -3,6 +3,7 @@ package drivertest
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync/atomic"
 	"testing"
@@ -29,10 +30,64 @@ func Run(t *testing.T, exec driver.Executor) {
 	if err := exec.QueueResume(ctx, queue); err != nil {
 		t.Fatalf("resume queue: %v", err)
 	}
+	leaderName := "leader-" + queue
+	if elected, err := exec.LeaderAttemptElect(ctx, driver.LeaderElectParams{
+		Name: leaderName, WorkerID: "owner-a", TTL: time.Hour,
+	}); err != nil || !elected {
+		t.Fatalf("elect owner-a: elected=%v err=%v", elected, err)
+	}
+	if err := exec.LeaderResign(ctx, driver.LeaderResignParams{Name: leaderName, WorkerID: "owner-b"}); err != nil {
+		t.Fatalf("non-owner resign: %v", err)
+	}
+	if elected, err := exec.LeaderAttemptElect(ctx, driver.LeaderElectParams{
+		Name: leaderName, WorkerID: "owner-b", TTL: time.Hour,
+	}); err != nil || elected {
+		t.Fatalf("non-owner resignation released lease: elected=%v err=%v", elected, err)
+	}
+	if err := exec.LeaderResign(ctx, driver.LeaderResignParams{Name: leaderName, WorkerID: "owner-a"}); err != nil {
+		t.Fatalf("owner resign: %v", err)
+	}
+	if elected, err := exec.LeaderAttemptElect(ctx, driver.LeaderElectParams{
+		Name: leaderName, WorkerID: "owner-b", TTL: time.Hour,
+	}); err != nil || !elected {
+		t.Fatalf("elect after owner resign: elected=%v err=%v", elected, err)
+	}
+	t.Cleanup(func() {
+		_ = exec.LeaderResign(context.Background(), driver.LeaderResignParams{Name: leaderName, WorkerID: "owner-b"})
+	})
+	cursorID := "cursor-" + queue
+	initialCursor := now.Truncate(time.Second)
+	cursor, err := exec.ScheduleCursorGetOrCreate(ctx, driver.ScheduleCursorCreateParams{ID: cursorID, InitialAt: initialCursor})
+	if err != nil || !cursor.Created || !cursor.At.Equal(initialCursor) {
+		t.Fatalf("create schedule cursor: cursor=%+v err=%v", cursor, err)
+	}
+	cursorAgain, err := exec.ScheduleCursorGetOrCreate(ctx, driver.ScheduleCursorCreateParams{
+		ID: cursorID, InitialAt: initialCursor.Add(-time.Hour),
+	})
+	if err != nil || cursorAgain.Created || !cursorAgain.At.Equal(initialCursor) {
+		t.Fatalf("reload schedule cursor: cursor=%+v err=%v", cursorAgain, err)
+	}
+	advanced, err := exec.ScheduleCursorAdvance(ctx, driver.ScheduleCursorAdvanceParams{
+		ID: cursorID, Expected: initialCursor.Add(-time.Hour), Next: initialCursor.Add(time.Hour),
+	})
+	if err != nil || advanced {
+		t.Fatalf("stale schedule cursor advance: advanced=%v err=%v", advanced, err)
+	}
+	nextCursor := initialCursor.Add(time.Hour)
+	advanced, err = exec.ScheduleCursorAdvance(ctx, driver.ScheduleCursorAdvanceParams{
+		ID: cursorID, Expected: initialCursor, Next: nextCursor,
+	})
+	if err != nil || !advanced {
+		t.Fatalf("advance schedule cursor: advanced=%v err=%v", advanced, err)
+	}
+	cursorAgain, err = exec.ScheduleCursorGetOrCreate(ctx, driver.ScheduleCursorCreateParams{ID: cursorID, InitialAt: initialCursor})
+	if err != nil || !cursorAgain.At.Equal(nextCursor) {
+		t.Fatalf("read advanced schedule cursor: cursor=%+v err=%v", cursorAgain, err)
+	}
 
 	insert := driver.JobInsertParams{
 		Queue: queue, Kind: "conformance", Args: []byte(`{"value":1}`),
-		RunAt: now, UniqueKey: "unique", Timeout: time.Second,
+		RunAt: now, UniqueKey: "unique-" + queue, Timeout: time.Second,
 		Tags: []string{"contract"}, PipelineID: "entity-1",
 	}
 	results, err := exec.JobInsertMany(ctx, []driver.JobInsertParams{insert})
@@ -45,6 +100,12 @@ func Run(t *testing.T, exec driver.Executor) {
 	duplicates, err := exec.JobInsertMany(ctx, []driver.JobInsertParams{insert})
 	if err != nil || len(duplicates) != 1 || !duplicates[0].UniqueSkip {
 		t.Fatalf("unique insert: results=%+v err=%v", duplicates, err)
+	}
+	crossQueueDuplicate := insert
+	crossQueueDuplicate.Queue = queue + "-other"
+	duplicates, err = exec.JobInsertMany(ctx, []driver.JobInsertParams{crossQueueDuplicate})
+	if err != nil || len(duplicates) != 1 || !duplicates[0].UniqueSkip {
+		t.Fatalf("global unique insert: results=%+v err=%v", duplicates, err)
 	}
 
 	row, err := exec.JobGetByID(ctx, id)
@@ -69,6 +130,7 @@ func Run(t *testing.T, exec driver.Executor) {
 	if claimed.WorkerID != "conformance-worker" || claimed.AttemptNum != 1 {
 		t.Fatalf("claim metadata: %+v", claimed)
 	}
+	firstClaim := claimed
 	rescuer, ok := exec.(driver.StuckJobRescuer)
 	if !ok {
 		t.Fatal("executor does not implement driver.StuckJobRescuer")
@@ -89,14 +151,145 @@ func Run(t *testing.T, exec driver.Executor) {
 	if claimed.AttemptNum < 2 {
 		t.Fatalf("rescued job did not retain attempt count: %+v", claimed)
 	}
-	if err := exec.JobSetStateIfRunning(ctx, driver.JobSetStateParams{ID: id, State: driver.JobStateCompleted}); err != nil {
+	heartbeater, ok := exec.(driver.JobHeartbeater)
+	if !ok {
+		t.Fatal("executor does not implement driver.JobHeartbeater")
+	}
+	heartbeatAt := claimed.AttemptedAt.Add(time.Hour)
+	renewed, err := heartbeater.JobHeartbeat(ctx, driver.JobHeartbeatParams{
+		ID: id, WorkerID: claimed.WorkerID, Attempt: claimed.AttemptNum, At: heartbeatAt,
+	})
+	if err != nil || !renewed {
+		t.Fatalf("heartbeat: renewed=%v err=%v", renewed, err)
+	}
+	rescued, err := rescuer.JobRescueStuck(ctx, driver.JobRescueParams{
+		Queue: queue, Before: heartbeatAt.Add(-time.Second),
+	})
+	if err != nil || rescued != 0 {
+		t.Fatalf("heartbeat did not protect running job: rescued=%d err=%v", rescued, err)
+	}
+	if err := exec.JobSetStateIfRunning(ctx, driver.JobSetStateParams{
+		ID: id, State: driver.JobStateCompleted,
+		ExpectedWorkerID: firstClaim.WorkerID, ExpectedAttempt: firstClaim.AttemptNum,
+	}); !errors.Is(err, driver.ErrStaleClaim) {
+		t.Fatalf("stale completion error=%v, want ErrStaleClaim", err)
+	}
+	current, err := exec.JobGetByID(ctx, id)
+	if err != nil || current == nil || current.State != driver.JobStateRunning || current.AttemptNum != claimed.AttemptNum {
+		t.Fatalf("stale worker overwrote current claim: row=%+v err=%v", current, err)
+	}
+	completionErr, completionTrace := "conformance failure context", "conformance stack trace"
+	if err := exec.JobSetStateIfRunning(ctx, driver.JobSetStateParams{
+		ID: id, State: driver.JobStateCompleted,
+		Err: &completionErr, Trace: &completionTrace, Attempt: claimed.AttemptNum,
+		ExpectedWorkerID: claimed.WorkerID, ExpectedAttempt: claimed.AttemptNum,
+	}); err != nil {
 		t.Fatalf("complete: %v", err)
+	}
+	completed, err := exec.JobGetByID(ctx, id)
+	if err != nil || completed == nil || len(completed.Errors) != 1 || completed.Errors[0].Trace != completionTrace {
+		t.Fatalf("persist attempt trace: row=%+v err=%v", completed, err)
 	}
 	reinserted, err := exec.JobInsertMany(ctx, []driver.JobInsertParams{insert})
 	if err != nil || len(reinserted) != 1 || reinserted[0].UniqueSkip || reinserted[0].Job == nil {
 		t.Fatalf("terminal job retained unique slot: results=%+v err=%v", reinserted, err)
 	}
 	t.Cleanup(func() { _ = exec.JobDelete(context.Background(), reinserted[0].Job.ID) })
+
+	permanent := driver.JobInsertParams{
+		Queue: queue, Kind: "permanent-unique", Args: []byte(`{"value":2}`),
+		RunAt: now, UniqueKey: "uf2_" + queue,
+	}
+	permanentResults, err := exec.JobInsertMany(ctx, []driver.JobInsertParams{permanent})
+	if err != nil || len(permanentResults) != 1 || permanentResults[0].Job == nil || permanentResults[0].UniqueSkip {
+		t.Fatalf("insert permanent unique job: results=%+v err=%v", permanentResults, err)
+	}
+	permanentID := permanentResults[0].Job.ID
+	if err := exec.JobCancel(ctx, permanentID); err != nil {
+		t.Fatalf("cancel permanent unique job: %v", err)
+	}
+	permanentDuplicate, err := exec.JobInsertMany(ctx, []driver.JobInsertParams{permanent})
+	if err != nil || len(permanentDuplicate) != 1 || !permanentDuplicate[0].UniqueSkip {
+		t.Fatalf("terminal permanent key was released: results=%+v err=%v", permanentDuplicate, err)
+	}
+	if err := exec.JobDelete(ctx, permanentID); err != nil {
+		t.Fatalf("delete permanent unique job: %v", err)
+	}
+	permanentAfterDelete, err := exec.JobInsertMany(ctx, []driver.JobInsertParams{permanent})
+	if err != nil || len(permanentAfterDelete) != 1 || permanentAfterDelete[0].UniqueSkip || permanentAfterDelete[0].Job == nil {
+		t.Fatalf("delete did not release permanent key: results=%+v err=%v", permanentAfterDelete, err)
+	}
+	t.Cleanup(func() { _ = exec.JobDelete(context.Background(), permanentAfterDelete[0].Job.ID) })
+
+	// A backend must choose priority globally across all due candidates, not
+	// merely sort a small storage-ordered subset after fetching it.
+	var ordered []driver.JobInsertParams
+	for i := range 8 {
+		ordered = append(ordered, driver.JobInsertParams{
+			Queue: queue, Kind: "ordering-low", Args: []byte(fmt.Sprintf(`{"n":%d}`, i)),
+			Priority: 0, RunAt: now.Add(-2 * time.Hour),
+		})
+	}
+	ordered = append(ordered, driver.JobInsertParams{
+		Queue: queue, Kind: "ordering-high", Args: []byte(`{"n":99}`),
+		Priority: 100, RunAt: now.Add(-time.Hour),
+	})
+	orderedResults, err := exec.JobInsertMany(ctx, ordered)
+	if err != nil || len(orderedResults) != len(ordered) {
+		t.Fatalf("insert ordering jobs: results=%d err=%v", len(orderedResults), err)
+	}
+	for _, result := range orderedResults {
+		if result.Job != nil {
+			id := result.Job.ID
+			t.Cleanup(func() { _ = exec.JobDelete(context.Background(), id) })
+		}
+	}
+	if adminExec, ok := exec.(driver.AdminExecutor); ok {
+		firstPage, listErr := adminExec.JobList(ctx, driver.JobListParams{Kind: "ordering-low", Limit: 3})
+		if listErr != nil || len(firstPage) != 3 {
+			t.Fatalf("first job page: rows=%+v err=%v", firstPage, listErr)
+		}
+		secondPage, listErr := adminExec.JobList(ctx, driver.JobListParams{
+			Kind: "ordering-low", Limit: 3, Cursor: driver.EncodeJobCursor(firstPage[len(firstPage)-1]),
+		})
+		if listErr != nil || len(secondPage) != 3 {
+			t.Fatalf("second job page: rows=%+v err=%v", secondPage, listErr)
+		}
+		seen := make(map[string]struct{}, len(firstPage))
+		for _, row := range firstPage {
+			seen[row.ID] = struct{}{}
+		}
+		for _, row := range secondPage {
+			if _, duplicate := seen[row.ID]; duplicate {
+				t.Fatalf("job %q appeared on consecutive pages", row.ID)
+			}
+		}
+		if _, listErr := adminExec.JobList(ctx, driver.JobListParams{Cursor: "invalid", Limit: 1}); !errors.Is(listErr, driver.ErrInvalidCursor) {
+			t.Fatalf("invalid job cursor error=%v, want ErrInvalidCursor", listErr)
+		}
+	}
+	for _, suffix := range []string{"-pagination-a", "-pagination-b", "-pagination-c"} {
+		if err := exec.QueuePause(ctx, queue+suffix); err != nil {
+			t.Fatalf("create pagination queue: %v", err)
+		}
+	}
+	firstQueues, err := exec.QueueList(ctx, driver.QueueListParams{Limit: 2})
+	if err != nil || len(firstQueues) != 2 {
+		t.Fatalf("first queue page: rows=%+v err=%v", firstQueues, err)
+	}
+	secondQueues, err := exec.QueueList(ctx, driver.QueueListParams{
+		Limit: 2, Cursor: driver.EncodeQueueCursor(*firstQueues[len(firstQueues)-1]),
+	})
+	if err != nil || len(secondQueues) == 0 || secondQueues[0].Name <= firstQueues[len(firstQueues)-1].Name {
+		t.Fatalf("second queue page: rows=%+v err=%v", secondQueues, err)
+	}
+	if _, err := exec.QueueList(ctx, driver.QueueListParams{Cursor: "invalid", Limit: 1}); !errors.Is(err, driver.ErrInvalidCursor) {
+		t.Fatalf("invalid queue cursor error=%v, want ErrInvalidCursor", err)
+	}
+	orderedClaim := fetchEventually(t, ctx, exec, queue)
+	if orderedClaim.Kind != "ordering-high" || orderedClaim.Priority != 100 {
+		t.Fatalf("priority contract selected %+v", orderedClaim)
+	}
 }
 
 // RunScheduled verifies that an executor does not claim a future job and does

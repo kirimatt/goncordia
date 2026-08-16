@@ -47,6 +47,7 @@ type jobError struct {
 	At      time.Time `firestore:"at"`
 	Attempt int       `firestore:"attempt"`
 	Message string    `firestore:"message"`
+	Trace   string    `firestore:"trace,omitempty"`
 }
 
 type queueDoc struct {
@@ -72,7 +73,7 @@ type executor struct {
 func (e *executor) Begin(_ context.Context) (driver.ExecutorTx, error) {
 	// Firestore transactions must be started via RunTransaction.
 	// The engine never calls Begin; return an error to surface misuse early.
-	return nil, fmt.Errorf("firestoredriver: Begin is not supported; use client.RunTransaction + EnqueueTx")
+	return nil, fmt.Errorf("%w: use firestore.Client.RunTransaction with EnqueueTx", driver.ErrUnsupported)
 }
 
 func (e *executor) JobInsertMany(ctx context.Context, params []driver.JobInsertParams) ([]driver.JobInsertResult, error) {
@@ -92,6 +93,9 @@ func (e *executor) JobFetchBatch(ctx context.Context, params driver.FetchParams)
 }
 func (e *executor) JobRescueStuck(ctx context.Context, params driver.JobRescueParams) (int64, error) {
 	return jobRescueStuck(ctx, e.client, params)
+}
+func (e *executor) JobHeartbeat(ctx context.Context, params driver.JobHeartbeatParams) (bool, error) {
+	return jobHeartbeat(ctx, e.client, params)
 }
 func (e *executor) JobSetStateIfRunning(ctx context.Context, params driver.JobSetStateParams) error {
 	return jobSetStateIfRunning(ctx, e.client, e.clk, params)
@@ -120,8 +124,14 @@ func (e *executor) QueueList(ctx context.Context, params driver.QueueListParams)
 func (e *executor) LeaderAttemptElect(ctx context.Context, params driver.LeaderElectParams) (bool, error) {
 	return leaderAttemptElect(ctx, e.client, e.clk, params)
 }
-func (e *executor) LeaderResign(ctx context.Context, name string) error {
-	return leaderResign(ctx, e.client, name)
+func (e *executor) LeaderResign(ctx context.Context, params driver.LeaderResignParams) error {
+	return leaderResign(ctx, e.client, params)
+}
+func (e *executor) ScheduleCursorGetOrCreate(ctx context.Context, params driver.ScheduleCursorCreateParams) (driver.ScheduleCursorResult, error) {
+	return scheduleCursorGetOrCreate(ctx, e.client, params)
+}
+func (e *executor) ScheduleCursorAdvance(ctx context.Context, params driver.ScheduleCursorAdvanceParams) (bool, error) {
+	return scheduleCursorAdvance(ctx, e.client, params)
 }
 
 // ---- txExecutor (wraps *firestore.Transaction from user's RunTransaction callback) ----
@@ -145,7 +155,7 @@ func (t *txExecutor) JobGetByID(ctx context.Context, id string) (*driver.JobRow,
 	snap, err := t.tx.Get(t.client.Collection(colJobs).Doc(id))
 	if err != nil {
 		if status.Code(err) == codes.NotFound {
-			return nil, nil
+			return nil, fmt.Errorf("%w: job %q", driver.ErrNotFound, id)
 		}
 		return nil, err
 	}
@@ -186,8 +196,14 @@ func (t *txExecutor) QueueList(ctx context.Context, params driver.QueueListParam
 func (t *txExecutor) LeaderAttemptElect(ctx context.Context, params driver.LeaderElectParams) (bool, error) {
 	return leaderAttemptElect(ctx, t.client, t.clk, params)
 }
-func (t *txExecutor) LeaderResign(ctx context.Context, name string) error {
-	return leaderResign(ctx, t.client, name)
+func (t *txExecutor) LeaderResign(ctx context.Context, params driver.LeaderResignParams) error {
+	return leaderResign(ctx, t.client, params)
+}
+func (t *txExecutor) ScheduleCursorGetOrCreate(ctx context.Context, params driver.ScheduleCursorCreateParams) (driver.ScheduleCursorResult, error) {
+	return scheduleCursorGetOrCreate(ctx, t.client, params)
+}
+func (t *txExecutor) ScheduleCursorAdvance(ctx context.Context, params driver.ScheduleCursorAdvanceParams) (bool, error) {
+	return scheduleCursorAdvance(ctx, t.client, params)
 }
 
 // ---- JobInsertMany (non-tx) ----
@@ -233,7 +249,7 @@ func jobInsertMany(ctx context.Context, client *firestore.Client, clk clock.Cloc
 		jobRef := client.Collection(colJobs).Doc(id)
 
 		if p.UniqueKey != "" {
-			uniqRef := client.Collection(colUniq).Doc(p.Queue + "#" + p.UniqueKey)
+			uniqRef := client.Collection(colUniq).Doc(p.UniqueKey)
 			var skip bool
 			if err := client.RunTransaction(ctx, func(ctx context.Context, tx *firestore.Transaction) error {
 				snap, err := tx.Get(uniqRef)
@@ -330,7 +346,7 @@ func jobInsertManyTx(ctx context.Context, client *firestore.Client, tx *firestor
 		}
 
 		if p.UniqueKey != "" {
-			uniqRef := client.Collection(colUniq).Doc(p.Queue + "#" + p.UniqueKey)
+			uniqRef := client.Collection(colUniq).Doc(p.UniqueKey)
 			entries[i].uniqRef = uniqRef
 			snap, err := tx.Get(uniqRef)
 			if err != nil && status.Code(err) != codes.NotFound {
@@ -379,6 +395,15 @@ func jobGetByID(ctx context.Context, client *firestore.Client, id string) (*driv
 }
 
 func jobList(ctx context.Context, client *firestore.Client, params driver.JobListParams) ([]driver.JobRow, error) {
+	var cursorAt time.Time
+	var cursorID string
+	if params.Cursor != "" {
+		var err error
+		cursorAt, cursorID, err = driver.DecodeJobCursor(params.Cursor)
+		if err != nil {
+			return nil, err
+		}
+	}
 	query := client.Collection(colJobs).Query
 	if params.Queue != "" {
 		query = query.Where("queue", "==", params.Queue)
@@ -396,10 +421,14 @@ func jobList(ctx context.Context, client *firestore.Client, params driver.JobLis
 	rows := make([]driver.JobRow, 0, len(snaps))
 	for _, snap := range snaps {
 		var job jobDoc
-		if snap.DataTo(&job) != nil || params.Cursor != "" && job.ID >= params.Cursor {
+		if snap.DataTo(&job) != nil {
 			continue
 		}
-		rows = append(rows, *docToRow(job))
+		row := docToRow(job)
+		if params.Cursor != "" && !driver.JobFollowsCursor(*row, cursorAt, cursorID) {
+			continue
+		}
+		rows = append(rows, *row)
 	}
 	sort.Slice(rows, func(i, j int) bool {
 		if !rows[i].CreatedAt.Equal(rows[j].CreatedAt) {
@@ -455,7 +484,6 @@ func jobFetchBatch(ctx context.Context, client *firestore.Client, clk clock.Cloc
 		Where("queue", "==", params.Queue).
 		Where("state", "in", []string{string(driver.JobStateAvailable), string(driver.JobStateScheduled)}).
 		Where("run_at", "<=", now).
-		Limit(params.Limit * 3).
 		Documents(ctx).GetAll()
 	if err != nil {
 		return nil, fmt.Errorf("query available jobs: %w", err)
@@ -478,7 +506,13 @@ func jobFetchBatch(ctx context.Context, client *firestore.Client, clk clock.Cloc
 		if candidates[i].j.Priority != candidates[k].j.Priority {
 			return candidates[i].j.Priority > candidates[k].j.Priority
 		}
-		return candidates[i].j.RunAt.Before(candidates[k].j.RunAt)
+		if !candidates[i].j.RunAt.Equal(candidates[k].j.RunAt) {
+			return candidates[i].j.RunAt.Before(candidates[k].j.RunAt)
+		}
+		if !candidates[i].j.CreatedAt.Equal(candidates[k].j.CreatedAt) {
+			return candidates[i].j.CreatedAt.Before(candidates[k].j.CreatedAt)
+		}
+		return candidates[i].j.ID < candidates[k].j.ID
 	})
 
 	var claimed []driver.JobRow
@@ -581,6 +615,30 @@ func jobRescueStuck(ctx context.Context, client *firestore.Client, params driver
 	return rescued, nil
 }
 
+func jobHeartbeat(ctx context.Context, client *firestore.Client, params driver.JobHeartbeatParams) (bool, error) {
+	jobRef := client.Collection(colJobs).Doc(params.ID)
+	renewed := false
+	err := client.RunTransaction(ctx, func(ctx context.Context, tx *firestore.Transaction) error {
+		snap, err := tx.Get(jobRef)
+		if err != nil {
+			if status.Code(err) == codes.NotFound {
+				return fmt.Errorf("%w: job %q", driver.ErrStaleClaim, params.ID)
+			}
+			return err
+		}
+		var job jobDoc
+		if err := snap.DataTo(&job); err != nil {
+			return err
+		}
+		if job.State != string(driver.JobStateRunning) || job.WorkerID != params.WorkerID || job.AttemptNum != params.Attempt {
+			return nil
+		}
+		renewed = true
+		return tx.Update(jobRef, []firestore.Update{{Path: "attempted_at", Value: params.At.UTC()}})
+	})
+	return renewed && err == nil, err
+}
+
 // ---- JobSetStateIfRunning ----
 
 func jobSetStateIfRunning(ctx context.Context, client *firestore.Client, clk clock.Clock, params driver.JobSetStateParams) error {
@@ -597,8 +655,8 @@ func jobSetStateIfRunning(ctx context.Context, client *firestore.Client, clk clo
 		if err := snap.DataTo(&j); err != nil {
 			return err
 		}
-		if j.State != string(driver.JobStateRunning) {
-			return nil
+		if j.State != string(driver.JobStateRunning) || !params.MatchesClaim(j.WorkerID, j.AttemptNum) {
+			return fmt.Errorf("%w: job %q", driver.ErrStaleClaim, params.ID)
 		}
 
 		now := clk.Now()
@@ -619,11 +677,15 @@ func jobSetStateIfRunning(ctx context.Context, client *firestore.Client, clk clo
 		}
 
 		if params.Err != nil {
-			newErrors := append(j.Errors, jobError{
+			stored := jobError{
 				At:      now,
 				Attempt: j.AttemptNum,
 				Message: *params.Err,
-			})
+			}
+			if params.Trace != nil {
+				stored.Trace = *params.Trace
+			}
+			newErrors := append(j.Errors, stored)
 			updates = append(updates, firestore.Update{Path: "errors", Value: newErrors})
 		}
 
@@ -642,8 +704,8 @@ func jobSetStateIfRunning(ctx context.Context, client *firestore.Client, clk clo
 				firestore.Update{Path: "state", Value: string(params.State)},
 				firestore.Update{Path: "finalized_at", Value: now.UTC()},
 			)
-			if j.UniqueKey != "" {
-				tx.Delete(client.Collection(colUniq).Doc(j.Queue + "#" + j.UniqueKey)) //nolint:errcheck
+			if j.UniqueKey != "" && !driver.IsPermanentUniqueKey(j.UniqueKey) {
+				tx.Delete(client.Collection(colUniq).Doc(j.UniqueKey)) //nolint:errcheck
 			}
 		}
 
@@ -659,7 +721,7 @@ func jobCancel(ctx context.Context, client *firestore.Client, clk clock.Clock, i
 		snap, err := tx.Get(jobRef)
 		if err != nil {
 			if status.Code(err) == codes.NotFound {
-				return fmt.Errorf("job %q not found", id)
+				return fmt.Errorf("%w: job %q", driver.ErrNotFound, id)
 			}
 			return err
 		}
@@ -668,7 +730,7 @@ func jobCancel(ctx context.Context, client *firestore.Client, clk clock.Clock, i
 			return err
 		}
 		if j.State != string(driver.JobStateAvailable) && j.State != string(driver.JobStateScheduled) {
-			return fmt.Errorf("job %q is in state %s, can only cancel available/scheduled", id, j.State)
+			return fmt.Errorf("%w: job %q is in state %s, can only cancel available/scheduled", driver.ErrConflict, id, j.State)
 		}
 		now := clk.Now()
 		if err := tx.Update(jobRef, []firestore.Update{
@@ -678,8 +740,8 @@ func jobCancel(ctx context.Context, client *firestore.Client, clk clock.Clock, i
 		}); err != nil {
 			return err
 		}
-		if j.UniqueKey != "" {
-			tx.Delete(client.Collection(colUniq).Doc(j.Queue + "#" + j.UniqueKey)) //nolint:errcheck
+		if j.UniqueKey != "" && !driver.IsPermanentUniqueKey(j.UniqueKey) {
+			tx.Delete(client.Collection(colUniq).Doc(j.UniqueKey)) //nolint:errcheck
 		}
 		return nil
 	})
@@ -692,7 +754,7 @@ func jobDelete(ctx context.Context, client *firestore.Client, id string) error {
 	snap, err := client.Collection(colJobs).Doc(id).Get(ctx)
 	if err != nil {
 		if status.Code(err) == codes.NotFound {
-			return nil
+			return fmt.Errorf("%w: job %q", driver.ErrNotFound, id)
 		}
 		return err
 	}
@@ -704,7 +766,7 @@ func jobDelete(ctx context.Context, client *firestore.Client, id string) error {
 		return err
 	}
 	if j.UniqueKey != "" {
-		client.Collection(colUniq).Doc(j.Queue + "#" + j.UniqueKey).Delete(ctx) //nolint:errcheck
+		client.Collection(colUniq).Doc(j.UniqueKey).Delete(ctx) //nolint:errcheck
 	}
 	return nil
 }
@@ -717,6 +779,9 @@ func jobReschedule(ctx context.Context, client *firestore.Client, params driver.
 		{Path: "run_at", Value: params.RunAt.UTC()},
 		{Path: "version", Value: firestore.Increment(1)},
 	})
+	if status.Code(err) == codes.NotFound {
+		return fmt.Errorf("%w: job %q", driver.ErrNotFound, params.ID)
+	}
 	return err
 }
 
@@ -757,11 +822,19 @@ func queueSetPaused(ctx context.Context, client *firestore.Client, clk clock.Clo
 }
 
 func queueList(ctx context.Context, client *firestore.Client, params driver.QueueListParams) ([]*driver.QueueRow, error) {
+	cursor := ""
+	if params.Cursor != "" {
+		var err error
+		cursor, err = driver.DecodeQueueCursor(params.Cursor)
+		if err != nil {
+			return nil, err
+		}
+	}
 	limit := params.Limit
-	if limit <= 0 {
+	if limit <= 0 || limit > 1000 {
 		limit = 100
 	}
-	snaps, err := client.Collection(colQueues).Limit(limit).Documents(ctx).GetAll()
+	snaps, err := client.Collection(colQueues).Documents(ctx).GetAll()
 	if err != nil {
 		return nil, err
 	}
@@ -771,12 +844,19 @@ func queueList(ctx context.Context, client *firestore.Client, params driver.Queu
 		if err := snap.DataTo(&q); err != nil {
 			continue
 		}
+		if q.Name <= cursor {
+			continue
+		}
 		rows = append(rows, &driver.QueueRow{
 			Name:      q.Name,
 			Paused:    q.Paused,
 			CreatedAt: q.CreatedAt,
 			UpdatedAt: q.UpdatedAt,
 		})
+	}
+	sort.Slice(rows, func(i, j int) bool { return rows[i].Name < rows[j].Name })
+	if len(rows) > limit {
+		rows = rows[:limit]
 	}
 	return rows, nil
 }
@@ -822,9 +902,72 @@ func leaderAttemptElect(ctx context.Context, client *firestore.Client, clk clock
 	return elected, err
 }
 
-func leaderResign(ctx context.Context, client *firestore.Client, name string) error {
-	_, err := client.Collection(colLeaders).Doc(name).Delete(ctx)
-	return err
+func leaderResign(ctx context.Context, client *firestore.Client, params driver.LeaderResignParams) error {
+	ref := client.Collection(colLeaders).Doc(params.Name)
+	return client.RunTransaction(ctx, func(ctx context.Context, tx *firestore.Transaction) error {
+		snap, err := tx.Get(ref)
+		if status.Code(err) == codes.NotFound {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		var current leaderDoc
+		if err := snap.DataTo(&current); err != nil {
+			return err
+		}
+		if current.WorkerID != params.WorkerID {
+			return nil
+		}
+		return tx.Delete(ref)
+	})
+}
+
+type scheduleCursorDoc struct {
+	At time.Time `firestore:"cursor_at"`
+}
+
+func scheduleCursorGetOrCreate(ctx context.Context, client *firestore.Client, params driver.ScheduleCursorCreateParams) (driver.ScheduleCursorResult, error) {
+	ref := client.Collection(colCursors).Doc(params.ID)
+	var result driver.ScheduleCursorResult
+	err := client.RunTransaction(ctx, func(ctx context.Context, tx *firestore.Transaction) error {
+		snap, err := tx.Get(ref)
+		if status.Code(err) == codes.NotFound {
+			result = driver.ScheduleCursorResult{At: params.InitialAt.UTC(), Created: true}
+			return tx.Create(ref, scheduleCursorDoc{At: result.At})
+		}
+		if err != nil {
+			return err
+		}
+		var doc scheduleCursorDoc
+		if err := snap.DataTo(&doc); err != nil {
+			return err
+		}
+		result.At = doc.At.UTC()
+		return nil
+	})
+	return result, err
+}
+
+func scheduleCursorAdvance(ctx context.Context, client *firestore.Client, params driver.ScheduleCursorAdvanceParams) (bool, error) {
+	ref := client.Collection(colCursors).Doc(params.ID)
+	advanced := false
+	err := client.RunTransaction(ctx, func(ctx context.Context, tx *firestore.Transaction) error {
+		snap, err := tx.Get(ref)
+		if err != nil {
+			return err
+		}
+		var doc scheduleCursorDoc
+		if err := snap.DataTo(&doc); err != nil {
+			return err
+		}
+		if !doc.At.Equal(params.Expected) {
+			return nil
+		}
+		advanced = true
+		return tx.Update(ref, []firestore.Update{{Path: "cursor_at", Value: params.Next.UTC()}})
+	})
+	return advanced, err
 }
 
 // ---- helpers ----
@@ -871,7 +1014,7 @@ func jobErrorsToRow(errs []jobError) []driver.AttemptError {
 	}
 	out := make([]driver.AttemptError, len(errs))
 	for i, e := range errs {
-		out[i] = driver.AttemptError{At: e.At, Attempt: e.Attempt, Error: e.Message}
+		out[i] = driver.AttemptError{At: e.At, Attempt: e.Attempt, Error: e.Message, Trace: e.Trace}
 	}
 	return out
 }

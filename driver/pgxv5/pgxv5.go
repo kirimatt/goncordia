@@ -17,6 +17,7 @@ import (
 	"embed"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -42,7 +43,8 @@ type Option func(*Driver)
 // WithClock injects a custom clock (for testing).
 func WithClock(c clock.Clock) Option { return func(d *Driver) { d.clk = c } }
 
-// New creates a Driver from an existing pgxpool.Pool.
+// New creates a Driver from an existing pgxpool.Pool. The caller retains
+// ownership of pool and must close it after the driver is no longer in use.
 // Call Migrate to create the schema before starting workers.
 func New(pool *pgxpool.Pool, opts ...Option) *Driver {
 	d := &Driver{pool: pool, clk: clock.Real{}}
@@ -55,7 +57,21 @@ func New(pool *pgxpool.Pool, opts ...Option) *Driver {
 // Migrate runs embedded SQL migrations against the database.
 // Safe to call multiple times (uses IF NOT EXISTS / CREATE OR REPLACE).
 func (d *Driver) Migrate(ctx context.Context) error {
-	if _, err := d.pool.Exec(ctx, `CREATE TABLE IF NOT EXISTS goncordia_schema_migrations (
+	conn, err := d.pool.Acquire(ctx)
+	if err != nil {
+		return fmt.Errorf("acquire migration connection: %w", err)
+	}
+	defer conn.Release()
+	if _, err := conn.Exec(ctx, `SELECT pg_advisory_lock(hashtext('goncordia_schema_migrations'))`); err != nil {
+		return fmt.Errorf("acquire migration lock: %w", err)
+	}
+	defer func() {
+		releaseCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_, _ = conn.Exec(releaseCtx, `SELECT pg_advisory_unlock(hashtext('goncordia_schema_migrations'))`)
+	}()
+
+	if _, err := conn.Exec(ctx, `CREATE TABLE IF NOT EXISTS goncordia_schema_migrations (
 		version TEXT PRIMARY KEY,
 		applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 	)`); err != nil {
@@ -70,7 +86,7 @@ func (d *Driver) Migrate(ctx context.Context) error {
 			continue
 		}
 		var applied bool
-		if err := d.pool.QueryRow(ctx,
+		if err := conn.QueryRow(ctx,
 			`SELECT EXISTS (SELECT 1 FROM goncordia_schema_migrations WHERE version=$1)`,
 			e.Name(),
 		).Scan(&applied); err != nil {
@@ -83,7 +99,7 @@ func (d *Driver) Migrate(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("read migration %s: %w", e.Name(), err)
 		}
-		tx, err := d.pool.Begin(ctx)
+		tx, err := conn.Begin(ctx)
 		if err != nil {
 			return fmt.Errorf("begin migration %s: %w", e.Name(), err)
 		}
@@ -128,7 +144,6 @@ func (d *Driver) Listener() driver.Listener {
 }
 
 func (d *Driver) Close() error {
-	d.pool.Close()
 	return nil
 }
 

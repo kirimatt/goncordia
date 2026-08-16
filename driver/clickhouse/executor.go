@@ -2,7 +2,9 @@ package clickhousedriver
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -22,7 +24,7 @@ type executor struct {
 }
 
 func (e *executor) Begin(_ context.Context) (driver.ExecutorTx, error) {
-	return &txExecutor{executor: *e}, nil
+	return nil, fmt.Errorf("%w: clickhouse transactions", driver.ErrUnsupported)
 }
 
 func (e *executor) JobInsertMany(ctx context.Context, params []driver.JobInsertParams) ([]driver.JobInsertResult, error) {
@@ -42,6 +44,9 @@ func (e *executor) JobFetchBatch(ctx context.Context, params driver.FetchParams)
 }
 func (e *executor) JobRescueStuck(ctx context.Context, params driver.JobRescueParams) (int64, error) {
 	return jobRescueStuck(ctx, e.conn, params)
+}
+func (e *executor) JobHeartbeat(ctx context.Context, params driver.JobHeartbeatParams) (bool, error) {
+	return jobHeartbeat(ctx, e.conn, params)
 }
 func (e *executor) JobSetStateIfRunning(ctx context.Context, params driver.JobSetStateParams) error {
 	return jobSetStateIfRunning(ctx, e.conn, e.clk, params)
@@ -70,8 +75,14 @@ func (e *executor) QueueList(ctx context.Context, params driver.QueueListParams)
 func (e *executor) LeaderAttemptElect(ctx context.Context, params driver.LeaderElectParams) (bool, error) {
 	return leaderAttemptElect(ctx, e.conn, e.clk, params)
 }
-func (e *executor) LeaderResign(ctx context.Context, name string) error {
-	return leaderResign(ctx, e.conn, name)
+func (e *executor) LeaderResign(ctx context.Context, params driver.LeaderResignParams) error {
+	return leaderResign(ctx, e.conn, params)
+}
+func (e *executor) ScheduleCursorGetOrCreate(ctx context.Context, params driver.ScheduleCursorCreateParams) (driver.ScheduleCursorResult, error) {
+	return scheduleCursorGetOrCreate(ctx, e.conn, params)
+}
+func (e *executor) ScheduleCursorAdvance(ctx context.Context, params driver.ScheduleCursorAdvanceParams) (bool, error) {
+	return scheduleCursorAdvance(ctx, e.conn, params)
 }
 
 // ---- txExecutor (no-op tx — ClickHouse has no transactions) ----
@@ -119,8 +130,14 @@ func (t *txExecutor) QueueList(ctx context.Context, params driver.QueueListParam
 func (t *txExecutor) LeaderAttemptElect(ctx context.Context, params driver.LeaderElectParams) (bool, error) {
 	return leaderAttemptElect(ctx, t.conn, t.clk, params)
 }
-func (t *txExecutor) LeaderResign(ctx context.Context, name string) error {
-	return leaderResign(ctx, t.conn, name)
+func (t *txExecutor) LeaderResign(ctx context.Context, params driver.LeaderResignParams) error {
+	return leaderResign(ctx, t.conn, params)
+}
+func (t *txExecutor) ScheduleCursorGetOrCreate(ctx context.Context, params driver.ScheduleCursorCreateParams) (driver.ScheduleCursorResult, error) {
+	return scheduleCursorGetOrCreate(ctx, t.conn, params)
+}
+func (t *txExecutor) ScheduleCursorAdvance(ctx context.Context, params driver.ScheduleCursorAdvanceParams) (bool, error) {
+	return scheduleCursorAdvance(ctx, t.conn, params)
 }
 
 // ---- job row helpers ----
@@ -129,6 +146,7 @@ type storedError struct {
 	At      int64  `json:"at_ms"`
 	Attempt int    `json:"attempt"`
 	Error   string `json:"error"`
+	Trace   string `json:"trace,omitempty"`
 }
 
 func marshalErrors(errs []driver.AttemptError) string {
@@ -137,7 +155,7 @@ func marshalErrors(errs []driver.AttemptError) string {
 	}
 	out := make([]storedError, len(errs))
 	for i, e := range errs {
-		out[i] = storedError{At: e.At.UnixMilli(), Attempt: e.Attempt, Error: e.Error}
+		out[i] = storedError{At: e.At.UnixMilli(), Attempt: e.Attempt, Error: e.Error, Trace: e.Trace}
 	}
 	b, _ := json.Marshal(out)
 	return string(b)
@@ -153,7 +171,7 @@ func unmarshalErrors(s string) []driver.AttemptError {
 	}
 	out := make([]driver.AttemptError, len(stored))
 	for i, e := range stored {
-		out[i] = driver.AttemptError{At: time.UnixMilli(e.At).UTC(), Attempt: e.Attempt, Error: e.Error}
+		out[i] = driver.AttemptError{At: time.UnixMilli(e.At).UTC(), Attempt: e.Attempt, Error: e.Error, Trace: e.Trace}
 	}
 	return out
 }
@@ -267,9 +285,9 @@ func jobInsertMany(ctx context.Context, conn chdriver.Conn, clk clock.Clock, par
 			var existing string
 			row := conn.QueryRow(ctx,
 				`SELECT id FROM goncordia_jobs FINAL
-				 WHERE queue=? AND unique_key=? AND state IN ('available','running','retryable','scheduled')
+					 WHERE unique_key=? AND (state IN ('available','running','retryable','scheduled') OR (startsWith(unique_key, 'uf2_') AND state != 'deleted'))
 				 LIMIT 1`,
-				p.Queue, p.UniqueKey)
+				p.UniqueKey)
 			if err := row.Scan(&existing); err == nil && existing != "" {
 				results[i] = driver.JobInsertResult{UniqueSkip: true}
 				continue
@@ -314,10 +332,13 @@ func jobInsertMany(ctx context.Context, conn chdriver.Conn, clk clock.Clock, par
 func jobGetByID(ctx context.Context, conn chdriver.Conn, id string) (*driver.JobRow, error) {
 	j, err := queryJob(ctx, conn, id)
 	if err != nil {
-		return nil, nil // not found or error — treat as not found
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, fmt.Errorf("%w: job %q", driver.ErrNotFound, id)
+		}
+		return nil, err
 	}
 	if j.ID == "" {
-		return nil, nil
+		return nil, fmt.Errorf("%w: job %q", driver.ErrNotFound, id)
 	}
 	return j.toRow(), nil
 }
@@ -338,8 +359,12 @@ func jobList(ctx context.Context, conn chdriver.Conn, params driver.JobListParam
 		args = append(args, params.Kind)
 	}
 	if params.Cursor != "" {
-		query += ` AND id<?`
-		args = append(args, params.Cursor)
+		cursorAt, cursorID, err := driver.DecodeJobCursor(params.Cursor)
+		if err != nil {
+			return nil, err
+		}
+		query += ` AND (created_at<? OR (created_at=? AND id<?))`
+		args = append(args, cursorAt, cursorAt, cursorID)
 	}
 	limit := params.Limit
 	if limit <= 0 || limit > 1000 {
@@ -407,7 +432,7 @@ func jobFetchBatch(ctx context.Context, conn chdriver.Conn, clk clock.Clock, par
 	rows, err := conn.Query(ctx,
 		`SELECT `+selectJobCols+` FROM goncordia_jobs FINAL
 		 WHERE queue=? AND state IN ('available','scheduled') AND run_at<=?
-		 ORDER BY priority DESC, run_at ASC
+		 ORDER BY priority DESC, run_at ASC, created_at ASC, id ASC
 		 LIMIT ?`,
 		params.Queue, now, params.Limit,
 	)
@@ -532,15 +557,35 @@ func jobRescueStuck(ctx context.Context, conn chdriver.Conn, params driver.JobRe
 	return rescued, nil
 }
 
+func jobHeartbeat(ctx context.Context, conn chdriver.Conn, params driver.JobHeartbeatParams) (bool, error) {
+	job, err := queryJob(ctx, conn, params.ID)
+	if err != nil {
+		return false, err
+	}
+	if job.ID == "" || job.State != string(driver.JobStateRunning) || job.WorkerID != params.WorkerID || int(job.AttemptNum) != params.Attempt {
+		return false, nil
+	}
+	at := params.At.UTC()
+	job.AttemptedAt = &at
+	job.Version++
+	if err := insertJobRow(ctx, conn, job); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 // ---- JobSetStateIfRunning ----
 
 func jobSetStateIfRunning(ctx context.Context, conn chdriver.Conn, clk clock.Clock, params driver.JobSetStateParams) error {
 	j, err := queryJob(ctx, conn, params.ID)
-	if err != nil || j.ID == "" {
-		return nil
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return err
 	}
-	if j.State != string(driver.JobStateRunning) {
-		return nil
+	if err != nil || j.ID == "" {
+		return fmt.Errorf("%w: job %q", driver.ErrStaleClaim, params.ID)
+	}
+	if j.State != string(driver.JobStateRunning) || !params.MatchesClaim(j.WorkerID, int(j.AttemptNum)) {
+		return fmt.Errorf("%w: job %q", driver.ErrStaleClaim, params.ID)
 	}
 
 	if params.Yield {
@@ -556,7 +601,11 @@ func jobSetStateIfRunning(ctx context.Context, conn chdriver.Conn, clk clock.Clo
 	now := clk.Now()
 	errs := unmarshalErrors(j.ErrorsJSON)
 	if params.Err != nil {
-		errs = append(errs, driver.AttemptError{At: now, Attempt: int(j.AttemptNum), Error: *params.Err})
+		stored := driver.AttemptError{At: now, Attempt: int(j.AttemptNum), Error: *params.Err}
+		if params.Trace != nil {
+			stored.Trace = *params.Trace
+		}
+		errs = append(errs, stored)
 	}
 
 	updated := j
@@ -584,11 +633,14 @@ func jobSetStateIfRunning(ctx context.Context, conn chdriver.Conn, clk clock.Clo
 
 func jobCancel(ctx context.Context, conn chdriver.Conn, clk clock.Clock, id string) error {
 	j, err := queryJob(ctx, conn, id)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
 	if err != nil || j.ID == "" {
-		return fmt.Errorf("job %q not found", id)
+		return fmt.Errorf("%w: job %q", driver.ErrNotFound, id)
 	}
 	if j.State != string(driver.JobStateAvailable) && j.State != string(driver.JobStateScheduled) {
-		return fmt.Errorf("job %q is in state %s, can only cancel available/scheduled", id, j.State)
+		return fmt.Errorf("%w: job %q is in state %s, can only cancel available/scheduled", driver.ErrConflict, id, j.State)
 	}
 
 	now := clk.Now()
@@ -606,8 +658,11 @@ func jobDelete(ctx context.Context, conn chdriver.Conn, id string) error {
 	// way as OLTP databases. We mark the job as deleted by setting a terminal state.
 	// Physical deletion happens via TTL or ALTER TABLE DELETE (async mutation).
 	j, err := queryJob(ctx, conn, id)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
 	if err != nil || j.ID == "" {
-		return nil
+		return fmt.Errorf("%w: job %q", driver.ErrNotFound, id)
 	}
 	deleted := j
 	deleted.State = "deleted"
@@ -619,8 +674,11 @@ func jobDelete(ctx context.Context, conn chdriver.Conn, id string) error {
 
 func jobReschedule(ctx context.Context, conn chdriver.Conn, params driver.RescheduleParams) error {
 	j, err := queryJob(ctx, conn, params.ID)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
 	if err != nil || j.ID == "" {
-		return fmt.Errorf("job %q not found", params.ID)
+		return fmt.Errorf("%w: job %q", driver.ErrNotFound, params.ID)
 	}
 	rescheduled := j
 	rescheduled.State = string(driver.JobStateScheduled)
@@ -660,7 +718,10 @@ func queueGet(ctx context.Context, conn chdriver.Conn, name string) (*driver.Que
 	row := conn.QueryRow(ctx,
 		`SELECT name, paused, created_at, updated_at FROM goncordia_queues FINAL WHERE name=? LIMIT 1`, name)
 	if err := row.Scan(&q.Name, &paused, &q.CreatedAt, &q.UpdatedAt); err != nil {
-		return nil, fmt.Errorf("queue %q not found", name)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, fmt.Errorf("%w: queue %q", driver.ErrNotFound, name)
+		}
+		return nil, err
 	}
 	q.Paused = paused == 1
 	return &q, nil
@@ -683,11 +744,22 @@ func queueSetPaused(ctx context.Context, conn chdriver.Conn, clk clock.Clock, na
 
 func queueList(ctx context.Context, conn chdriver.Conn, params driver.QueueListParams) ([]*driver.QueueRow, error) {
 	limit := params.Limit
-	if limit <= 0 {
+	if limit <= 0 || limit > 1000 {
 		limit = 100
 	}
-	rows, err := conn.Query(ctx,
-		`SELECT name, paused, created_at, updated_at FROM goncordia_queues FINAL LIMIT ?`, limit)
+	query := `SELECT name, paused, created_at, updated_at FROM goncordia_queues FINAL`
+	var args []any
+	if params.Cursor != "" {
+		cursor, err := driver.DecodeQueueCursor(params.Cursor)
+		if err != nil {
+			return nil, err
+		}
+		query += ` WHERE name>?`
+		args = append(args, cursor)
+	}
+	query += ` ORDER BY name LIMIT ?`
+	args = append(args, limit)
+	rows, err := conn.Query(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -733,15 +805,45 @@ func leaderAttemptElect(ctx context.Context, conn chdriver.Conn, clk clock.Clock
 	return false, nil
 }
 
-func leaderResign(ctx context.Context, conn chdriver.Conn, name string) error {
+func leaderResign(ctx context.Context, conn chdriver.Conn, params driver.LeaderResignParams) error {
+	var workerID string
 	var ver int64
-	row := conn.QueryRow(ctx, `SELECT version FROM goncordia_leaders FINAL WHERE name=? LIMIT 1`, name)
-	_ = row.Scan(&ver)
+	row := conn.QueryRow(ctx, `SELECT worker_id, version FROM goncordia_leaders FINAL WHERE name=? LIMIT 1`, params.Name)
+	if err := row.Scan(&workerID, &ver); err != nil || workerID != params.WorkerID {
+		return nil
+	}
 	past := time.Unix(0, 0)
 	return conn.Exec(ctx,
 		`INSERT INTO goncordia_leaders (name, worker_id, expires_at, version) VALUES (?,'',?,?)`,
-		name, past, ver+1,
+		params.Name, past, ver+1,
 	)
+}
+
+func scheduleCursorGetOrCreate(ctx context.Context, conn chdriver.Conn, params driver.ScheduleCursorCreateParams) (driver.ScheduleCursorResult, error) {
+	var at time.Time
+	var version int64
+	err := conn.QueryRow(ctx, `SELECT cursor_at, version FROM goncordia_schedule_cursors FINAL WHERE id=? LIMIT 1`, params.ID).Scan(&at, &version)
+	if err == nil {
+		return driver.ScheduleCursorResult{At: at.UTC()}, nil
+	}
+	initial := params.InitialAt.UTC()
+	if err := conn.Exec(ctx, `INSERT INTO goncordia_schedule_cursors (id, cursor_at, version) VALUES (?,?,1)`, params.ID, initial); err != nil {
+		return driver.ScheduleCursorResult{}, err
+	}
+	return driver.ScheduleCursorResult{At: initial, Created: true}, nil
+}
+
+func scheduleCursorAdvance(ctx context.Context, conn chdriver.Conn, params driver.ScheduleCursorAdvanceParams) (bool, error) {
+	var at time.Time
+	var version int64
+	if err := conn.QueryRow(ctx, `SELECT cursor_at, version FROM goncordia_schedule_cursors FINAL WHERE id=? LIMIT 1`, params.ID).Scan(&at, &version); err != nil {
+		return false, err
+	}
+	if !at.Equal(params.Expected) {
+		return false, nil
+	}
+	return true, conn.Exec(ctx, `INSERT INTO goncordia_schedule_cursors (id, cursor_at, version) VALUES (?,?,?)`,
+		params.ID, params.Next.UTC(), version+1)
 }
 
 // compile-time checks

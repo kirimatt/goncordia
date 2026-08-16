@@ -4,8 +4,10 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log/slog"
+	"runtime/debug"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -29,6 +31,9 @@ type WorkerConfig struct {
 	// Concurrency is the maximum number of jobs running simultaneously.
 	// Default: 10.
 	Concurrency int
+	// MaxPending bounds jobs claimed by this process but waiting for pipeline,
+	// per-kind, or global execution capacity. Default: 4 * Concurrency.
+	MaxPending int
 	// WorkerID identifies claims made by this pool. If empty, a random ID is generated.
 	WorkerID string
 	// PollInterval is how long to wait between polls when the queue is empty.
@@ -45,12 +50,17 @@ type WorkerConfig struct {
 	StuckJobTimeout time.Duration
 	// RescueInterval controls how often abandoned jobs are checked. Default: 1 minute.
 	RescueInterval time.Duration
+	// HeartbeatInterval controls how often active claims renew their lease. It
+	// defaults to one third of StuckJobTimeout. A negative value disables it.
+	HeartbeatInterval time.Duration
 	// Clock overrides the time source. Defaults to clock.Real{}.
 	// Inject clock.NewMock() in tests to control time.
 	Clock clock.Clock
 	// Middleware is applied around each job execution in order (outermost first).
 	// Use it to add tracing, logging, or metrics without modifying job handlers.
 	Middleware []JobMiddleware
+	// Observer receives claim, heartbeat, and rescue lifecycle events.
+	Observer WorkerObserver
 	// ErrorHandler receives asynchronous fetch, rescue, and state-transition errors.
 	// Default: slog.Error.
 	ErrorHandler func(error)
@@ -66,6 +76,7 @@ type WorkerPool[TTx any] struct {
 
 	wg             sync.WaitGroup
 	sem            chan struct{}
+	pending        chan struct{}
 	shutdownOnce   sync.Once
 	shutdownCh     chan struct{}
 	isShuttingDown atomic.Bool
@@ -84,6 +95,12 @@ func NewWorkerPool[TTx any](d driver.Driver[TTx], registry *core.Registry, cfg W
 	if cfg.Concurrency <= 0 {
 		cfg.Concurrency = 10
 	}
+	if cfg.MaxPending <= 0 {
+		cfg.MaxPending = cfg.Concurrency * 4
+	}
+	if cfg.MaxPending < cfg.Concurrency {
+		cfg.MaxPending = cfg.Concurrency
+	}
 	if cfg.WorkerID == "" {
 		cfg.WorkerID = newWorkerID()
 	}
@@ -98,6 +115,12 @@ func NewWorkerPool[TTx any](d driver.Driver[TTx], registry *core.Registry, cfg W
 	}
 	if cfg.RescueInterval <= 0 {
 		cfg.RescueInterval = time.Minute
+	}
+	if cfg.HeartbeatInterval == 0 && cfg.StuckJobTimeout > 0 {
+		cfg.HeartbeatInterval = cfg.StuckJobTimeout / 3
+	}
+	if cfg.StuckJobTimeout > 0 && cfg.HeartbeatInterval >= cfg.StuckJobTimeout {
+		cfg.HeartbeatInterval = cfg.StuckJobTimeout / 3
 	}
 	if cfg.RetryPolicy == nil {
 		cfg.RetryPolicy = core.DefaultRetryPolicy
@@ -131,6 +154,7 @@ func NewWorkerPool[TTx any](d driver.Driver[TTx], registry *core.Registry, cfg W
 		registry:       registry,
 		config:         cfg,
 		sem:            make(chan struct{}, cfg.Concurrency),
+		pending:        make(chan struct{}, cfg.MaxPending),
 		shutdownCh:     make(chan struct{}),
 		pipelineTails:  make(map[string]chan struct{}),
 		kindSemaphores: make(map[string]chan struct{}),
@@ -270,7 +294,7 @@ func (p *WorkerPool[TTx]) fetchAndDispatch(ctx context.Context) {
 		return
 	}
 
-	free := cap(p.sem) - len(p.sem)
+	free := cap(p.pending) - len(p.pending)
 	if free <= 0 {
 		return
 	}
@@ -307,21 +331,26 @@ func (p *WorkerPool[TTx]) fetchAndDispatch(ctx context.Context) {
 
 		for i := range rows {
 			row := rows[i]
+			if p.config.Observer != nil {
+				p.config.Observer.JobClaimed(ctx, row)
+			}
 			pipelineReady, pipelineDone := p.pipelineGate(row.PipelineID)
-			p.sem <- struct{}{}
+			p.pending <- struct{}{}
 			p.wg.Add(1)
 			go func() {
 				defer p.wg.Done()
-				defer func() { <-p.sem }()
+				defer func() { <-p.pending }()
 				defer pipelineDone()
+				claimCtx, stopHeartbeat := p.startHeartbeat(ctx, exec, row)
+				defer stopHeartbeat()
 				if pipelineReady != nil {
 					select {
 					case <-pipelineReady:
-					case <-ctx.Done():
-						p.setState(ctx, exec, driver.JobSetStateParams{ID: row.ID, Yield: true})
+					case <-claimCtx.Done():
+						p.setState(ctx, exec, fencedStateParams(row, driver.JobSetStateParams{Yield: true}))
 						return
 					case <-p.shutdownCh:
-						p.setState(context.Background(), exec, driver.JobSetStateParams{ID: row.ID, Yield: true})
+						p.setState(context.Background(), exec, fencedStateParams(row, driver.JobSetStateParams{Yield: true}))
 						return
 					}
 				}
@@ -330,15 +359,25 @@ func (p *WorkerPool[TTx]) fetchAndDispatch(ctx context.Context) {
 					select {
 					case kindSem <- struct{}{}:
 						defer func() { <-kindSem }()
-					case <-ctx.Done():
-						p.setState(ctx, exec, driver.JobSetStateParams{ID: row.ID, Yield: true})
+					case <-claimCtx.Done():
+						p.setState(ctx, exec, fencedStateParams(row, driver.JobSetStateParams{Yield: true}))
 						return
 					}
 				}
-				p.processRow(ctx, exec, row)
+				select {
+				case p.sem <- struct{}{}:
+					defer func() { <-p.sem }()
+				case <-claimCtx.Done():
+					p.setState(ctx, exec, fencedStateParams(row, driver.JobSetStateParams{Yield: true}))
+					return
+				case <-p.shutdownCh:
+					p.setState(context.Background(), exec, fencedStateParams(row, driver.JobSetStateParams{Yield: true}))
+					return
+				}
+				p.processRow(claimCtx, exec, row)
 			}()
 		}
-		free = cap(p.sem) - len(p.sem)
+		free = cap(p.pending) - len(p.pending)
 		if free <= 0 {
 			return
 		}
@@ -400,6 +439,7 @@ func (p *WorkerPool[TTx]) processRow(ctx context.Context, exec driver.Executor, 
 		AttemptNum: row.AttemptNum,
 		MaxRetry:   maxRetry,
 		CreatedAt:  row.CreatedAt,
+		RunAt:      row.RunAt,
 		WorkerID:   row.WorkerID,
 		Tags:       row.Tags,
 		PipelineID: row.PipelineID,
@@ -411,12 +451,7 @@ func (p *WorkerPool[TTx]) processRow(ctx context.Context, exec driver.Executor, 
 	handler = func(ctx context.Context, job *core.RawJob) (err error) {
 		defer func() {
 			if r := recover(); r != nil {
-				switch v := r.(type) {
-				case error:
-					err = v
-				default:
-					err = &panicError{val: v}
-				}
+				err = newPanicError(r)
 			}
 		}()
 		return p.registry.Process(ctx, job)
@@ -445,55 +480,120 @@ func (p *WorkerPool[TTx]) processRow(ctx context.Context, exec driver.Executor, 
 	}
 
 	jobErr := callHandler(jobCtx, raw, handler)
+	// Losing the pool/claim context is not a job failure. Return the fenced
+	// claim to the queue without recording an error or consuming an attempt.
+	// A job-specific timeout only cancels jobCtx, so it still follows retry rules.
+	if ctx.Err() != nil {
+		p.setState(ctx, exec, fencedStateParams(row, driver.JobSetStateParams{Yield: true}))
+		return
+	}
 
 	if jobErr == nil {
-		p.setState(ctx, exec, driver.JobSetStateParams{
-			ID:    row.ID,
+		p.setState(ctx, exec, fencedStateParams(row, driver.JobSetStateParams{
 			State: driver.JobStateCompleted,
-		})
+		}))
 		return
 	}
 
 	errStr := jobErr.Error()
+	trace := panicTrace(jobErr)
+	if _, discard := core.AsDiscard(jobErr); discard {
+		p.setState(ctx, exec, fencedStateParams(row, driver.JobSetStateParams{
+			State: driver.JobStateDiscarded, Err: &errStr, Trace: trace, Attempt: row.AttemptNum,
+		}))
+		return
+	}
 
 	if row.AttemptNum >= maxRetry {
-		p.setState(ctx, exec, driver.JobSetStateParams{
-			ID:      row.ID,
+		p.setState(ctx, exec, fencedStateParams(row, driver.JobSetStateParams{
 			State:   driver.JobStateDiscarded,
 			Err:     &errStr,
+			Trace:   trace,
 			Attempt: row.AttemptNum,
-		})
+		}))
 		return
 	}
 
-	retryAt := p.config.RetryPolicy.NextRetryAt(row.AttemptNum, jobErr, p.config.Clock)
+	var retryAt time.Time
+	if directive, ok := core.AsRetry(jobErr); ok {
+		retryAt = directive.At
+		if retryAt.IsZero() {
+			retryAt = p.config.Clock.Now().Add(directive.After)
+		}
+	} else {
+		retryAt = p.config.RetryPolicy.NextRetryAt(row.AttemptNum, jobErr, p.config.Clock)
+	}
 	if retryAt.IsZero() {
-		p.setState(ctx, exec, driver.JobSetStateParams{
-			ID:      row.ID,
+		p.setState(ctx, exec, fencedStateParams(row, driver.JobSetStateParams{
 			State:   driver.JobStateDiscarded,
 			Err:     &errStr,
+			Trace:   trace,
 			Attempt: row.AttemptNum,
-		})
+		}))
 		return
 	}
-	p.setState(ctx, exec, driver.JobSetStateParams{
-		ID:      row.ID,
+	p.setState(ctx, exec, fencedStateParams(row, driver.JobSetStateParams{
 		State:   driver.JobStateRetryable,
 		Err:     &errStr,
+		Trace:   trace,
 		Attempt: row.AttemptNum,
 		RetryAt: retryAt,
-	})
+	}))
+}
+
+func fencedStateParams(row driver.JobRow, params driver.JobSetStateParams) driver.JobSetStateParams {
+	params.ID = row.ID
+	params.ExpectedWorkerID = row.WorkerID
+	params.ExpectedAttempt = row.AttemptNum
+	return params
+}
+
+func (p *WorkerPool[TTx]) startHeartbeat(ctx context.Context, exec driver.Executor, row driver.JobRow) (context.Context, func()) {
+	heartbeater, ok := exec.(driver.JobHeartbeater)
+	if !ok || p.config.HeartbeatInterval <= 0 {
+		return ctx, func() {}
+	}
+	claimCtx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	ticker := p.config.Clock.NewTicker(p.config.HeartbeatInterval)
+	go func() {
+		defer close(done)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-claimCtx.Done():
+				return
+			case <-p.shutdownCh:
+				return
+			case <-ticker.C():
+				params := driver.JobHeartbeatParams{
+					ID: row.ID, WorkerID: row.WorkerID, Attempt: row.AttemptNum, At: p.config.Clock.Now(),
+				}
+				renewed, err := heartbeater.JobHeartbeat(claimCtx, params)
+				if p.config.Observer != nil {
+					p.config.Observer.JobHeartbeat(claimCtx, HeartbeatEvent{Job: row, Renewed: renewed, Err: err})
+				}
+				if err != nil {
+					p.reportError(fmt.Errorf("heartbeat job %s: %w", row.ID, err))
+					continue
+				}
+				if !renewed {
+					cancel()
+					return
+				}
+			}
+		}
+	}()
+	return claimCtx, func() {
+		cancel()
+		<-done
+	}
 }
 
 func callHandler(ctx context.Context, job *core.RawJob, handler func(context.Context, *core.RawJob) error) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
-			switch v := r.(type) {
-			case error:
-				err = v
-			default:
-				err = &panicError{val: v}
-			}
+			err = newPanicError(r)
 		}
 	}()
 	return handler(ctx, job)
@@ -506,7 +606,7 @@ func (p *WorkerPool[TTx]) setState(ctx context.Context, exec driver.Executor, pa
 		stateCtx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 	}
-	if err := exec.JobSetStateIfRunning(stateCtx, params); err != nil {
+	if err := exec.JobSetStateIfRunning(stateCtx, params); err != nil && !errors.Is(err, driver.ErrStaleClaim) {
 		p.reportError(fmt.Errorf("set state for job %s: %w", params.ID, err))
 	}
 }
@@ -518,7 +618,11 @@ func (p *WorkerPool[TTx]) rescueStuck(ctx context.Context) {
 	}
 	before := p.config.Clock.Now().Add(-p.config.StuckJobTimeout)
 	for _, queue := range p.config.Queues {
-		if _, err := rescuer.JobRescueStuck(ctx, driver.JobRescueParams{Queue: queue, Before: before}); err != nil {
+		rescued, err := rescuer.JobRescueStuck(ctx, driver.JobRescueParams{Queue: queue, Before: before})
+		if p.config.Observer != nil {
+			p.config.Observer.JobsRescued(ctx, RescueEvent{Queue: queue, Before: before, Rescued: rescued, Err: err})
+		}
+		if err != nil {
 			p.reportError(fmt.Errorf("rescue queue %q: %w", queue, err))
 		}
 	}
@@ -530,10 +634,26 @@ func (p *WorkerPool[TTx]) reportError(err error) {
 	}
 }
 
-type panicError struct{ val any }
+type panicError struct {
+	val   any
+	stack string
+}
+
+func newPanicError(value any) *panicError {
+	return &panicError{val: value, stack: string(debug.Stack())}
+}
 
 func (e *panicError) Error() string {
 	return "panic: " + anyToString(e.val)
+}
+
+func panicTrace(err error) *string {
+	var panicErr *panicError
+	if !errors.As(err, &panicErr) || panicErr.stack == "" {
+		return nil
+	}
+	trace := panicErr.stack
+	return &trace
 }
 
 func anyToString(v any) string {

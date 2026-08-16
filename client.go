@@ -16,6 +16,7 @@ package goncordia
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"reflect"
@@ -43,6 +44,8 @@ type ClientConfig struct {
 	// Now overrides the wall clock used for period-based unique keys.
 	// Deprecated: use Clock.
 	Now func() time.Time
+	// Observer instruments enqueue storage operations.
+	Observer ClientObserver
 }
 
 // InsertRequest allows each item in a batch to have independent options.
@@ -69,13 +72,18 @@ func (c *Client[TTx]) Enqueue(ctx context.Context, args core.JobArgs, opts *core
 	if err != nil {
 		return nil, err
 	}
+	ctx, finish := c.startEnqueue(ctx, []driver.JobInsertParams{params}, false)
 	results, err := c.driver.Executor().JobInsertMany(ctx, []driver.JobInsertParams{params})
 	if err != nil {
+		finish(results, err)
 		return nil, err
 	}
 	if len(results) != 1 {
-		return nil, fmt.Errorf("driver %q returned %d results for one insert", c.driver.Name(), len(results))
+		err = fmt.Errorf("driver %q returned %d results for one insert", c.driver.Name(), len(results))
+		finish(results, err)
+		return nil, err
 	}
+	finish(results, nil)
 	return &results[0], nil
 }
 
@@ -84,20 +92,25 @@ func (c *Client[TTx]) Enqueue(ctx context.Context, args core.JobArgs, opts *core
 // Only available on backends with Capabilities.NativeTx == true.
 func (c *Client[TTx]) EnqueueTx(ctx context.Context, tx TTx, args core.JobArgs, opts *core.InsertOpts) (*driver.JobInsertResult, error) {
 	if !c.driver.Capabilities().NativeTx {
-		return nil, fmt.Errorf("driver %q does not support transactional inserts", c.driver.Name())
+		return nil, fmt.Errorf("%w: driver %q does not support transactional inserts", driver.ErrUnsupported, c.driver.Name())
 	}
 	params, err := c.buildInsertParams(args, opts)
 	if err != nil {
 		return nil, err
 	}
 	etx := c.driver.UnwrapTx(tx)
+	ctx, finish := c.startEnqueue(ctx, []driver.JobInsertParams{params}, true)
 	results, err := etx.JobInsertMany(ctx, []driver.JobInsertParams{params})
 	if err != nil {
+		finish(results, err)
 		return nil, err
 	}
 	if len(results) != 1 {
-		return nil, fmt.Errorf("driver %q returned %d results for one transactional insert", c.driver.Name(), len(results))
+		err = fmt.Errorf("driver %q returned %d results for one transactional insert", c.driver.Name(), len(results))
+		finish(results, err)
+		return nil, err
 	}
+	finish(results, nil)
 	return &results[0], nil
 }
 
@@ -111,13 +124,16 @@ func (c *Client[TTx]) EnqueueBatch(ctx context.Context, requests []InsertRequest
 		}
 		params = append(params, p)
 	}
-	return c.driver.Executor().JobInsertMany(ctx, params)
+	ctx, finish := c.startEnqueue(ctx, params, false)
+	results, err := c.driver.Executor().JobInsertMany(ctx, params)
+	finish(results, err)
+	return results, err
 }
 
 // EnqueueBatchTx inserts jobs with per-item options in an existing transaction.
 func (c *Client[TTx]) EnqueueBatchTx(ctx context.Context, tx TTx, requests []InsertRequest) ([]driver.JobInsertResult, error) {
 	if !c.driver.Capabilities().NativeTx {
-		return nil, fmt.Errorf("driver %q does not support transactional inserts", c.driver.Name())
+		return nil, fmt.Errorf("%w: driver %q does not support transactional inserts", driver.ErrUnsupported, c.driver.Name())
 	}
 	params := make([]driver.JobInsertParams, 0, len(requests))
 	for _, request := range requests {
@@ -127,7 +143,10 @@ func (c *Client[TTx]) EnqueueBatchTx(ctx context.Context, tx TTx, requests []Ins
 		}
 		params = append(params, p)
 	}
-	return c.driver.UnwrapTx(tx).JobInsertMany(ctx, params)
+	ctx, finish := c.startEnqueue(ctx, params, true)
+	results, err := c.driver.UnwrapTx(tx).JobInsertMany(ctx, params)
+	finish(results, err)
+	return results, err
 }
 
 // EnqueueMany inserts multiple jobs in a single batch (non-transactional).
@@ -140,13 +159,16 @@ func (c *Client[TTx]) EnqueueMany(ctx context.Context, args []core.JobArgs, opts
 		}
 		params = append(params, p)
 	}
-	return c.driver.Executor().JobInsertMany(ctx, params)
+	ctx, finish := c.startEnqueue(ctx, params, false)
+	results, err := c.driver.Executor().JobInsertMany(ctx, params)
+	finish(results, err)
+	return results, err
 }
 
 // EnqueueManyTx inserts multiple jobs within an existing transaction.
 func (c *Client[TTx]) EnqueueManyTx(ctx context.Context, tx TTx, args []core.JobArgs, opts *core.InsertOpts) ([]driver.JobInsertResult, error) {
 	if !c.driver.Capabilities().NativeTx {
-		return nil, fmt.Errorf("driver %q does not support transactional inserts", c.driver.Name())
+		return nil, fmt.Errorf("%w: driver %q does not support transactional inserts", driver.ErrUnsupported, c.driver.Name())
 	}
 	params := make([]driver.JobInsertParams, 0, len(args))
 	for _, a := range args {
@@ -157,7 +179,46 @@ func (c *Client[TTx]) EnqueueManyTx(ctx context.Context, tx TTx, args []core.Job
 		params = append(params, p)
 	}
 	etx := c.driver.UnwrapTx(tx)
-	return etx.JobInsertMany(ctx, params)
+	ctx, finish := c.startEnqueue(ctx, params, true)
+	results, err := etx.JobInsertMany(ctx, params)
+	finish(results, err)
+	return results, err
+}
+
+func (c *Client[TTx]) startEnqueue(ctx context.Context, params []driver.JobInsertParams, transactional bool) (context.Context, func([]driver.JobInsertResult, error)) {
+	if c.config.Observer == nil {
+		return ctx, func([]driver.JobInsertResult, error) {}
+	}
+	start := EnqueueStart{Driver: c.driver.Name(), Count: len(params), Transactional: transactional}
+	if len(params) > 0 {
+		start.Queue, start.Kind = params[0].Queue, params[0].Kind
+		for _, param := range params[1:] {
+			if param.Queue != start.Queue {
+				start.Queue = ""
+			}
+			if param.Kind != start.Kind {
+				start.Kind = ""
+			}
+		}
+	}
+	observedCtx, finish := c.config.Observer.StartEnqueue(ctx, start)
+	if observedCtx == nil {
+		observedCtx = ctx
+	}
+	if finish == nil {
+		finish = func(EnqueueFinish) {}
+	}
+	return observedCtx, func(results []driver.JobInsertResult, err error) {
+		outcome := EnqueueFinish{Err: err}
+		for _, result := range results {
+			if result.UniqueSkip {
+				outcome.UniqueSkipped++
+			} else if result.Job != nil {
+				outcome.Inserted++
+			}
+		}
+		finish(outcome)
+	}
 }
 
 // Cancel marks a job as cancelled. The job must be in available or scheduled state.
@@ -250,20 +311,35 @@ func buildUniqueKey(args core.JobArgs, queue string, opts *core.UniqueOpts, now 
 		return "", nil
 	}
 
-	key := args.Kind()
+	canonical := struct {
+		Version     int             `json:"version"`
+		Kind        string          `json:"kind"`
+		Queue       string          `json:"queue,omitempty"`
+		CallerKey   string          `json:"caller_key,omitempty"`
+		Args        json.RawMessage `json:"args,omitempty"`
+		PeriodStart int64           `json:"period_start,omitempty"`
+	}{Version: 2, Kind: args.Kind(), CallerKey: opts.Key}
 	if opts.ByQueue {
-		key += ":" + queue
+		canonical.Queue = queue
 	}
 	if opts.ByArgs {
 		b, err := json.Marshal(args)
 		if err != nil {
 			return "", fmt.Errorf("marshal args for unique key: %w", err)
 		}
-		key += ":" + string(b)
+		canonical.Args = b
 	}
 	if opts.ByPeriod > 0 {
-		window := now.Truncate(opts.ByPeriod)
-		key += ":" + window.Format(time.RFC3339)
+		canonical.PeriodStart = now.Truncate(opts.ByPeriod).UnixNano()
 	}
-	return key, nil
+	payload, err := json.Marshal(canonical)
+	if err != nil {
+		return "", fmt.Errorf("marshal canonical unique key: %w", err)
+	}
+	digest := sha256.Sum256(payload)
+	prefix := "u2_"
+	if opts.Forever {
+		prefix = "uf2_"
+	}
+	return fmt.Sprintf("%s%x", prefix, digest[:]), nil
 }

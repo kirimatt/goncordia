@@ -40,6 +40,8 @@ type Job[T JobArgs] struct {
 	MaxRetry int
 	// CreatedAt is when the job was first enqueued.
 	CreatedAt time.Time
+	// RunAt is when the job became eligible to run.
+	RunAt time.Time
 	// WorkerID identifies the worker pool that claimed this attempt.
 	WorkerID string
 	// Tags are optional labels attached to the job at enqueue time.
@@ -79,10 +81,16 @@ type UniqueOpts struct {
 	// This rule is identical across all drivers.
 	// ByArgs deduplicates based on the job arguments (JSON equality).
 	ByArgs bool
+	// Key is an optional caller-defined deduplication key. It is combined with
+	// the job kind and other enabled dimensions before hashing.
+	Key string
 	// ByQueue includes the queue name in the uniqueness key.
 	ByQueue bool
-	// ByPeriod deduplicates within a rolling time window.
+	// ByPeriod deduplicates within fixed UTC windows aligned to this duration.
 	ByPeriod time.Duration
+	// Forever retains the uniqueness record after the job reaches a terminal
+	// state. Explicitly deleting the job releases it.
+	Forever bool
 }
 
 // WorkerOpts configures default behavior for a Worker registration.

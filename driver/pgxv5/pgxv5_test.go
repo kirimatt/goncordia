@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -19,6 +20,35 @@ import (
 	"github.com/kirimatt/goncordia/driver/drivertest"
 	pgxdriver "github.com/kirimatt/goncordia/driver/pgxv5"
 )
+
+func TestPgxv5_ConcurrentMigrateAndOwnership(t *testing.T) {
+	skipIfNoDocker(t)
+	pool, cleanup := newTestPool(t)
+	defer cleanup()
+	drivers := []*pgxdriver.Driver{pgxdriver.New(pool), pgxdriver.New(pool)}
+	var wg sync.WaitGroup
+	errs := make(chan error, 8)
+	for i := range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs <- drivers[i%len(drivers)].Migrate(context.Background())
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Errorf("concurrent migrate: %v", err)
+		}
+	}
+	if err := drivers[0].Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.Ping(context.Background()); err != nil {
+		t.Fatalf("driver closed caller-owned pool: %v", err)
+	}
+}
 
 // skipIfNoDocker skips the test if Docker is not available.
 func skipIfNoDocker(t *testing.T) {

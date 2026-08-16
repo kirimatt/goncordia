@@ -9,7 +9,137 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-No changes yet.
+---
+
+## [v0.16.0] — 2026-08-16
+
+### Added
+- Fenced worker state transitions using the expected worker ID and attempt
+  number, preventing a rescued stale worker from completing a newer claim.
+- Claim heartbeats on every built-in driver, driven by the injected clock.
+- `WorkerConfig.MaxPending` to bound prefetched jobs independently of active
+  execution concurrency.
+- `WorkerConfig.HeartbeatInterval`, defaulting to one third of
+  `StuckJobTimeout`.
+- Stable driver error categories, beginning with `driver.ErrUnsupported` for
+  `errors.Is` checks.
+- Opaque versioned job and queue cursors plus `driver.JobPage` and
+  `driver.QueuePage` response types.
+- A portable `Maintenance` service with retention pruning, partial-result bulk
+  retry/cancel/delete, and paginated dead-letter inspection/replay.
+- Configurable symmetric retry jitter with an injectable deterministic random
+  source.
+- Enqueue/worker observer hooks and OpenTelemetry enqueue spans, enqueue
+  duration, scheduled-lag, heartbeat, and rescued-lease metrics.
+- Worker-returned `core.Discard`, `core.RetryAfter`, and `core.RetryAt`
+  directives.
+- `UniqueOpts.Key` for caller-defined deduplication dimensions.
+- `UniqueOpts.Forever` for durable idempotency keys that survive terminal job
+  states until explicit deletion.
+- `core.Cron` for validated standard five-field cron expressions evaluated in
+  an explicit time zone with daylight-saving support.
+- Durable periodic job IDs, persisted compare-and-swap schedule cursors, and
+  `CronCatchUpAll`, `CronCatchUpLatest`, and `CronSkipMissed` policies.
+- Admin read-only mode, per-operation authorization hooks, and configurable job
+  response redaction with secure payload-hiding defaults.
+- Reproducible CI/release checks, a core-package coverage floor, cursor fuzz
+  tests, automated changelog-derived GitHub releases, and grouped dependency
+  update automation.
+
+### Changed
+- Pipeline and per-kind waiters no longer occupy global execution slots.
+- Worker cancellation yields an interrupted claim without recording an error
+  or consuming an attempt.
+- Ready-job selection is standardized as `priority DESC, run_at ASC,
+  created_at ASC, id ASC` across built-in drivers.
+- Redis completion/retry/yield transitions now use `WATCH`/`MULTI` so claim
+  validation and state changes are atomic.
+- The memory driver no longer advertises fake transaction support, and
+  non-transactional executors return `driver.ErrUnsupported` from `Begin`.
+- Exponential retry calculation is integer-based and overflow-safe for
+  arbitrarily large attempt numbers.
+- Unique jobs now use bounded, versioned SHA-256 canonical keys. Uniqueness is
+  global by default; `UniqueOpts.ByQueue` explicitly scopes it per queue, and
+  `ByPeriod` uses fixed UTC-aligned windows.
+- Redis and DynamoDB now create a job and its uniqueness reservation atomically.
+- Every built-in driver enforces the same global canonical-key contract;
+  ClickHouse remains best-effort under concurrent inserts.
+- Cron leader resignation is ownership-safe on every built-in driver, and the
+  scheduler releases its lease during shutdown without reusing the cancelled
+  run context.
+- Durable cron occurrences use permanent idempotency keys and only advance their
+  persisted cursor after enqueue succeeds or is recognized as a duplicate.
+- Administrative job ordering now uses the composite `created_at DESC, id DESC`
+  cursor on every backend; queues are consistently ordered by name.
+- The admin jobs and queues endpoints return `items`, `next_cursor`, and
+  `has_more` instead of bare arrays.
+- Built-in drivers classify missing records, invalid state transitions, and
+  stale fenced claims with `ErrNotFound`, `ErrConflict`, and `ErrStaleClaim`.
+- Admin API errors map invalid cursors to 400, missing records to 404, conflicts
+  and stale claims to 409, and unsupported operations to 501.
+- Drivers no longer close caller-supplied clients, pools, connections,
+  databases, or sessions; resource ownership is consistently retained by the
+  caller.
+- SQL migrations are serialized across application instances with PostgreSQL/
+  MySQL advisory locks and a SQLite immediate transaction. Concurrent DynamoDB
+  migration calls now wait for tables another instance is creating.
+- Panic failures now retain their runtime stack in `AttemptError.Trace` across
+  every built-in backend. Queue-time metrics measure only time after a job is
+  eligible, excluding intentional scheduled delay.
+- Admin mutations require an explicit action confirmation header. Liveness and
+  storage readiness are separate probes, metrics failures return 503 without
+  partial samples, and dashboard assets now comply with a strict CSP without
+  inline scripts or styles.
+- Updated the AWS SDK, Firestore, ClickHouse, pgx, Redis, Testcontainers,
+  OpenTelemetry, gRPC, GORM, and modernc SQLite dependency families in isolated
+  batches validated against their affected driver suites.
+
+### Testing
+- Driver conformance now covers stale-worker fencing, heartbeat protection, and
+  global priority selection beyond a storage-ordered candidate subset, plus
+  uniqueness across queues, durable uniqueness after cancellation, and
+  ownership-safe leader resignation, opaque pagination without duplicates, and
+  invalid cursor classification.
+- Added deterministic worker tests for heartbeat renewal, cancellation yield,
+  bounded pending work, and pipeline/global-concurrency isolation.
+- Added concurrent migration tests for pgx, PostgreSQL, MySQL, and SQLite, plus
+  ownership checks proving `Driver.Close` leaves supplied resources usable.
+- Added deterministic maintenance tests driven entirely by an injected manual
+  clock, including retention cutoffs, partial bulk failures, and dead-letter
+  state validation.
+- Cross-driver conformance now verifies attempt stack-trace serialization, and
+  retry jitter tests use an injected random source.
+- Added admin security and failure-mode tests for authorization, read-only mode,
+  payload redaction, explicit mutation confirmation, independent probes, strict
+  CSP assets, and all-or-nothing metrics output.
+- CI actions and analysis tools are pinned to immutable revisions or explicit
+  versions; release tags must match the latest dated changelog section and the
+  README installation version.
+
+### Upgrade notes
+- SQL users must run `Migrate` before starting workers. Migration 004 replaces
+  the `(queue, unique_key)` active-job index with a global `unique_key` index.
+- MongoDB users must run `Migrate` to create the global v2 unique index.
+  Cassandra users must run `Migrate` to create `goncordia_uniq_v2`.
+- Existing active jobs with the same legacy key in different queues must be
+  completed, cancelled, or otherwise reconciled before the SQL or MongoDB
+  global unique index can be created.
+- Unique keys generated by this release intentionally differ from legacy keys;
+  deploy updated producers only after the schema migration is complete.
+- SQL users must also apply migration 005 for `goncordia_schedule_cursors`.
+  Cassandra and ClickHouse users must call `Migrate`; DynamoDB migration creates
+  the new `goncordia_schedule_cursors` table. Redis, MongoDB, Firestore, and the
+  memory driver create cursor storage lazily.
+- Cassandra compensates failed writes after reserving a key, but a process crash
+  between the cross-partition writes can leave an orphaned reservation in
+  `goncordia_uniq_v2`. ClickHouse uniqueness remains best-effort.
+- Admin API consumers must read list results from the `items` field and follow
+  `next_cursor`; the previous bare-array response is replaced by a page envelope.
+- Callers that previously relied on `Driver.Close` to close a supplied resource
+  must now close that resource directly.
+- Admin API mutation clients must send `X-Goncordia-Confirm` with the action
+  name. Job arguments, unique keys, and panic traces are now redacted by default;
+  install an explicit `WithJobRedactor` policy if trusted clients require them.
 
 ---
 
@@ -295,6 +425,12 @@ No changes yet.
 - `Clock` interface + `MockClock` for deterministic time control in tests
 - MIT License
 
+[v0.16.0]: https://github.com/kirimatt/goncordia/releases/tag/v0.16.0
+[v0.15.1]: https://github.com/kirimatt/goncordia/releases/tag/v0.15.1
+[v0.15.0]: https://github.com/kirimatt/goncordia/releases/tag/v0.15.0
+[v0.14.0]: https://github.com/kirimatt/goncordia/releases/tag/v0.14.0
+[v0.13.0]: https://github.com/kirimatt/goncordia/releases/tag/v0.13.0
+[v0.12.0]: https://github.com/kirimatt/goncordia/releases/tag/v0.12.0
 [v0.11.0]: https://github.com/kirimatt/goncordia/releases/tag/v0.11.0
 [v0.10.0]: https://github.com/kirimatt/goncordia/releases/tag/v0.10.0
 [v0.9.0]: https://github.com/kirimatt/goncordia/releases/tag/v0.9.0

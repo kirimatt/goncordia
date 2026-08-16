@@ -27,7 +27,7 @@ type executor struct {
 }
 
 func (e *executor) Begin(_ context.Context) (driver.ExecutorTx, error) {
-	return &txExecutor{executor: *e}, nil
+	return nil, fmt.Errorf("%w: dynamodb transactions", driver.ErrUnsupported)
 }
 
 func (e *executor) JobInsertMany(ctx context.Context, params []driver.JobInsertParams) ([]driver.JobInsertResult, error) {
@@ -47,6 +47,9 @@ func (e *executor) JobFetchBatch(ctx context.Context, params driver.FetchParams)
 }
 func (e *executor) JobRescueStuck(ctx context.Context, params driver.JobRescueParams) (int64, error) {
 	return jobRescueStuck(ctx, e.svc, params)
+}
+func (e *executor) JobHeartbeat(ctx context.Context, params driver.JobHeartbeatParams) (bool, error) {
+	return jobHeartbeat(ctx, e.svc, params)
 }
 func (e *executor) JobSetStateIfRunning(ctx context.Context, params driver.JobSetStateParams) error {
 	return jobSetStateIfRunning(ctx, e.svc, e.clk, params)
@@ -75,8 +78,14 @@ func (e *executor) QueueList(ctx context.Context, params driver.QueueListParams)
 func (e *executor) LeaderAttemptElect(ctx context.Context, params driver.LeaderElectParams) (bool, error) {
 	return leaderAttemptElect(ctx, e.svc, e.clk, params)
 }
-func (e *executor) LeaderResign(ctx context.Context, name string) error {
-	return leaderResign(ctx, e.svc, name)
+func (e *executor) LeaderResign(ctx context.Context, params driver.LeaderResignParams) error {
+	return leaderResign(ctx, e.svc, params)
+}
+func (e *executor) ScheduleCursorGetOrCreate(ctx context.Context, params driver.ScheduleCursorCreateParams) (driver.ScheduleCursorResult, error) {
+	return scheduleCursorGetOrCreate(ctx, e.svc, params)
+}
+func (e *executor) ScheduleCursorAdvance(ctx context.Context, params driver.ScheduleCursorAdvanceParams) (bool, error) {
+	return scheduleCursorAdvance(ctx, e.svc, params)
 }
 
 // ---- txExecutor (no-op tx — DynamoDB has no cross-table transactions) ----
@@ -124,8 +133,14 @@ func (t *txExecutor) QueueList(ctx context.Context, params driver.QueueListParam
 func (t *txExecutor) LeaderAttemptElect(ctx context.Context, params driver.LeaderElectParams) (bool, error) {
 	return leaderAttemptElect(ctx, t.svc, t.clk, params)
 }
-func (t *txExecutor) LeaderResign(ctx context.Context, name string) error {
-	return leaderResign(ctx, t.svc, name)
+func (t *txExecutor) LeaderResign(ctx context.Context, params driver.LeaderResignParams) error {
+	return leaderResign(ctx, t.svc, params)
+}
+func (t *txExecutor) ScheduleCursorGetOrCreate(ctx context.Context, params driver.ScheduleCursorCreateParams) (driver.ScheduleCursorResult, error) {
+	return scheduleCursorGetOrCreate(ctx, t.svc, params)
+}
+func (t *txExecutor) ScheduleCursorAdvance(ctx context.Context, params driver.ScheduleCursorAdvanceParams) (bool, error) {
+	return scheduleCursorAdvance(ctx, t.svc, params)
 }
 
 // ---- job row ----
@@ -198,6 +213,7 @@ type storedError struct {
 	At      int64  `json:"at_ms"`
 	Attempt int    `json:"attempt"`
 	Error   string `json:"error"`
+	Trace   string `json:"trace,omitempty"`
 }
 
 func marshalErrors(errs []driver.AttemptError) string {
@@ -206,7 +222,7 @@ func marshalErrors(errs []driver.AttemptError) string {
 	}
 	out := make([]storedError, len(errs))
 	for i, e := range errs {
-		out[i] = storedError{At: e.At.UnixMilli(), Attempt: e.Attempt, Error: e.Error}
+		out[i] = storedError{At: e.At.UnixMilli(), Attempt: e.Attempt, Error: e.Error, Trace: e.Trace}
 	}
 	b, _ := json.Marshal(out)
 	return string(b)
@@ -222,7 +238,7 @@ func unmarshalErrors(s string) []driver.AttemptError {
 	}
 	out := make([]driver.AttemptError, len(stored))
 	for i, e := range stored {
-		out[i] = driver.AttemptError{At: time.UnixMilli(e.At).UTC(), Attempt: e.Attempt, Error: e.Error}
+		out[i] = driver.AttemptError{At: time.UnixMilli(e.At).UTC(), Attempt: e.Attempt, Error: e.Error, Trace: e.Trace}
 	}
 	return out
 }
@@ -270,28 +286,6 @@ func jobInsertMany(ctx context.Context, svc *dynamodb.Client, clk clock.Clock, p
 			tags = []string{}
 		}
 
-		// Unique-key check via conditional PutItem.
-		if p.UniqueKey != "" {
-			pk := p.Queue + "#" + p.UniqueKey
-			_, err := svc.PutItem(ctx, &dynamodb.PutItemInput{
-				TableName: aws.String(tableUniq),
-				Item: map[string]types.AttributeValue{
-					"pk":     &types.AttributeValueMemberS{Value: pk},
-					"job_id": &types.AttributeValueMemberS{Value: id},
-				},
-				ConditionExpression:      aws.String("attribute_not_exists(#pk)"),
-				ExpressionAttributeNames: map[string]string{"#pk": "pk"},
-			})
-			if err != nil {
-				var cce *types.ConditionalCheckFailedException
-				if errors.As(err, &cce) {
-					results[i] = driver.JobInsertResult{UniqueSkip: true}
-					continue
-				}
-				return nil, fmt.Errorf("unique key check: %w", err)
-			}
-		}
-
 		j := dynamoJob{
 			ID:         id,
 			Queue:      p.Queue,
@@ -316,9 +310,30 @@ func jobInsertMany(ctx context.Context, svc *dynamodb.Client, clk clock.Clock, p
 		if err != nil {
 			return nil, err
 		}
-		if _, err := svc.PutItem(ctx, &dynamodb.PutItemInput{
-			TableName: aws.String(tableJobs),
-			Item:      item,
+		if p.UniqueKey != "" {
+			_, err = svc.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{
+				TransactItems: []types.TransactWriteItem{
+					{Put: &types.Put{TableName: aws.String(tableJobs), Item: item}},
+					{Put: &types.Put{
+						TableName: aws.String(tableUniq),
+						Item: map[string]types.AttributeValue{
+							"pk": &types.AttributeValueMemberS{Value: p.UniqueKey}, "job_id": &types.AttributeValueMemberS{Value: id},
+						},
+						ConditionExpression:      aws.String("attribute_not_exists(#pk)"),
+						ExpressionAttributeNames: map[string]string{"#pk": "pk"},
+					}},
+				},
+			})
+			if err != nil {
+				var cancelled *types.TransactionCanceledException
+				if errors.As(err, &cancelled) {
+					results[i] = driver.JobInsertResult{UniqueSkip: true}
+					continue
+				}
+				return nil, fmt.Errorf("insert unique job: %w", err)
+			}
+		} else if _, err := svc.PutItem(ctx, &dynamodb.PutItemInput{
+			TableName: aws.String(tableJobs), Item: item,
 		}); err != nil {
 			return nil, fmt.Errorf("insert job: %w", err)
 		}
@@ -355,12 +370,21 @@ func jobGetByID(ctx context.Context, svc *dynamodb.Client, id string) (*driver.J
 		return nil, err
 	}
 	if j == nil {
-		return nil, nil
+		return nil, fmt.Errorf("%w: job %q", driver.ErrNotFound, id)
 	}
 	return jobFromDynamo(*j), nil
 }
 
 func scanJobs(ctx context.Context, svc *dynamodb.Client, params driver.JobListParams) ([]driver.JobRow, error) {
+	var cursorAt time.Time
+	var cursorID string
+	if params.Cursor != "" {
+		var err error
+		cursorAt, cursorID, err = driver.DecodeJobCursor(params.Cursor)
+		if err != nil {
+			return nil, err
+		}
+	}
 	var startKey map[string]types.AttributeValue
 	var rows []driver.JobRow
 	for {
@@ -373,10 +397,11 @@ func scanJobs(ctx context.Context, svc *dynamodb.Client, params driver.JobListPa
 			if attributevalue.UnmarshalMap(item, &job) != nil {
 				continue
 			}
-			if params.Queue != "" && job.Queue != params.Queue || params.State != "" && driver.JobState(job.State) != params.State || params.Kind != "" && job.Kind != params.Kind || params.Cursor != "" && job.ID >= params.Cursor {
+			row := jobFromDynamo(job)
+			if params.Queue != "" && job.Queue != params.Queue || params.State != "" && driver.JobState(job.State) != params.State || params.Kind != "" && job.Kind != params.Kind || params.Cursor != "" && !driver.JobFollowsCursor(*row, cursorAt, cursorID) {
 				continue
 			}
-			rows = append(rows, *jobFromDynamo(job))
+			rows = append(rows, *row)
 		}
 		if len(out.LastEvaluatedKey) == 0 {
 			break
@@ -434,39 +459,54 @@ func jobFetchBatch(ctx context.Context, svc *dynamodb.Client, clk clock.Clock, p
 
 	candidates := make([]dynamoJob, 0, params.Limit*6)
 	for _, state := range []driver.JobState{driver.JobStateAvailable, driver.JobStateScheduled} {
-		out, queryErr := svc.Query(ctx, &dynamodb.QueryInput{
-			TableName:              aws.String(tableJobs),
-			IndexName:              aws.String(gsiQueueState),
-			KeyConditionExpression: aws.String("#qs = :qs AND run_at <= :now"),
-			ExpressionAttributeNames: map[string]string{
-				"#qs": "queue_state",
-			},
-			ExpressionAttributeValues: map[string]types.AttributeValue{
-				":qs":  &types.AttributeValueMemberS{Value: qsKey(params.Queue, string(state))},
-				":now": &types.AttributeValueMemberS{Value: nowStr},
-			},
-			Limit: aws.Int32(int32(params.Limit * 3)),
-		})
-		if queryErr != nil {
-			return nil, fmt.Errorf("query %s jobs: %w", state, queryErr)
-		}
-		for _, item := range out.Items {
-			var j dynamoJob
-			if err := attributevalue.UnmarshalMap(item, &j); err != nil {
-				continue
+		var startKey map[string]types.AttributeValue
+		for {
+			out, queryErr := svc.Query(ctx, &dynamodb.QueryInput{
+				TableName:              aws.String(tableJobs),
+				IndexName:              aws.String(gsiQueueState),
+				KeyConditionExpression: aws.String("#qs = :qs AND run_at <= :now"),
+				ExpressionAttributeNames: map[string]string{
+					"#qs": "queue_state",
+				},
+				ExpressionAttributeValues: map[string]types.AttributeValue{
+					":qs":  &types.AttributeValueMemberS{Value: qsKey(params.Queue, string(state))},
+					":now": &types.AttributeValueMemberS{Value: nowStr},
+				},
+				ExclusiveStartKey: startKey,
+			})
+			if queryErr != nil {
+				return nil, fmt.Errorf("query %s jobs: %w", state, queryErr)
 			}
-			candidates = append(candidates, j)
+			for _, item := range out.Items {
+				var j dynamoJob
+				if err := attributevalue.UnmarshalMap(item, &j); err != nil {
+					continue
+				}
+				candidates = append(candidates, j)
+			}
+			if len(out.LastEvaluatedKey) == 0 {
+				break
+			}
+			startKey = out.LastEvaluatedKey
 		}
 	}
 
-	// Sort: earliest run_at first, then highest priority first within same run_at.
+	// Portable order: highest priority, then earliest run_at/created_at/id.
 	sort.Slice(candidates, func(i, k int) bool {
-		ti := parseTime(candidates[i].RunAt)
-		tk := parseTime(candidates[k].RunAt)
-		if ti.Equal(tk) {
+		if candidates[i].Priority != candidates[k].Priority {
 			return candidates[i].Priority > candidates[k].Priority
 		}
-		return ti.Before(tk)
+		ti := parseTime(candidates[i].RunAt)
+		tk := parseTime(candidates[k].RunAt)
+		if !ti.Equal(tk) {
+			return ti.Before(tk)
+		}
+		ci := parseTime(candidates[i].CreatedAt)
+		ck := parseTime(candidates[k].CreatedAt)
+		if !ci.Equal(ck) {
+			return ci.Before(ck)
+		}
+		return candidates[i].ID < candidates[k].ID
 	})
 
 	qsRunning := qsKey(params.Queue, string(driver.JobStateRunning))
@@ -598,6 +638,35 @@ func jobRescueStuck(ctx context.Context, svc *dynamodb.Client, params driver.Job
 	}
 }
 
+func jobHeartbeat(ctx context.Context, svc *dynamodb.Client, params driver.JobHeartbeatParams) (bool, error) {
+	_, err := svc.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName: aws.String(tableJobs),
+		Key: map[string]types.AttributeValue{
+			"id": &types.AttributeValueMemberS{Value: params.ID},
+		},
+		UpdateExpression:    aws.String("SET #aat=:at, #ver=#ver+:one"),
+		ConditionExpression: aws.String("#state=:running AND #wid=:wid AND #anum=:anum"),
+		ExpressionAttributeNames: map[string]string{
+			"#aat": "attempted_at", "#ver": "version", "#state": "state", "#wid": "worker_id", "#anum": "attempt_num",
+		},
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":at":      &types.AttributeValueMemberS{Value: params.At.UTC().Format(timeFmt)},
+			":one":     &types.AttributeValueMemberN{Value: "1"},
+			":running": &types.AttributeValueMemberS{Value: string(driver.JobStateRunning)},
+			":wid":     &types.AttributeValueMemberS{Value: params.WorkerID},
+			":anum":    &types.AttributeValueMemberN{Value: strconv.Itoa(params.Attempt)},
+		},
+	})
+	if err != nil {
+		var conditional *types.ConditionalCheckFailedException
+		if errors.As(err, &conditional) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
 // ---- JobSetStateIfRunning ----
 
 func jobSetStateIfRunning(ctx context.Context, svc *dynamodb.Client, clk clock.Clock, params driver.JobSetStateParams) error {
@@ -605,8 +674,8 @@ func jobSetStateIfRunning(ctx context.Context, svc *dynamodb.Client, clk clock.C
 	if err != nil {
 		return err
 	}
-	if j == nil || j.State != string(driver.JobStateRunning) {
-		return nil
+	if j == nil || j.State != string(driver.JobStateRunning) || !params.MatchesClaim(j.WorkerID, j.AttemptNum) {
+		return fmt.Errorf("%w: job %q", driver.ErrStaleClaim, params.ID)
 	}
 
 	if params.Yield {
@@ -621,7 +690,7 @@ func jobSetStateIfRunning(ctx context.Context, svc *dynamodb.Client, clk clock.C
 					` REMOVE #aat` +
 					` ADD #anum :neg_one`,
 			),
-			ConditionExpression: aws.String("#state = :running"),
+			ConditionExpression: aws.String("#state = :running AND #ver = :expected_ver"),
 			ExpressionAttributeNames: map[string]string{
 				"#state": "state",
 				"#qs":    "queue_state",
@@ -631,18 +700,19 @@ func jobSetStateIfRunning(ctx context.Context, svc *dynamodb.Client, clk clock.C
 				"#ver":   "version",
 			},
 			ExpressionAttributeValues: map[string]types.AttributeValue{
-				":avail":   &types.AttributeValueMemberS{Value: string(driver.JobStateAvailable)},
-				":qs":      &types.AttributeValueMemberS{Value: qsAvail},
-				":empty":   &types.AttributeValueMemberS{Value: ""},
-				":one":     &types.AttributeValueMemberN{Value: "1"},
-				":neg_one": &types.AttributeValueMemberN{Value: "-1"},
-				":running": &types.AttributeValueMemberS{Value: string(driver.JobStateRunning)},
+				":avail":        &types.AttributeValueMemberS{Value: string(driver.JobStateAvailable)},
+				":qs":           &types.AttributeValueMemberS{Value: qsAvail},
+				":empty":        &types.AttributeValueMemberS{Value: ""},
+				":one":          &types.AttributeValueMemberN{Value: "1"},
+				":neg_one":      &types.AttributeValueMemberN{Value: "-1"},
+				":running":      &types.AttributeValueMemberS{Value: string(driver.JobStateRunning)},
+				":expected_ver": &types.AttributeValueMemberN{Value: strconv.FormatInt(j.Version, 10)},
 			},
 		})
 		if err != nil {
 			var cce *types.ConditionalCheckFailedException
 			if errors.As(err, &cce) {
-				return nil
+				return fmt.Errorf("%w: job %q", driver.ErrStaleClaim, params.ID)
 			}
 		}
 		return err
@@ -651,11 +721,15 @@ func jobSetStateIfRunning(ctx context.Context, svc *dynamodb.Client, clk clock.C
 	now := clk.Now()
 	newErrors := unmarshalErrors(j.ErrorsJSON)
 	if params.Err != nil {
-		newErrors = append(newErrors, driver.AttemptError{
+		stored := driver.AttemptError{
 			At:      now,
 			Attempt: j.AttemptNum,
 			Error:   *params.Err,
-		})
+		}
+		if params.Trace != nil {
+			stored.Trace = *params.Trace
+		}
+		newErrors = append(newErrors, stored)
 	}
 	errJSON := marshalErrors(newErrors)
 
@@ -668,10 +742,11 @@ func jobSetStateIfRunning(ctx context.Context, svc *dynamodb.Client, clk clock.C
 		"#ver":   "version",
 	}
 	exprVals := map[string]types.AttributeValue{
-		":empty":   &types.AttributeValueMemberS{Value: ""},
-		":errj":    &types.AttributeValueMemberS{Value: errJSON},
-		":one":     &types.AttributeValueMemberN{Value: "1"},
-		":running": &types.AttributeValueMemberS{Value: string(driver.JobStateRunning)},
+		":empty":        &types.AttributeValueMemberS{Value: ""},
+		":errj":         &types.AttributeValueMemberS{Value: errJSON},
+		":one":          &types.AttributeValueMemberN{Value: "1"},
+		":running":      &types.AttributeValueMemberS{Value: string(driver.JobStateRunning)},
+		":expected_ver": &types.AttributeValueMemberN{Value: strconv.FormatInt(j.Version, 10)},
 	}
 
 	if params.State == driver.JobStateRetryable {
@@ -698,22 +773,22 @@ func jobSetStateIfRunning(ctx context.Context, svc *dynamodb.Client, clk clock.C
 			"id": &types.AttributeValueMemberS{Value: params.ID},
 		},
 		UpdateExpression:          aws.String(updateExpr),
-		ConditionExpression:       aws.String("#state = :running"),
+		ConditionExpression:       aws.String("#state = :running AND #ver = :expected_ver"),
 		ExpressionAttributeNames:  exprNames,
 		ExpressionAttributeValues: exprVals,
 	})
 	if err != nil {
 		var cce *types.ConditionalCheckFailedException
 		if errors.As(err, &cce) {
-			return nil
+			return fmt.Errorf("%w: job %q", driver.ErrStaleClaim, params.ID)
 		}
 		return err
 	}
-	if params.State != driver.JobStateRetryable && j.UniqueKey != "" {
+	if params.State != driver.JobStateRetryable && j.UniqueKey != "" && !driver.IsPermanentUniqueKey(j.UniqueKey) {
 		_, err = svc.DeleteItem(ctx, &dynamodb.DeleteItemInput{
 			TableName: aws.String(tableUniq),
 			Key: map[string]types.AttributeValue{
-				"pk": &types.AttributeValueMemberS{Value: j.Queue + "#" + j.UniqueKey},
+				"pk": &types.AttributeValueMemberS{Value: j.UniqueKey},
 			},
 		})
 		return err
@@ -729,10 +804,10 @@ func jobCancel(ctx context.Context, svc *dynamodb.Client, clk clock.Clock, id st
 		return err
 	}
 	if j == nil {
-		return fmt.Errorf("job %q not found", id)
+		return fmt.Errorf("%w: job %q", driver.ErrNotFound, id)
 	}
 	if j.State != string(driver.JobStateAvailable) && j.State != string(driver.JobStateScheduled) {
-		return fmt.Errorf("job %q is in state %s, can only cancel available/scheduled", id, j.State)
+		return fmt.Errorf("%w: job %q is in state %s, can only cancel available/scheduled", driver.ErrConflict, id, j.State)
 	}
 
 	now := clk.Now()
@@ -763,16 +838,16 @@ func jobCancel(ctx context.Context, svc *dynamodb.Client, clk clock.Clock, id st
 	if err != nil {
 		var cce *types.ConditionalCheckFailedException
 		if errors.As(err, &cce) {
-			return nil
+			return fmt.Errorf("%w: job %q changed before cancellation", driver.ErrConflict, id)
 		}
 		return err
 	}
 
-	if j.UniqueKey != "" {
+	if j.UniqueKey != "" && !driver.IsPermanentUniqueKey(j.UniqueKey) {
 		_, _ = svc.DeleteItem(ctx, &dynamodb.DeleteItemInput{
 			TableName: aws.String(tableUniq),
 			Key: map[string]types.AttributeValue{
-				"pk": &types.AttributeValueMemberS{Value: j.Queue + "#" + j.UniqueKey},
+				"pk": &types.AttributeValueMemberS{Value: j.UniqueKey},
 			},
 		})
 	}
@@ -787,7 +862,7 @@ func jobDelete(ctx context.Context, svc *dynamodb.Client, id string) error {
 		return err
 	}
 	if j == nil {
-		return nil
+		return fmt.Errorf("%w: job %q", driver.ErrNotFound, id)
 	}
 	if _, err := svc.DeleteItem(ctx, &dynamodb.DeleteItemInput{
 		TableName: aws.String(tableJobs),
@@ -801,7 +876,7 @@ func jobDelete(ctx context.Context, svc *dynamodb.Client, id string) error {
 		_, _ = svc.DeleteItem(ctx, &dynamodb.DeleteItemInput{
 			TableName: aws.String(tableUniq),
 			Key: map[string]types.AttributeValue{
-				"pk": &types.AttributeValueMemberS{Value: j.Queue + "#" + j.UniqueKey},
+				"pk": &types.AttributeValueMemberS{Value: j.UniqueKey},
 			},
 		})
 	}
@@ -816,7 +891,7 @@ func jobReschedule(ctx context.Context, svc *dynamodb.Client, params driver.Resc
 		return err
 	}
 	if j == nil {
-		return fmt.Errorf("job %q not found", params.ID)
+		return fmt.Errorf("%w: job %q", driver.ErrNotFound, params.ID)
 	}
 	_, err = svc.UpdateItem(ctx, &dynamodb.UpdateItemInput{
 		TableName: aws.String(tableJobs),
@@ -874,7 +949,7 @@ func queueGet(ctx context.Context, svc *dynamodb.Client, name string) (*driver.Q
 		return nil, err
 	}
 	if out.Item == nil {
-		return nil, fmt.Errorf("queue %q not found", name)
+		return nil, fmt.Errorf("%w: queue %q", driver.ErrNotFound, name)
 	}
 	return itemToQueueRow(out.Item, name), nil
 }
@@ -900,26 +975,44 @@ func queueSetPaused(ctx context.Context, svc *dynamodb.Client, clk clock.Clock, 
 }
 
 func queueList(ctx context.Context, svc *dynamodb.Client, params driver.QueueListParams) ([]*driver.QueueRow, error) {
-	limit := int32(params.Limit)
-	if limit <= 0 {
+	cursor := ""
+	if params.Cursor != "" {
+		var err error
+		cursor, err = driver.DecodeQueueCursor(params.Cursor)
+		if err != nil {
+			return nil, err
+		}
+	}
+	limit := params.Limit
+	if limit <= 0 || limit > 1000 {
 		limit = 100
 	}
-	out, err := svc.Scan(ctx, &dynamodb.ScanInput{
-		TableName: aws.String(tableQueues),
-		Limit:     aws.Int32(limit),
-	})
-	if err != nil {
-		return nil, err
-	}
-	rows := make([]*driver.QueueRow, 0, len(out.Items))
-	for _, item := range out.Items {
-		name := ""
-		if v, ok := item["name"]; ok {
-			if sv, ok := v.(*types.AttributeValueMemberS); ok {
-				name = sv.Value
+	var startKey map[string]types.AttributeValue
+	var rows []*driver.QueueRow
+	for {
+		out, err := svc.Scan(ctx, &dynamodb.ScanInput{TableName: aws.String(tableQueues), ExclusiveStartKey: startKey})
+		if err != nil {
+			return nil, err
+		}
+		for _, item := range out.Items {
+			name := ""
+			if v, ok := item["name"]; ok {
+				if sv, ok := v.(*types.AttributeValueMemberS); ok {
+					name = sv.Value
+				}
+			}
+			if name > cursor {
+				rows = append(rows, itemToQueueRow(item, name))
 			}
 		}
-		rows = append(rows, itemToQueueRow(item, name))
+		if len(out.LastEvaluatedKey) == 0 {
+			break
+		}
+		startKey = out.LastEvaluatedKey
+	}
+	sort.Slice(rows, func(i, j int) bool { return rows[i].Name < rows[j].Name })
+	if len(rows) > limit {
+		rows = rows[:limit]
 	}
 	return rows, nil
 }
@@ -980,14 +1073,76 @@ func leaderAttemptElect(ctx context.Context, svc *dynamodb.Client, clk clock.Clo
 	return true, nil
 }
 
-func leaderResign(ctx context.Context, svc *dynamodb.Client, name string) error {
+func leaderResign(ctx context.Context, svc *dynamodb.Client, params driver.LeaderResignParams) error {
 	_, err := svc.DeleteItem(ctx, &dynamodb.DeleteItemInput{
 		TableName: aws.String(tableLeaders),
 		Key: map[string]types.AttributeValue{
-			"name": &types.AttributeValueMemberS{Value: name},
+			"name": &types.AttributeValueMemberS{Value: params.Name},
+		},
+		ConditionExpression: aws.String("worker_id = :wid"),
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":wid": &types.AttributeValueMemberS{Value: params.WorkerID},
 		},
 	})
+	var conflict *types.ConditionalCheckFailedException
+	if errors.As(err, &conflict) {
+		return nil
+	}
 	return err
+}
+
+func scheduleCursorGetOrCreate(ctx context.Context, svc *dynamodb.Client, params driver.ScheduleCursorCreateParams) (driver.ScheduleCursorResult, error) {
+	initial := params.InitialAt.UTC().Format(timeFmt)
+	created := true
+	_, err := svc.PutItem(ctx, &dynamodb.PutItemInput{
+		TableName: aws.String(tableCursors),
+		Item: map[string]types.AttributeValue{
+			"id": &types.AttributeValueMemberS{Value: params.ID}, "cursor_at": &types.AttributeValueMemberS{Value: initial},
+		},
+		ConditionExpression:      aws.String("attribute_not_exists(#id)"),
+		ExpressionAttributeNames: map[string]string{"#id": "id"},
+	})
+	if err != nil {
+		var conflict *types.ConditionalCheckFailedException
+		if !errors.As(err, &conflict) {
+			return driver.ScheduleCursorResult{}, err
+		}
+		created = false
+	}
+	out, err := svc.GetItem(ctx, &dynamodb.GetItemInput{
+		TableName:      aws.String(tableCursors),
+		Key:            map[string]types.AttributeValue{"id": &types.AttributeValueMemberS{Value: params.ID}},
+		ConsistentRead: aws.Bool(true),
+	})
+	if err != nil {
+		return driver.ScheduleCursorResult{}, err
+	}
+	value, ok := out.Item["cursor_at"].(*types.AttributeValueMemberS)
+	if !ok {
+		return driver.ScheduleCursorResult{}, fmt.Errorf("schedule cursor %q has no cursor_at", params.ID)
+	}
+	return driver.ScheduleCursorResult{At: parseTime(value.Value), Created: created}, nil
+}
+
+func scheduleCursorAdvance(ctx context.Context, svc *dynamodb.Client, params driver.ScheduleCursorAdvanceParams) (bool, error) {
+	_, err := svc.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName:           aws.String(tableCursors),
+		Key:                 map[string]types.AttributeValue{"id": &types.AttributeValueMemberS{Value: params.ID}},
+		UpdateExpression:    aws.String("SET cursor_at = :next"),
+		ConditionExpression: aws.String("cursor_at = :expected"),
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":next":     &types.AttributeValueMemberS{Value: params.Next.UTC().Format(timeFmt)},
+			":expected": &types.AttributeValueMemberS{Value: params.Expected.UTC().Format(timeFmt)},
+		},
+	})
+	if err != nil {
+		var conflict *types.ConditionalCheckFailedException
+		if errors.As(err, &conflict) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
 }
 
 // compile-time checks

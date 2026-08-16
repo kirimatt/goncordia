@@ -41,6 +41,7 @@ type attemptError struct {
 	At      time.Time `bson:"at"`
 	Attempt int       `bson:"attempt"`
 	Message string    `bson:"message"`
+	Trace   string    `bson:"trace,omitempty"`
 }
 
 type queueDoc struct {
@@ -96,6 +97,9 @@ func (e *executor) JobFetchBatch(ctx context.Context, params driver.FetchParams)
 func (e *executor) JobRescueStuck(ctx context.Context, params driver.JobRescueParams) (int64, error) {
 	return jobRescueStuck(ctx, e.db, params)
 }
+func (e *executor) JobHeartbeat(ctx context.Context, params driver.JobHeartbeatParams) (bool, error) {
+	return jobHeartbeat(ctx, e.db, params)
+}
 func (e *executor) JobSetStateIfRunning(ctx context.Context, params driver.JobSetStateParams) error {
 	return jobSetStateIfRunning(ctx, e.db, e.clk, params)
 }
@@ -123,8 +127,14 @@ func (e *executor) QueueList(ctx context.Context, params driver.QueueListParams)
 func (e *executor) LeaderAttemptElect(ctx context.Context, params driver.LeaderElectParams) (bool, error) {
 	return leaderAttemptElect(ctx, e.db, e.clk, params)
 }
-func (e *executor) LeaderResign(ctx context.Context, name string) error {
-	return leaderResign(ctx, e.db, name)
+func (e *executor) LeaderResign(ctx context.Context, params driver.LeaderResignParams) error {
+	return leaderResign(ctx, e.db, params)
+}
+func (e *executor) ScheduleCursorGetOrCreate(ctx context.Context, params driver.ScheduleCursorCreateParams) (driver.ScheduleCursorResult, error) {
+	return scheduleCursorGetOrCreate(ctx, e.db, params)
+}
+func (e *executor) ScheduleCursorAdvance(ctx context.Context, params driver.ScheduleCursorAdvanceParams) (bool, error) {
+	return scheduleCursorAdvance(ctx, e.db, params)
 }
 
 // ---- txExecutor (transactional) ----
@@ -191,8 +201,14 @@ func (t *txExecutor) QueueList(ctx context.Context, params driver.QueueListParam
 func (t *txExecutor) LeaderAttemptElect(ctx context.Context, params driver.LeaderElectParams) (bool, error) {
 	return leaderAttemptElect(t.sc, t.db, t.clk, params)
 }
-func (t *txExecutor) LeaderResign(ctx context.Context, name string) error {
-	return leaderResign(t.sc, t.db, name)
+func (t *txExecutor) LeaderResign(ctx context.Context, params driver.LeaderResignParams) error {
+	return leaderResign(t.sc, t.db, params)
+}
+func (t *txExecutor) ScheduleCursorGetOrCreate(ctx context.Context, params driver.ScheduleCursorCreateParams) (driver.ScheduleCursorResult, error) {
+	return scheduleCursorGetOrCreate(t.sc, t.db, params)
+}
+func (t *txExecutor) ScheduleCursorAdvance(ctx context.Context, params driver.ScheduleCursorAdvanceParams) (bool, error) {
+	return scheduleCursorAdvance(t.sc, t.db, params)
 }
 
 // ---- core functions ----
@@ -232,11 +248,8 @@ func jobInsertMany(ctx context.Context, db *mongo.Database, clk clock.Clock, par
 		}
 
 		if p.UniqueKey != "" {
-			// Atomic upsert: only insert if no active job with this unique key exists.
-			filter := bson.M{
-				"queue":      p.Queue,
-				"unique_key": p.UniqueKey,
-			}
+			// Atomic upsert: the canonical key already captures the requested scope.
+			filter := bson.M{"unique_key": p.UniqueKey}
 			update := bson.M{"$setOnInsert": doc}
 			res, err := col.UpdateOne(ctx, filter, update, options.Update().SetUpsert(true))
 			if err != nil {
@@ -273,7 +286,7 @@ func jobGetByID(ctx context.Context, db *mongo.Database, id string) (*driver.Job
 	var doc jobDoc
 	if err := db.Collection(jobsCollection).FindOne(ctx, bson.M{"_id": oid}).Decode(&doc); err != nil {
 		if err == mongo.ErrNoDocuments {
-			return nil, nil
+			return nil, fmt.Errorf("%w: job %q", driver.ErrNotFound, id)
 		}
 		return nil, err
 	}
@@ -293,11 +306,18 @@ func jobList(ctx context.Context, db *mongo.Database, params driver.JobListParam
 		filter["kind"] = params.Kind
 	}
 	if params.Cursor != "" {
-		cursor, err := primitive.ObjectIDFromHex(params.Cursor)
+		cursorAt, cursorID, err := driver.DecodeJobCursor(params.Cursor)
 		if err != nil {
-			return nil, fmt.Errorf("invalid cursor %q: %w", params.Cursor, err)
+			return nil, err
 		}
-		filter["_id"] = bson.M{"$lt": cursor}
+		cursorOID, err := primitive.ObjectIDFromHex(cursorID)
+		if err != nil {
+			return nil, fmt.Errorf("%w: invalid mongodb job id", driver.ErrInvalidCursor)
+		}
+		filter["$or"] = bson.A{
+			bson.M{"created_at": bson.M{"$lt": cursorAt}},
+			bson.M{"created_at": cursorAt, "_id": bson.M{"$lt": cursorOID}},
+		}
 	}
 	limit := params.Limit
 	if limit <= 0 || limit > 1000 {
@@ -371,7 +391,7 @@ func jobFetchBatch(ctx context.Context, db *mongo.Database, clk clock.Clock, par
 		"$inc": bson.M{"attempt_num": 1},
 	}
 	findOpts := options.FindOneAndUpdate().
-		SetSort(bson.D{{Key: "priority", Value: -1}, {Key: "run_at", Value: 1}}).
+		SetSort(bson.D{{Key: "priority", Value: -1}, {Key: "run_at", Value: 1}, {Key: "created_at", Value: 1}, {Key: "_id", Value: 1}}).
 		SetReturnDocument(options.After)
 
 	var rows []driver.JobRow
@@ -406,22 +426,47 @@ func jobRescueStuck(ctx context.Context, db *mongo.Database, params driver.JobRe
 	return result.ModifiedCount, nil
 }
 
+func jobHeartbeat(ctx context.Context, db *mongo.Database, params driver.JobHeartbeatParams) (bool, error) {
+	oid, err := primitive.ObjectIDFromHex(params.ID)
+	if err != nil {
+		return false, fmt.Errorf("invalid job id %q: %w", params.ID, err)
+	}
+	result, err := db.Collection(jobsCollection).UpdateOne(ctx, bson.M{
+		"_id": oid, "state": string(driver.JobStateRunning),
+		"worker_id": params.WorkerID, "attempt_num": params.Attempt,
+	}, bson.M{"$set": bson.M{"attempted_at": params.At.UTC()}})
+	if err != nil {
+		return false, err
+	}
+	return result.ModifiedCount == 1, nil
+}
+
 func jobSetStateIfRunning(ctx context.Context, db *mongo.Database, clk clock.Clock, params driver.JobSetStateParams) error {
 	oid, err := primitive.ObjectIDFromHex(params.ID)
 	if err != nil {
 		return fmt.Errorf("invalid job id %q: %w", params.ID, err)
 	}
+	filter := bson.M{"_id": oid, "state": string(driver.JobStateRunning)}
+	if params.ExpectedWorkerID != "" {
+		filter["worker_id"] = params.ExpectedWorkerID
+	}
+	if params.ExpectedAttempt > 0 {
+		filter["attempt_num"] = params.ExpectedAttempt
+	}
 
 	if params.Yield {
-		_, err = db.Collection(jobsCollection).UpdateOne(ctx,
-			bson.M{"_id": oid, "state": string(driver.JobStateRunning)},
+		result, updateErr := db.Collection(jobsCollection).UpdateOne(ctx,
+			filter,
 			bson.M{
 				"$set":   bson.M{"state": string(driver.JobStateAvailable), "attempted_at": nil},
 				"$inc":   bson.M{"attempt_num": -1},
 				"$unset": bson.M{"worker_id": ""},
 			},
 		)
-		return err
+		if updateErr == nil && result.ModifiedCount == 0 {
+			return fmt.Errorf("%w: job %q", driver.ErrStaleClaim, params.ID)
+		}
+		return updateErr
 	}
 
 	now := clk.Now()
@@ -432,7 +477,18 @@ func jobSetStateIfRunning(ctx context.Context, db *mongo.Database, clk clock.Clo
 	switch params.State {
 	case driver.JobStateCompleted, driver.JobStateDiscarded, driver.JobStateCancelled:
 		set["finalized_at"] = now
-		unset["unique_key"] = "" // free uniqueness slot
+		var current struct {
+			UniqueKey string `bson:"unique_key"`
+		}
+		if err := db.Collection(jobsCollection).FindOne(ctx, filter,
+			options.FindOne().SetProjection(bson.M{"unique_key": 1})).Decode(&current); err == mongo.ErrNoDocuments {
+			return fmt.Errorf("%w: job %q", driver.ErrStaleClaim, params.ID)
+		} else if err != nil {
+			return err
+		}
+		if !driver.IsPermanentUniqueKey(current.UniqueKey) {
+			unset["unique_key"] = "" // free uniqueness slot
+		}
 	case driver.JobStateRetryable:
 		if !params.RetryAt.IsZero() {
 			set["run_at"] = params.RetryAt
@@ -441,11 +497,15 @@ func jobSetStateIfRunning(ctx context.Context, db *mongo.Database, clk clock.Clo
 	}
 
 	if params.Err != nil {
-		push["errors"] = attemptError{
+		stored := attemptError{
 			At:      now,
 			Attempt: params.Attempt,
 			Message: *params.Err,
 		}
+		if params.Trace != nil {
+			stored.Trace = *params.Trace
+		}
+		push["errors"] = stored
 	}
 
 	update := bson.M{"$set": set}
@@ -456,10 +516,13 @@ func jobSetStateIfRunning(ctx context.Context, db *mongo.Database, clk clock.Clo
 		update["$push"] = push
 	}
 
-	_, err = db.Collection(jobsCollection).UpdateOne(ctx,
-		bson.M{"_id": oid, "state": string(driver.JobStateRunning)},
+	result, err := db.Collection(jobsCollection).UpdateOne(ctx,
+		filter,
 		update,
 	)
+	if err == nil && result.ModifiedCount == 0 {
+		return fmt.Errorf("%w: job %q", driver.ErrStaleClaim, params.ID)
+	}
 	return err
 }
 
@@ -468,16 +531,26 @@ func jobCancel(ctx context.Context, db *mongo.Database, clk clock.Clock, id stri
 	if err != nil {
 		return fmt.Errorf("invalid job id %q: %w", id, err)
 	}
-	_, err = db.Collection(jobsCollection).UpdateOne(ctx,
-		bson.M{
-			"_id":   oid,
-			"state": bson.M{"$in": bson.A{string(driver.JobStateAvailable), string(driver.JobStateScheduled)}},
-		},
-		bson.M{
-			"$set":   bson.M{"state": string(driver.JobStateCancelled), "finalized_at": clk.Now()},
-			"$unset": bson.M{"unique_key": ""},
-		},
-	)
+	filter := bson.M{
+		"_id": oid, "state": bson.M{"$in": bson.A{string(driver.JobStateAvailable), string(driver.JobStateScheduled)}},
+	}
+	var current struct {
+		UniqueKey string `bson:"unique_key"`
+	}
+	if err := db.Collection(jobsCollection).FindOne(ctx, filter,
+		options.FindOne().SetProjection(bson.M{"unique_key": 1})).Decode(&current); err == mongo.ErrNoDocuments {
+		if _, getErr := jobGetByID(ctx, db, id); getErr != nil {
+			return getErr
+		}
+		return fmt.Errorf("%w: job %q cannot be cancelled in its current state", driver.ErrConflict, id)
+	} else if err != nil {
+		return err
+	}
+	update := bson.M{"$set": bson.M{"state": string(driver.JobStateCancelled), "finalized_at": clk.Now()}}
+	if !driver.IsPermanentUniqueKey(current.UniqueKey) {
+		update["$unset"] = bson.M{"unique_key": ""}
+	}
+	_, err = db.Collection(jobsCollection).UpdateOne(ctx, filter, update)
 	return err
 }
 
@@ -486,7 +559,10 @@ func jobDelete(ctx context.Context, db *mongo.Database, id string) error {
 	if err != nil {
 		return fmt.Errorf("invalid job id %q: %w", id, err)
 	}
-	_, err = db.Collection(jobsCollection).DeleteOne(ctx, bson.M{"_id": oid})
+	result, err := db.Collection(jobsCollection).DeleteOne(ctx, bson.M{"_id": oid})
+	if err == nil && result.DeletedCount == 0 {
+		return fmt.Errorf("%w: job %q", driver.ErrNotFound, id)
+	}
 	return err
 }
 
@@ -495,10 +571,13 @@ func jobReschedule(ctx context.Context, db *mongo.Database, params driver.Resche
 	if err != nil {
 		return fmt.Errorf("invalid job id %q: %w", params.ID, err)
 	}
-	_, err = db.Collection(jobsCollection).UpdateOne(ctx,
+	result, err := db.Collection(jobsCollection).UpdateOne(ctx,
 		bson.M{"_id": oid},
 		bson.M{"$set": bson.M{"run_at": params.RunAt, "state": string(driver.JobStateScheduled)}},
 	)
+	if err == nil && result.MatchedCount == 0 {
+		return fmt.Errorf("%w: job %q", driver.ErrNotFound, params.ID)
+	}
 	return err
 }
 
@@ -540,11 +619,19 @@ func queueSetPaused(ctx context.Context, db *mongo.Database, clk clock.Clock, na
 
 func queueList(ctx context.Context, db *mongo.Database, params driver.QueueListParams) ([]*driver.QueueRow, error) {
 	limit := int64(params.Limit)
-	if limit <= 0 {
+	if limit <= 0 || limit > 1000 {
 		limit = 100
 	}
+	filter := bson.M{}
+	if params.Cursor != "" {
+		cursor, err := driver.DecodeQueueCursor(params.Cursor)
+		if err != nil {
+			return nil, err
+		}
+		filter["name"] = bson.M{"$gt": cursor}
+	}
 	cur, err := db.Collection(queuesCollection).Find(ctx,
-		bson.M{},
+		filter,
 		options.Find().SetLimit(limit).SetSort(bson.D{{Key: "name", Value: 1}}),
 	)
 	if err != nil {
@@ -604,9 +691,42 @@ func leaderAttemptElect(ctx context.Context, db *mongo.Database, clk clock.Clock
 	return true, nil
 }
 
-func leaderResign(ctx context.Context, db *mongo.Database, name string) error {
-	_, err := db.Collection(leadersCollection).DeleteOne(ctx, bson.M{"_id": name})
+func leaderResign(ctx context.Context, db *mongo.Database, params driver.LeaderResignParams) error {
+	_, err := db.Collection(leadersCollection).DeleteOne(ctx, bson.M{"_id": params.Name, "worker_id": params.WorkerID})
 	return err
+}
+
+type scheduleCursorDoc struct {
+	ID string    `bson:"_id"`
+	At time.Time `bson:"cursor_at"`
+}
+
+func scheduleCursorGetOrCreate(ctx context.Context, db *mongo.Database, params driver.ScheduleCursorCreateParams) (driver.ScheduleCursorResult, error) {
+	col := db.Collection(cursorsCollection)
+	initial := params.InitialAt.UTC()
+	created := true
+	_, err := col.InsertOne(ctx, scheduleCursorDoc{ID: params.ID, At: initial})
+	if err != nil {
+		if !mongo.IsDuplicateKeyError(err) {
+			return driver.ScheduleCursorResult{}, err
+		}
+		created = false
+	}
+	var doc scheduleCursorDoc
+	if err := col.FindOne(ctx, bson.M{"_id": params.ID}).Decode(&doc); err != nil {
+		return driver.ScheduleCursorResult{}, err
+	}
+	return driver.ScheduleCursorResult{At: doc.At.UTC(), Created: created}, nil
+}
+
+func scheduleCursorAdvance(ctx context.Context, db *mongo.Database, params driver.ScheduleCursorAdvanceParams) (bool, error) {
+	result, err := db.Collection(cursorsCollection).UpdateOne(ctx,
+		bson.M{"_id": params.ID, "cursor_at": params.Expected.UTC()},
+		bson.M{"$set": bson.M{"cursor_at": params.Next.UTC()}})
+	if err != nil {
+		return false, err
+	}
+	return result.ModifiedCount == 1, nil
 }
 
 // ---- helpers ----
@@ -614,7 +734,7 @@ func leaderResign(ctx context.Context, db *mongo.Database, name string) error {
 func docToRow(doc jobDoc) *driver.JobRow {
 	var errs []driver.AttemptError
 	for _, e := range doc.Errors {
-		errs = append(errs, driver.AttemptError{At: e.At, Attempt: e.Attempt, Error: e.Message})
+		errs = append(errs, driver.AttemptError{At: e.At, Attempt: e.Attempt, Error: e.Message, Trace: e.Trace})
 	}
 
 	var timeout time.Duration

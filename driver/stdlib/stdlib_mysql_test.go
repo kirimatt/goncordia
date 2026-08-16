@@ -42,6 +42,28 @@ func newMySQLDriver(t *testing.T, opts ...stdlibdriver.Option) *stdlibdriver.Dri
 	return d
 }
 
+func TestStdlibMySQL_ConcurrentMigrate(t *testing.T) {
+	ctx := context.Background()
+	db1, err := sql.Open("mysql", mysqlDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db1.Close()
+	db2, err := sql.Open("mysql", mysqlDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db2.Close()
+	if _, err := db1.ExecContext(ctx, "DROP TABLE IF EXISTS goncordia_jobs, goncordia_queues, goncordia_leaders, goncordia_schedule_cursors, goncordia_schema_migrations"); err != nil {
+		t.Fatal(err)
+	}
+	drivers := []*stdlibdriver.Driver{
+		stdlibdriver.New(db1, stdlibdriver.MySQL),
+		stdlibdriver.New(db2, stdlibdriver.MySQL),
+	}
+	assertConcurrentMigrate(t, drivers)
+}
+
 func TestStdlibMySQL_EnqueueAndProcess(t *testing.T) {
 	d := newMySQLDriver(t)
 	drivertest.Run(t, d.Executor())

@@ -1,12 +1,22 @@
 // Package driver defines the interfaces that all storage backend drivers must implement.
-// Each backend (Postgres, MySQL, SQLite, MongoDB, Redis, in-memory) provides its own
-// implementation of Driver[TTx], parameterized by the transaction type native to that backend.
+// Built-in backends include PostgreSQL, MySQL, SQLite, MongoDB, Redis,
+// Cassandra, ClickHouse, DynamoDB, Firestore, and in-memory. Each implements
+// Driver[TTx], parameterized by its native transaction type.
 package driver
 
 import (
 	"context"
+	"strings"
 	"time"
 )
+
+const permanentUniqueKeyPrefix = "uf2_"
+
+// IsPermanentUniqueKey reports whether key remains reserved after a terminal
+// transition. Explicit deletion still releases the key.
+func IsPermanentUniqueKey(key string) bool {
+	return strings.HasPrefix(key, permanentUniqueKeyPrefix)
+}
 
 // Driver is the top-level interface for a job queue storage backend.
 // TTx is the transaction type native to the backend library the user chose
@@ -28,7 +38,9 @@ type Driver[TTx any] interface {
 	// Listener returns a push-notification listener, or nil if polling must be used.
 	Listener() Listener
 
-	// Close releases any resources held by the driver.
+	// Close releases resources created by the driver itself. Constructors that
+	// accept a client, pool, connection, or session never take ownership of it;
+	// the caller remains responsible for closing that resource.
 	Close() error
 }
 
@@ -71,6 +83,13 @@ type StuckJobRescuer interface {
 	JobRescueStuck(ctx context.Context, params JobRescueParams) (int64, error)
 }
 
+// JobHeartbeater is an optional executor capability implemented by drivers
+// that can renew a running claim. The worker pool uses it to prevent healthy
+// long-running jobs from being rescued as abandoned.
+type JobHeartbeater interface {
+	JobHeartbeat(ctx context.Context, params JobHeartbeatParams) (renewed bool, err error)
+}
+
 // AdminExecutor is an optional executor capability used by the admin HTTP API
 // for filtered job inspection and queue-depth metrics.
 type AdminExecutor interface {
@@ -85,7 +104,8 @@ type baseExecutor interface {
 
 	JobInsertMany(ctx context.Context, params []JobInsertParams) ([]JobInsertResult, error)
 	JobGetByID(ctx context.Context, id string) (*JobRow, error)
-	// JobFetchBatch atomically claims up to limit available jobs for processing.
+	// JobFetchBatch atomically claims up to limit due jobs for processing in
+	// priority DESC, run_at ASC, created_at ASC, id ASC order.
 	// Implementations use SELECT FOR UPDATE SKIP LOCKED (SQL) or findOneAndUpdate (MongoDB).
 	JobFetchBatch(ctx context.Context, params FetchParams) ([]JobRow, error)
 	// JobSetStateIfRunning atomically transitions a running job to a terminal/retry state.
@@ -104,7 +124,12 @@ type baseExecutor interface {
 	// --- Leader election (only called when Capabilities.AdvisoryLocks == false, others use DB-specific mechanisms) ---
 
 	LeaderAttemptElect(ctx context.Context, params LeaderElectParams) (elected bool, err error)
-	LeaderResign(ctx context.Context, name string) error
+	LeaderResign(ctx context.Context, params LeaderResignParams) error
+
+	// --- Durable periodic schedule cursors ---
+
+	ScheduleCursorGetOrCreate(ctx context.Context, params ScheduleCursorCreateParams) (ScheduleCursorResult, error)
+	ScheduleCursorAdvance(ctx context.Context, params ScheduleCursorAdvanceParams) (advanced bool, err error)
 }
 
 // --- Parameter and result types ---
@@ -116,7 +141,7 @@ type JobInsertParams struct {
 	Args       []byte    // JSON-encoded job arguments
 	Priority   int       // higher = processed first; default 0
 	RunAt      time.Time // zero means "immediately"
-	UniqueKey  string    // optional; prevents duplicate jobs with the same key+state
+	UniqueKey  string    // optional; globally prevents duplicate active jobs with the same canonical key
 	MaxRetry   int
 	Timeout    time.Duration
 	Tags       []string
@@ -142,18 +167,36 @@ type JobRescueParams struct {
 	Before time.Time
 }
 
+// JobHeartbeatParams renews one fenced running claim at At.
+type JobHeartbeatParams struct {
+	ID       string
+	WorkerID string
+	Attempt  int
+	At       time.Time
+}
+
 // JobSetStateParams transitions a running job to a new state.
 type JobSetStateParams struct {
-	ID      string
-	State   JobState
-	Err     *string   // serialized error for failed/retryable states
-	Attempt int       // attempt number associated with Err
-	RetryAt time.Time // populated when State == JobStateRetryable
+	ID               string
+	State            JobState
+	Err              *string   // serialized error for failed/retryable states
+	Trace            *string   // optional panic stack trace retained with Err
+	Attempt          int       // attempt number associated with Err
+	RetryAt          time.Time // populated when State == JobStateRetryable
+	ExpectedWorkerID string    // optional fencing precondition
+	ExpectedAttempt  int       // optional fencing precondition
 	// Yield returns the job to available without recording an error or counting
 	// an attempt. Used by the pipeline serialization mechanism when a job cannot
 	// run yet because another job with the same PipelineID is already running.
 	// When Yield is true all other fields except ID are ignored.
 	Yield bool
+}
+
+// MatchesClaim reports whether the current claim satisfies the optional
+// fencing preconditions on a state transition.
+func (p JobSetStateParams) MatchesClaim(workerID string, attempt int) bool {
+	return (p.ExpectedWorkerID == "" || p.ExpectedWorkerID == workerID) &&
+		(p.ExpectedAttempt <= 0 || p.ExpectedAttempt == attempt)
 }
 
 // RescheduleParams reschedules a job to run at a future time.
@@ -201,6 +244,31 @@ type LeaderElectParams struct {
 	TTL      time.Duration
 }
 
+// LeaderResignParams releases a lease only when WorkerID still owns it.
+type LeaderResignParams struct {
+	Name     string
+	WorkerID string
+}
+
+// ScheduleCursorCreateParams initializes a durable schedule cursor if missing.
+type ScheduleCursorCreateParams struct {
+	ID        string
+	InitialAt time.Time
+}
+
+// ScheduleCursorResult returns the persisted cursor and whether it was created.
+type ScheduleCursorResult struct {
+	At      time.Time
+	Created bool
+}
+
+// ScheduleCursorAdvanceParams advances a cursor using compare-and-swap.
+type ScheduleCursorAdvanceParams struct {
+	ID       string
+	Expected time.Time
+	Next     time.Time
+}
+
 // --- Row types ---
 
 // JobRow is the canonical in-memory representation of a job record.
@@ -213,7 +281,7 @@ type JobRow struct {
 	Priority    int
 	RunAt       time.Time
 	CreatedAt   time.Time
-	AttemptedAt *time.Time
+	AttemptedAt *time.Time // claim time, refreshed by heartbeats while running
 	FinalizedAt *time.Time
 	AttemptNum  int
 	MaxRetry    int

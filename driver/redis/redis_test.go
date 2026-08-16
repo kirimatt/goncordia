@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -142,6 +143,49 @@ func TestRedis_UniqueJobs(t *testing.T) {
 	}
 	if !r2.UniqueSkip {
 		t.Fatal("expected second insert to be duplicate")
+	}
+}
+
+func TestRedis_ConcurrentUniqueInsertIsAtomic(t *testing.T) {
+	d, _ := newDriver(t)
+	ctx := context.Background()
+	client := redisdriver.NewClient(d, goncordia.ClientConfig{})
+	opts := &core.InsertOpts{UniqueOpts: &core.UniqueOpts{ByArgs: true}}
+
+	const inserts = 32
+	results := make(chan bool, inserts)
+	errs := make(chan error, inserts)
+	var wg sync.WaitGroup
+	for range inserts {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			result, err := client.Enqueue(ctx, EmailJob{To: "atomic@test.com"}, opts)
+			if err != nil {
+				errs <- err
+				return
+			}
+			results <- result.UniqueSkip
+		}()
+	}
+	wg.Wait()
+	close(results)
+	close(errs)
+	for err := range errs {
+		t.Fatalf("concurrent insert: %v", err)
+	}
+
+	inserted := 0
+	skipped := 0
+	for skip := range results {
+		if skip {
+			skipped++
+		} else {
+			inserted++
+		}
+	}
+	if inserted != 1 || skipped != inserts-1 {
+		t.Fatalf("inserted=%d skipped=%d, want 1/%d", inserted, skipped, inserts-1)
 	}
 }
 

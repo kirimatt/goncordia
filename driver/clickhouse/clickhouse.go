@@ -60,7 +60,8 @@ type Option func(*Driver)
 // WithClock injects a custom clock (useful for tests).
 func WithClock(c clock.Clock) Option { return func(d *Driver) { d.clk = c } }
 
-// New creates a Driver wrapping the given clickhouse driver.Conn.
+// New creates a Driver wrapping the given clickhouse driver.Conn. The caller
+// retains ownership of conn and must close it after the driver is no longer in use.
 // Call Migrate to create the schema before starting workers.
 func New(conn driver.Conn, opts ...Option) *Driver {
 	d := &Driver{conn: conn, clk: clock.Real{}}
@@ -117,6 +118,13 @@ func (d *Driver) Migrate(ctx context.Context) error {
 			version    Int64
 		) ENGINE = ReplacingMergeTree(version)
 		ORDER BY name`,
+
+		`CREATE TABLE IF NOT EXISTS goncordia_schedule_cursors (
+			id        String,
+			cursor_at DateTime64(3, 'UTC'),
+			version   Int64
+		) ENGINE = ReplacingMergeTree(version)
+		ORDER BY id`,
 	}
 	for _, stmt := range stmts {
 		if err := d.conn.Exec(ctx, stmt); err != nil {
@@ -151,7 +159,7 @@ func (d *Driver) UnwrapTx(_ NoTx) gdriver.ExecutorTx {
 // Listener returns nil — ClickHouse driver uses polling.
 func (d *Driver) Listener() gdriver.Listener { return nil }
 
-func (d *Driver) Close() error { return d.conn.Close() }
+func (d *Driver) Close() error { return nil }
 
 // Client is a type alias so callers never write goncordia.Client[NoTx].
 type Client = goncordia.Client[NoTx]

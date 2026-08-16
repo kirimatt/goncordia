@@ -1,6 +1,6 @@
 // Package memory provides an in-memory driver for testing and development.
 // It has no persistence — all jobs are lost on process restart.
-// TTx is NoTx since in-memory operations don't need real transactions.
+// TTx is NoTx; the driver does not claim rollback semantics.
 package memory
 
 import (
@@ -16,7 +16,7 @@ import (
 )
 
 // NoTx is the transaction type for the memory driver.
-// In-memory "transactions" are no-ops (state is managed by locks).
+// In-memory operations are individually synchronized but do not provide rollback.
 type NoTx struct{}
 
 // Driver implements driver.Driver[NoTx] using in-memory maps.
@@ -27,6 +27,7 @@ type Driver struct {
 	seq     uint64
 	notify  map[string][]chan driver.Notification
 	leaders map[string]memoryLeader
+	cursors map[string]time.Time
 	clk     clock.Clock
 }
 
@@ -50,6 +51,7 @@ func New(opts ...Option) *Driver {
 		queues:  make(map[string]*driver.QueueRow),
 		notify:  make(map[string][]chan driver.Notification),
 		leaders: make(map[string]memoryLeader),
+		cursors: make(map[string]time.Time),
 		clk:     clock.Real{},
 	}
 	for _, o := range opts {
@@ -62,7 +64,7 @@ func (d *Driver) Name() string { return "memory" }
 
 func (d *Driver) Capabilities() driver.Capabilities {
 	return driver.Capabilities{
-		NativeTx:      true,
+		NativeTx:      false,
 		SkipLocked:    true,
 		UniqueJobs:    true,
 		ListenNotify:  true,
@@ -82,7 +84,7 @@ func (d *Driver) Close() error { return nil }
 type executor struct{ d *Driver }
 
 func (e *executor) Begin(_ context.Context) (driver.ExecutorTx, error) {
-	return &txExecutor{executor: executor{d: e.d}}, nil
+	return nil, fmt.Errorf("%w: memory transactions", driver.ErrUnsupported)
 }
 
 func (e *executor) JobInsertMany(_ context.Context, params []driver.JobInsertParams) ([]driver.JobInsertResult, error) {
@@ -92,7 +94,7 @@ func (e *executor) JobInsertMany(_ context.Context, params []driver.JobInsertPar
 	results := make([]driver.JobInsertResult, 0, len(params))
 	for _, p := range params {
 		if p.UniqueKey != "" {
-			if dup := e.d.findUniqueJob(p.Queue, p.UniqueKey); dup != nil {
+			if dup := e.d.findUniqueJob(p.UniqueKey); dup != nil {
 				results = append(results, driver.JobInsertResult{Job: dup, UniqueSkip: true})
 				continue
 			}
@@ -138,7 +140,7 @@ func (e *executor) JobGetByID(_ context.Context, id string) (*driver.JobRow, err
 	defer e.d.mu.Unlock()
 	row, ok := e.d.jobs[id]
 	if !ok {
-		return nil, fmt.Errorf("job %q not found", id)
+		return nil, fmt.Errorf("%w: job %q", driver.ErrNotFound, id)
 	}
 	cp := *row
 	return &cp, nil
@@ -147,9 +149,19 @@ func (e *executor) JobGetByID(_ context.Context, id string) (*driver.JobRow, err
 func (e *executor) JobList(_ context.Context, params driver.JobListParams) ([]driver.JobRow, error) {
 	e.d.mu.Lock()
 	defer e.d.mu.Unlock()
+	var cursorAt time.Time
+	var cursorID string
+	if params.Cursor != "" {
+		var err error
+		cursorAt, cursorID, err = driver.DecodeJobCursor(params.Cursor)
+		if err != nil {
+			return nil, err
+		}
+	}
 	rows := make([]driver.JobRow, 0, len(e.d.jobs))
 	for _, row := range e.d.jobs {
-		if params.Queue != "" && row.Queue != params.Queue || params.State != "" && row.State != params.State || params.Kind != "" && row.Kind != params.Kind || params.Cursor != "" && row.ID >= params.Cursor {
+		if params.Queue != "" && row.Queue != params.Queue || params.State != "" && row.State != params.State || params.Kind != "" && row.Kind != params.Kind ||
+			params.Cursor != "" && !driver.JobFollowsCursor(*row, cursorAt, cursorID) {
 			continue
 		}
 		rows = append(rows, *row)
@@ -211,7 +223,13 @@ func (e *executor) JobFetchBatch(_ context.Context, params driver.FetchParams) (
 		if candidates[i].Priority != candidates[k].Priority {
 			return candidates[i].Priority > candidates[k].Priority
 		}
-		return candidates[i].RunAt.Before(candidates[k].RunAt)
+		if !candidates[i].RunAt.Equal(candidates[k].RunAt) {
+			return candidates[i].RunAt.Before(candidates[k].RunAt)
+		}
+		if !candidates[i].CreatedAt.Equal(candidates[k].CreatedAt) {
+			return candidates[i].CreatedAt.Before(candidates[k].CreatedAt)
+		}
+		return candidates[i].ID < candidates[k].ID
 	})
 
 	limit := params.Limit
@@ -248,12 +266,24 @@ func (e *executor) JobRescueStuck(_ context.Context, params driver.JobRescuePara
 	return rescued, nil
 }
 
+func (e *executor) JobHeartbeat(_ context.Context, params driver.JobHeartbeatParams) (bool, error) {
+	e.d.mu.Lock()
+	defer e.d.mu.Unlock()
+	row, ok := e.d.jobs[params.ID]
+	if !ok || row.State != driver.JobStateRunning || row.WorkerID != params.WorkerID || row.AttemptNum != params.Attempt {
+		return false, nil
+	}
+	at := params.At.UTC()
+	row.AttemptedAt = &at
+	return true, nil
+}
+
 func (e *executor) JobSetStateIfRunning(_ context.Context, params driver.JobSetStateParams) error {
 	e.d.mu.Lock()
 	defer e.d.mu.Unlock()
 	row, ok := e.d.jobs[params.ID]
-	if !ok || row.State != driver.JobStateRunning {
-		return nil
+	if !ok || row.State != driver.JobStateRunning || !params.MatchesClaim(row.WorkerID, row.AttemptNum) {
+		return fmt.Errorf("%w: job %q", driver.ErrStaleClaim, params.ID)
 	}
 	if params.Yield {
 		row.State = driver.JobStateAvailable
@@ -265,10 +295,15 @@ func (e *executor) JobSetStateIfRunning(_ context.Context, params driver.JobSetS
 	row.State = params.State
 	row.WorkerID = ""
 	if params.Err != nil {
+		trace := ""
+		if params.Trace != nil {
+			trace = *params.Trace
+		}
 		row.Errors = append(row.Errors, driver.AttemptError{
 			At:      e.d.clk.Now(),
 			Attempt: row.AttemptNum,
 			Error:   *params.Err,
+			Trace:   trace,
 		})
 	}
 	if params.State == driver.JobStateRetryable && !params.RetryAt.IsZero() {
@@ -289,10 +324,10 @@ func (e *executor) JobCancel(_ context.Context, id string) error {
 	defer e.d.mu.Unlock()
 	row, ok := e.d.jobs[id]
 	if !ok {
-		return fmt.Errorf("job %q not found", id)
+		return fmt.Errorf("%w: job %q", driver.ErrNotFound, id)
 	}
 	if row.State != driver.JobStateAvailable && row.State != driver.JobStateScheduled {
-		return fmt.Errorf("job %q is in state %s, can only cancel available/scheduled", id, row.State)
+		return fmt.Errorf("%w: job %q is in state %s, can only cancel available/scheduled", driver.ErrConflict, id, row.State)
 	}
 	row.State = driver.JobStateCancelled
 	now := e.d.clk.Now()
@@ -303,6 +338,9 @@ func (e *executor) JobCancel(_ context.Context, id string) error {
 func (e *executor) JobDelete(_ context.Context, id string) error {
 	e.d.mu.Lock()
 	defer e.d.mu.Unlock()
+	if _, ok := e.d.jobs[id]; !ok {
+		return fmt.Errorf("%w: job %q", driver.ErrNotFound, id)
+	}
 	delete(e.d.jobs, id)
 	return nil
 }
@@ -312,7 +350,7 @@ func (e *executor) JobReschedule(_ context.Context, params driver.ReschedulePara
 	defer e.d.mu.Unlock()
 	row, ok := e.d.jobs[params.ID]
 	if !ok {
-		return fmt.Errorf("job %q not found", params.ID)
+		return fmt.Errorf("%w: job %q", driver.ErrNotFound, params.ID)
 	}
 	row.RunAt = params.RunAt
 	row.State = driver.JobStateScheduled
@@ -324,7 +362,7 @@ func (e *executor) QueueGet(_ context.Context, name string) (*driver.QueueRow, e
 	defer e.d.mu.Unlock()
 	q, ok := e.d.queues[name]
 	if !ok {
-		return nil, fmt.Errorf("queue %q not found", name)
+		return nil, fmt.Errorf("%w: queue %q", driver.ErrNotFound, name)
 	}
 	cp := *q
 	return &cp, nil
@@ -346,13 +384,32 @@ func (e *executor) QueueResume(_ context.Context, name string) error {
 	return nil
 }
 
-func (e *executor) QueueList(_ context.Context, _ driver.QueueListParams) ([]*driver.QueueRow, error) {
+func (e *executor) QueueList(_ context.Context, params driver.QueueListParams) ([]*driver.QueueRow, error) {
 	e.d.mu.Lock()
 	defer e.d.mu.Unlock()
+	cursor := ""
+	if params.Cursor != "" {
+		var err error
+		cursor, err = driver.DecodeQueueCursor(params.Cursor)
+		if err != nil {
+			return nil, err
+		}
+	}
 	rows := make([]*driver.QueueRow, 0, len(e.d.queues))
 	for _, q := range e.d.queues {
+		if q.Name <= cursor {
+			continue
+		}
 		cp := *q
 		rows = append(rows, &cp)
+	}
+	sort.Slice(rows, func(i, j int) bool { return rows[i].Name < rows[j].Name })
+	limit := params.Limit
+	if limit <= 0 || limit > 1000 {
+		limit = 100
+	}
+	if len(rows) > limit {
+		rows = rows[:limit]
 	}
 	return rows, nil
 }
@@ -369,11 +426,35 @@ func (e *executor) LeaderAttemptElect(_ context.Context, params driver.LeaderEle
 	return true, nil
 }
 
-func (e *executor) LeaderResign(_ context.Context, name string) error {
+func (e *executor) LeaderResign(_ context.Context, params driver.LeaderResignParams) error {
 	e.d.mu.Lock()
 	defer e.d.mu.Unlock()
-	delete(e.d.leaders, name)
+	if current, ok := e.d.leaders[params.Name]; ok && current.workerID == params.WorkerID {
+		delete(e.d.leaders, params.Name)
+	}
 	return nil
+}
+
+func (e *executor) ScheduleCursorGetOrCreate(_ context.Context, params driver.ScheduleCursorCreateParams) (driver.ScheduleCursorResult, error) {
+	e.d.mu.Lock()
+	defer e.d.mu.Unlock()
+	if at, ok := e.d.cursors[params.ID]; ok {
+		return driver.ScheduleCursorResult{At: at}, nil
+	}
+	at := params.InitialAt.UTC()
+	e.d.cursors[params.ID] = at
+	return driver.ScheduleCursorResult{At: at, Created: true}, nil
+}
+
+func (e *executor) ScheduleCursorAdvance(_ context.Context, params driver.ScheduleCursorAdvanceParams) (bool, error) {
+	e.d.mu.Lock()
+	defer e.d.mu.Unlock()
+	current, ok := e.d.cursors[params.ID]
+	if !ok || !current.Equal(params.Expected) {
+		return false, nil
+	}
+	e.d.cursors[params.ID] = params.Next.UTC()
+	return true, nil
 }
 
 // --- txExecutor ---
@@ -454,12 +535,13 @@ func (d *Driver) broadcastNotify(queue string) {
 	}
 }
 
-func (d *Driver) findUniqueJob(queue, uniqueKey string) *driver.JobRow {
+func (d *Driver) findUniqueJob(uniqueKey string) *driver.JobRow {
 	for _, j := range d.jobs {
-		if j.Queue == queue && j.UniqueKey == uniqueKey &&
-			j.State != driver.JobStateCompleted &&
-			j.State != driver.JobStateDiscarded &&
-			j.State != driver.JobStateCancelled {
+		if j.UniqueKey == uniqueKey &&
+			(driver.IsPermanentUniqueKey(uniqueKey) ||
+				j.State != driver.JobStateCompleted &&
+					j.State != driver.JobStateDiscarded &&
+					j.State != driver.JobStateCancelled) {
 			return j
 		}
 	}

@@ -2,6 +2,7 @@ package goncordia
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"log/slog"
 	"sync/atomic"
@@ -14,13 +15,37 @@ import (
 
 // PeriodicJob pairs a Schedule with the job args to enqueue on each tick.
 type PeriodicJob struct {
+	// ID enables durable scheduling. It must be stable and unique within the
+	// LeaderName group. Empty preserves the legacy process-local schedule.
+	ID string
 	// Schedule determines when the job runs.
 	Schedule core.Schedule
 	// Args is the job to enqueue.
 	Args core.JobArgs
 	// Opts are passed through to Enqueue on each tick (optional).
 	Opts *core.InsertOpts
+	// StartAt is the durable cursor anchor; the first occurrence is
+	// Schedule.Next(StartAt). Required when ID is set.
+	StartAt time.Time
+	// CatchUp controls how missed durable occurrences are handled.
+	CatchUp CronCatchUpPolicy
+	// MaxCatchUp bounds occurrences enqueued per tick for CronCatchUpAll.
+	// Zero uses CronConfig.MaxCatchUp.
+	MaxCatchUp int
 }
+
+// CronCatchUpPolicy controls handling of durable occurrences missed while no
+// scheduler held leadership.
+type CronCatchUpPolicy uint8
+
+const (
+	// CronCatchUpAll enqueues every missed occurrence, bounded per tick.
+	CronCatchUpAll CronCatchUpPolicy = iota
+	// CronCatchUpLatest enqueues only the latest missed occurrence.
+	CronCatchUpLatest
+	// CronSkipMissed advances past old occurrences without enqueueing them.
+	CronSkipMissed
+)
 
 // CronConfig configures a CronScheduler.
 type CronConfig struct {
@@ -36,6 +61,8 @@ type CronConfig struct {
 	WorkerID string
 	// LeaderTTL is the lease duration on non-advisory-lock backends. Default: 30 seconds.
 	LeaderTTL time.Duration
+	// MaxCatchUp bounds catch-up inserts per durable job per tick. Default: 100.
+	MaxCatchUp int
 	// ErrorHandler receives leader-election and enqueue errors. Default: slog.Error.
 	ErrorHandler func(error)
 }
@@ -79,6 +106,9 @@ func NewCronScheduler[TTx any](d driver.Driver[TTx], jobs []PeriodicJob, cfg Cro
 	if cfg.LeaderTTL <= 0 {
 		cfg.LeaderTTL = 30 * time.Second
 	}
+	if cfg.MaxCatchUp <= 0 {
+		cfg.MaxCatchUp = 100
+	}
 	if cfg.ErrorHandler == nil {
 		cfg.ErrorHandler = func(err error) { slog.Error("goncordia cron error", "error", err) }
 	}
@@ -97,9 +127,40 @@ func NewCronScheduler[TTx any](d driver.Driver[TTx], jobs []PeriodicJob, cfg Cro
 
 // Start begins the scheduling loop. It blocks until ctx is cancelled.
 func (s *CronScheduler[TTx]) Start(ctx context.Context) error {
+	seenIDs := make(map[string]struct{})
+	for _, entry := range s.entries {
+		if entry.job.Schedule == nil {
+			return fmt.Errorf("periodic job %q has no schedule", entry.job.ID)
+		}
+		if entry.job.ID == "" {
+			continue
+		}
+		if entry.job.StartAt.IsZero() {
+			return fmt.Errorf("periodic job %q requires StartAt for durable scheduling", entry.job.ID)
+		}
+		if entry.job.CatchUp > CronSkipMissed {
+			return fmt.Errorf("periodic job %q has invalid catch-up policy %d", entry.job.ID, entry.job.CatchUp)
+		}
+		if entry.job.MaxCatchUp < 0 {
+			return fmt.Errorf("periodic job %q has negative MaxCatchUp", entry.job.ID)
+		}
+		if _, exists := seenIDs[entry.job.ID]; exists {
+			return fmt.Errorf("duplicate periodic job ID %q", entry.job.ID)
+		}
+		seenIDs[entry.job.ID] = struct{}{}
+	}
 	if !s.started.CompareAndSwap(false, true) {
 		return fmt.Errorf("cron scheduler already started")
 	}
+	defer func() {
+		resignCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		if err := s.client.driver.Executor().LeaderResign(resignCtx, driver.LeaderResignParams{
+			Name: s.config.LeaderName, WorkerID: s.config.WorkerID,
+		}); err != nil {
+			s.config.ErrorHandler(fmt.Errorf("cron leader resignation: %w", err))
+		}
+	}()
 	ticker := s.config.Clock.NewTicker(s.config.TickInterval)
 	defer ticker.Stop()
 
@@ -129,6 +190,10 @@ func (s *CronScheduler[TTx]) tick(ctx context.Context) {
 	now := s.config.Clock.Now()
 	for i := range s.entries {
 		e := &s.entries[i]
+		if e.job.ID != "" {
+			s.tickDurable(ctx, e, now)
+			continue
+		}
 		next := e.job.Schedule.Next(e.lastRun)
 		if next.IsZero() || !now.Before(next) {
 			if _, err := s.client.Enqueue(ctx, e.job.Args, e.job.Opts); err != nil {
@@ -138,4 +203,109 @@ func (s *CronScheduler[TTx]) tick(ctx context.Context) {
 			e.lastRun = now
 		}
 	}
+}
+
+func (s *CronScheduler[TTx]) tickDurable(ctx context.Context, entry *cronEntry, now time.Time) {
+	exec := s.client.driver.Executor()
+	cursorID := durableScheduleCursorID(s.config.LeaderName, entry.job.ID)
+	cursorResult, err := exec.ScheduleCursorGetOrCreate(ctx, driver.ScheduleCursorCreateParams{
+		ID: cursorID, InitialAt: entry.job.StartAt.UTC(),
+	})
+	if err != nil {
+		s.config.ErrorHandler(fmt.Errorf("load periodic cursor %q: %w", entry.job.ID, err))
+		return
+	}
+
+	original := cursorResult.At
+	cursor := original
+	due := make([]time.Time, 0, 1)
+	scanComplete := false
+	for range 100_000 {
+		next := entry.job.Schedule.Next(cursor)
+		if next.IsZero() || !next.After(cursor) {
+			s.config.ErrorHandler(fmt.Errorf("periodic job %q schedule did not advance after %s", entry.job.ID, cursor))
+			return
+		}
+		if next.After(now) {
+			scanComplete = true
+			break
+		}
+		due = append(due, next)
+		cursor = next
+		if entry.job.CatchUp == CronCatchUpAll && len(due) >= s.maxCatchUp(entry.job) {
+			break
+		}
+	}
+	if !scanComplete && entry.job.CatchUp != CronCatchUpAll {
+		s.config.ErrorHandler(fmt.Errorf("periodic job %q exceeded 100000 missed occurrences; move StartAt forward", entry.job.ID))
+		return
+	}
+	if len(due) == 0 {
+		return
+	}
+
+	switch entry.job.CatchUp {
+	case CronCatchUpLatest:
+		latest := due[len(due)-1]
+		if !s.enqueueOccurrence(ctx, entry.job, latest) {
+			return
+		}
+		s.advanceCursor(ctx, exec, entry.job.ID, cursorID, original, latest)
+	case CronSkipMissed:
+		latest := due[len(due)-1]
+		if now.Sub(latest) <= s.config.TickInterval && !s.enqueueOccurrence(ctx, entry.job, latest) {
+			return
+		}
+		s.advanceCursor(ctx, exec, entry.job.ID, cursorID, original, latest)
+	default:
+		expected := original
+		for _, occurrence := range due {
+			if !s.enqueueOccurrence(ctx, entry.job, occurrence) {
+				return
+			}
+			if !s.advanceCursor(ctx, exec, entry.job.ID, cursorID, expected, occurrence) {
+				return
+			}
+			expected = occurrence
+		}
+	}
+}
+
+func (s *CronScheduler[TTx]) maxCatchUp(job PeriodicJob) int {
+	if job.MaxCatchUp > 0 {
+		return job.MaxCatchUp
+	}
+	return s.config.MaxCatchUp
+}
+
+func (s *CronScheduler[TTx]) enqueueOccurrence(ctx context.Context, job PeriodicJob, occurrence time.Time) bool {
+	opts := core.InsertOpts{}
+	if job.Opts != nil {
+		opts = *job.Opts
+	}
+	opts.UniqueOpts = &core.UniqueOpts{
+		Key:     fmt.Sprintf("cron:%s:%s:%d", s.config.LeaderName, job.ID, occurrence.UTC().UnixNano()),
+		Forever: true,
+	}
+	if _, err := s.client.Enqueue(ctx, job.Args, &opts); err != nil {
+		s.config.ErrorHandler(fmt.Errorf("enqueue periodic job %q occurrence %s: %w", job.ID, occurrence, err))
+		return false
+	}
+	return true
+}
+
+func (s *CronScheduler[TTx]) advanceCursor(ctx context.Context, exec driver.Executor, jobID, cursorID string, expected, next time.Time) bool {
+	advanced, err := exec.ScheduleCursorAdvance(ctx, driver.ScheduleCursorAdvanceParams{
+		ID: cursorID, Expected: expected.UTC(), Next: next.UTC(),
+	})
+	if err != nil {
+		s.config.ErrorHandler(fmt.Errorf("advance periodic cursor %q: %w", jobID, err))
+		return false
+	}
+	return advanced
+}
+
+func durableScheduleCursorID(group, id string) string {
+	digest := sha256.Sum256([]byte(group + "\x00" + id))
+	return fmt.Sprintf("c1_%x", digest[:])
 }

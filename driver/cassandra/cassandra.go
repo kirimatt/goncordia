@@ -57,7 +57,8 @@ type Option func(*Driver)
 // WithClock injects a custom clock (useful for tests).
 func WithClock(c clock.Clock) Option { return func(d *Driver) { d.clk = c } }
 
-// New creates a Driver wrapping the given *gocql.Session.
+// New creates a Driver wrapping the given *gocql.Session. The caller retains
+// ownership of session and must close it after the driver is no longer in use.
 // The session's keyspace must already be set (cluster.Keyspace = "...").
 // Call Migrate to create the schema before starting workers.
 func New(session *gocql.Session, opts ...Option) *Driver {
@@ -127,6 +128,16 @@ func (d *Driver) Migrate(ctx context.Context) error {
 			ukey    text,
 			job_id  text,
 			PRIMARY KEY ((queue, ukey))
+		)`,
+
+		`CREATE TABLE IF NOT EXISTS goncordia_uniq_v2 (
+			ukey   text PRIMARY KEY,
+			job_id text
+		)`,
+
+		`CREATE TABLE IF NOT EXISTS goncordia_schedule_cursors (
+			id        text PRIMARY KEY,
+			cursor_at timestamp
 		)`,
 
 		// Leader election. Row TTL is set per insert to expire stale leaders.
@@ -229,7 +240,6 @@ func (d *Driver) UnwrapTx(_ NoTx) driver.ExecutorTx {
 func (d *Driver) Listener() driver.Listener { return nil }
 
 func (d *Driver) Close() error {
-	d.session.Close()
 	return nil
 }
 

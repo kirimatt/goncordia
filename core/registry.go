@@ -23,6 +23,7 @@ type RawJob struct {
 	AttemptNum int
 	MaxRetry   int
 	CreatedAt  time.Time
+	RunAt      time.Time
 	WorkerID   string
 	Tags       []string
 	PipelineID string
@@ -58,6 +59,7 @@ func RegisterWorker[T JobArgs](r *Registry, w Worker[T], opts WorkerOpts) {
 				AttemptNum: rawJob.AttemptNum,
 				MaxRetry:   rawJob.MaxRetry,
 				CreatedAt:  rawJob.CreatedAt,
+				RunAt:      rawJob.RunAt,
 				WorkerID:   rawJob.WorkerID,
 				Tags:       rawJob.Tags,
 				PipelineID: rawJob.PipelineID,

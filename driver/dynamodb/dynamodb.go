@@ -46,6 +46,7 @@ const (
 	tableUniq     = "goncordia_uniq"
 	tableQueues   = "goncordia_queues"
 	tableLeaders  = "goncordia_leaders"
+	tableCursors  = "goncordia_schedule_cursors"
 	gsiQueueState = "gsi_queue_state"
 )
 
@@ -131,16 +132,25 @@ func (d *Driver) Migrate(ctx context.Context) error {
 				{AttributeName: aws.String("name"), KeyType: types.KeyTypeHash},
 			},
 		},
+		{
+			TableName:   aws.String(tableCursors),
+			BillingMode: types.BillingModePayPerRequest,
+			AttributeDefinitions: []types.AttributeDefinition{
+				{AttributeName: aws.String("id"), AttributeType: types.ScalarAttributeTypeS},
+			},
+			KeySchema: []types.KeySchemaElement{
+				{AttributeName: aws.String("id"), KeyType: types.KeyTypeHash},
+			},
+		},
 	}
 
 	waiter := dynamodb.NewTableExistsWaiter(d.svc)
 	for _, input := range tables {
 		if _, err := d.svc.CreateTable(ctx, input); err != nil {
 			var riu *types.ResourceInUseException
-			if errors.As(err, &riu) {
-				continue
+			if !errors.As(err, &riu) {
+				return fmt.Errorf("dynamodb migrate: create %s: %w", *input.TableName, err)
 			}
-			return fmt.Errorf("dynamodb migrate: create %s: %w", *input.TableName, err)
 		}
 		if err := waiter.Wait(ctx, &dynamodb.DescribeTableInput{TableName: input.TableName}, 30*time.Second); err != nil {
 			return fmt.Errorf("dynamodb migrate: wait %s: %w", *input.TableName, err)

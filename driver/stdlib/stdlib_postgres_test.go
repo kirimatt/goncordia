@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -16,6 +17,48 @@ import (
 	"github.com/kirimatt/goncordia/driver/drivertest"
 	stdlibdriver "github.com/kirimatt/goncordia/driver/stdlib"
 )
+
+func TestStdlibPostgres_ConcurrentMigrate(t *testing.T) {
+	ctx := context.Background()
+	db1, err := sql.Open("pgx", postgresDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db1.Close()
+	db2, err := sql.Open("pgx", postgresDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db2.Close()
+	if _, err := db1.ExecContext(ctx, "DROP TABLE IF EXISTS goncordia_jobs, goncordia_queues, goncordia_leaders, goncordia_schedule_cursors, goncordia_schema_migrations CASCADE"); err != nil {
+		t.Fatal(err)
+	}
+	drivers := []*stdlibdriver.Driver{
+		stdlibdriver.New(db1, stdlibdriver.Postgres),
+		stdlibdriver.New(db2, stdlibdriver.Postgres),
+	}
+	assertConcurrentMigrate(t, drivers)
+}
+
+func assertConcurrentMigrate(t *testing.T, drivers []*stdlibdriver.Driver) {
+	t.Helper()
+	var wg sync.WaitGroup
+	errs := make(chan error, 8)
+	for i := range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs <- drivers[i%len(drivers)].Migrate(context.Background())
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Errorf("concurrent migrate: %v", err)
+		}
+	}
+}
 
 func newPostgresDriver(t *testing.T, opts ...stdlibdriver.Option) *stdlibdriver.Driver {
 	t.Helper()
