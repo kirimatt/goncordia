@@ -369,12 +369,21 @@ func jobGetByID(ctx context.Context, svc *dynamodb.Client, id string) (*driver.J
 		return nil, err
 	}
 	if j == nil {
-		return nil, nil
+		return nil, fmt.Errorf("%w: job %q", driver.ErrNotFound, id)
 	}
 	return jobFromDynamo(*j), nil
 }
 
 func scanJobs(ctx context.Context, svc *dynamodb.Client, params driver.JobListParams) ([]driver.JobRow, error) {
+	var cursorAt time.Time
+	var cursorID string
+	if params.Cursor != "" {
+		var err error
+		cursorAt, cursorID, err = driver.DecodeJobCursor(params.Cursor)
+		if err != nil {
+			return nil, err
+		}
+	}
 	var startKey map[string]types.AttributeValue
 	var rows []driver.JobRow
 	for {
@@ -387,10 +396,11 @@ func scanJobs(ctx context.Context, svc *dynamodb.Client, params driver.JobListPa
 			if attributevalue.UnmarshalMap(item, &job) != nil {
 				continue
 			}
-			if params.Queue != "" && job.Queue != params.Queue || params.State != "" && driver.JobState(job.State) != params.State || params.Kind != "" && job.Kind != params.Kind || params.Cursor != "" && job.ID >= params.Cursor {
+			row := jobFromDynamo(job)
+			if params.Queue != "" && job.Queue != params.Queue || params.State != "" && driver.JobState(job.State) != params.State || params.Kind != "" && job.Kind != params.Kind || params.Cursor != "" && !driver.JobFollowsCursor(*row, cursorAt, cursorID) {
 				continue
 			}
-			rows = append(rows, *jobFromDynamo(job))
+			rows = append(rows, *row)
 		}
 		if len(out.LastEvaluatedKey) == 0 {
 			break
@@ -664,7 +674,7 @@ func jobSetStateIfRunning(ctx context.Context, svc *dynamodb.Client, clk clock.C
 		return err
 	}
 	if j == nil || j.State != string(driver.JobStateRunning) || !params.MatchesClaim(j.WorkerID, j.AttemptNum) {
-		return nil
+		return fmt.Errorf("%w: job %q", driver.ErrStaleClaim, params.ID)
 	}
 
 	if params.Yield {
@@ -701,7 +711,7 @@ func jobSetStateIfRunning(ctx context.Context, svc *dynamodb.Client, clk clock.C
 		if err != nil {
 			var cce *types.ConditionalCheckFailedException
 			if errors.As(err, &cce) {
-				return nil
+				return fmt.Errorf("%w: job %q", driver.ErrStaleClaim, params.ID)
 			}
 		}
 		return err
@@ -765,7 +775,7 @@ func jobSetStateIfRunning(ctx context.Context, svc *dynamodb.Client, clk clock.C
 	if err != nil {
 		var cce *types.ConditionalCheckFailedException
 		if errors.As(err, &cce) {
-			return nil
+			return fmt.Errorf("%w: job %q", driver.ErrStaleClaim, params.ID)
 		}
 		return err
 	}
@@ -789,10 +799,10 @@ func jobCancel(ctx context.Context, svc *dynamodb.Client, clk clock.Clock, id st
 		return err
 	}
 	if j == nil {
-		return fmt.Errorf("job %q not found", id)
+		return fmt.Errorf("%w: job %q", driver.ErrNotFound, id)
 	}
 	if j.State != string(driver.JobStateAvailable) && j.State != string(driver.JobStateScheduled) {
-		return fmt.Errorf("job %q is in state %s, can only cancel available/scheduled", id, j.State)
+		return fmt.Errorf("%w: job %q is in state %s, can only cancel available/scheduled", driver.ErrConflict, id, j.State)
 	}
 
 	now := clk.Now()
@@ -823,7 +833,7 @@ func jobCancel(ctx context.Context, svc *dynamodb.Client, clk clock.Clock, id st
 	if err != nil {
 		var cce *types.ConditionalCheckFailedException
 		if errors.As(err, &cce) {
-			return nil
+			return fmt.Errorf("%w: job %q changed before cancellation", driver.ErrConflict, id)
 		}
 		return err
 	}
@@ -847,7 +857,7 @@ func jobDelete(ctx context.Context, svc *dynamodb.Client, id string) error {
 		return err
 	}
 	if j == nil {
-		return nil
+		return fmt.Errorf("%w: job %q", driver.ErrNotFound, id)
 	}
 	if _, err := svc.DeleteItem(ctx, &dynamodb.DeleteItemInput{
 		TableName: aws.String(tableJobs),
@@ -876,7 +886,7 @@ func jobReschedule(ctx context.Context, svc *dynamodb.Client, params driver.Resc
 		return err
 	}
 	if j == nil {
-		return fmt.Errorf("job %q not found", params.ID)
+		return fmt.Errorf("%w: job %q", driver.ErrNotFound, params.ID)
 	}
 	_, err = svc.UpdateItem(ctx, &dynamodb.UpdateItemInput{
 		TableName: aws.String(tableJobs),
@@ -934,7 +944,7 @@ func queueGet(ctx context.Context, svc *dynamodb.Client, name string) (*driver.Q
 		return nil, err
 	}
 	if out.Item == nil {
-		return nil, fmt.Errorf("queue %q not found", name)
+		return nil, fmt.Errorf("%w: queue %q", driver.ErrNotFound, name)
 	}
 	return itemToQueueRow(out.Item, name), nil
 }
@@ -960,26 +970,44 @@ func queueSetPaused(ctx context.Context, svc *dynamodb.Client, clk clock.Clock, 
 }
 
 func queueList(ctx context.Context, svc *dynamodb.Client, params driver.QueueListParams) ([]*driver.QueueRow, error) {
-	limit := int32(params.Limit)
-	if limit <= 0 {
+	cursor := ""
+	if params.Cursor != "" {
+		var err error
+		cursor, err = driver.DecodeQueueCursor(params.Cursor)
+		if err != nil {
+			return nil, err
+		}
+	}
+	limit := params.Limit
+	if limit <= 0 || limit > 1000 {
 		limit = 100
 	}
-	out, err := svc.Scan(ctx, &dynamodb.ScanInput{
-		TableName: aws.String(tableQueues),
-		Limit:     aws.Int32(limit),
-	})
-	if err != nil {
-		return nil, err
-	}
-	rows := make([]*driver.QueueRow, 0, len(out.Items))
-	for _, item := range out.Items {
-		name := ""
-		if v, ok := item["name"]; ok {
-			if sv, ok := v.(*types.AttributeValueMemberS); ok {
-				name = sv.Value
+	var startKey map[string]types.AttributeValue
+	var rows []*driver.QueueRow
+	for {
+		out, err := svc.Scan(ctx, &dynamodb.ScanInput{TableName: aws.String(tableQueues), ExclusiveStartKey: startKey})
+		if err != nil {
+			return nil, err
+		}
+		for _, item := range out.Items {
+			name := ""
+			if v, ok := item["name"]; ok {
+				if sv, ok := v.(*types.AttributeValueMemberS); ok {
+					name = sv.Value
+				}
+			}
+			if name > cursor {
+				rows = append(rows, itemToQueueRow(item, name))
 			}
 		}
-		rows = append(rows, itemToQueueRow(item, name))
+		if len(out.LastEvaluatedKey) == 0 {
+			break
+		}
+		startKey = out.LastEvaluatedKey
+	}
+	sort.Slice(rows, func(i, j int) bool { return rows[i].Name < rows[j].Name })
+	if len(rows) > limit {
+		rows = rows[:limit]
 	}
 	return rows, nil
 }

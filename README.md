@@ -488,6 +488,21 @@ reschedule, queue pause/resume, and per-state queue counts. On Redis, Cassandra,
 DynamoDB, and Firestore, administrative list/metric operations scan records and
 are intended for moderate operational use rather than high-frequency scraping.
 
+`GET /api/jobs` and `GET /api/queues` return a page envelope:
+
+```json
+{"items": [], "next_cursor": "opaque-value", "has_more": true}
+```
+
+Pass `next_cursor` back as the `cursor` query parameter. Cursors are opaque and
+versioned; callers must not parse or construct them. Job cursors preserve the
+stable `created_at DESC, id DESC` order, including ties, and queue cursors use
+queue-name order. Invalid cursors return HTTP 400. Driver errors map consistently:
+not found to 404, conflict or stale claim to 409, and unsupported operations to
+501. Applications can classify the same errors with `errors.Is` and
+`driver.ErrNotFound`, `driver.ErrConflict`, `driver.ErrStaleClaim`,
+`driver.ErrUnsupported`, or `driver.ErrInvalidCursor`.
+
 ---
 
 ## Periodic / cron jobs
@@ -637,7 +652,7 @@ func (d *MyDriver) Listener() driver.Listener          { return nil } // nil = p
 func (d *MyDriver) Close() error                       { return nil }
 ```
 
-See [`driver/driver.go`](driver/driver.go) for the full core interface and optional rescue/admin capabilities, and [`driver/memory/memory.go`](driver/memory/memory.go) for a reference implementation. Driver authors can reuse `driver/drivertest.Run` for the base contract and `driver/drivertest.RunScheduled` with an injected `clock.Manual` for scheduled-job conformance.
+See [`driver/driver.go`](driver/driver.go) for the full core interface and optional rescue/admin capabilities, and [`driver/memory/memory.go`](driver/memory/memory.go) for a reference implementation. Driver authors can reuse `driver/drivertest.Run` for the base contract and `driver/drivertest.RunScheduled` with an injected `clock.Manual` for scheduled-job conformance. The base contract includes opaque job/queue pagination, deterministic ordering, invalid-cursor classification, fencing, and typed stale-claim behavior.
 
 ---
 

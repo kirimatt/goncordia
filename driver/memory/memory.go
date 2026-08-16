@@ -140,7 +140,7 @@ func (e *executor) JobGetByID(_ context.Context, id string) (*driver.JobRow, err
 	defer e.d.mu.Unlock()
 	row, ok := e.d.jobs[id]
 	if !ok {
-		return nil, fmt.Errorf("job %q not found", id)
+		return nil, fmt.Errorf("%w: job %q", driver.ErrNotFound, id)
 	}
 	cp := *row
 	return &cp, nil
@@ -149,9 +149,19 @@ func (e *executor) JobGetByID(_ context.Context, id string) (*driver.JobRow, err
 func (e *executor) JobList(_ context.Context, params driver.JobListParams) ([]driver.JobRow, error) {
 	e.d.mu.Lock()
 	defer e.d.mu.Unlock()
+	var cursorAt time.Time
+	var cursorID string
+	if params.Cursor != "" {
+		var err error
+		cursorAt, cursorID, err = driver.DecodeJobCursor(params.Cursor)
+		if err != nil {
+			return nil, err
+		}
+	}
 	rows := make([]driver.JobRow, 0, len(e.d.jobs))
 	for _, row := range e.d.jobs {
-		if params.Queue != "" && row.Queue != params.Queue || params.State != "" && row.State != params.State || params.Kind != "" && row.Kind != params.Kind || params.Cursor != "" && row.ID >= params.Cursor {
+		if params.Queue != "" && row.Queue != params.Queue || params.State != "" && row.State != params.State || params.Kind != "" && row.Kind != params.Kind ||
+			params.Cursor != "" && !driver.JobFollowsCursor(*row, cursorAt, cursorID) {
 			continue
 		}
 		rows = append(rows, *row)
@@ -273,7 +283,7 @@ func (e *executor) JobSetStateIfRunning(_ context.Context, params driver.JobSetS
 	defer e.d.mu.Unlock()
 	row, ok := e.d.jobs[params.ID]
 	if !ok || row.State != driver.JobStateRunning || !params.MatchesClaim(row.WorkerID, row.AttemptNum) {
-		return nil
+		return fmt.Errorf("%w: job %q", driver.ErrStaleClaim, params.ID)
 	}
 	if params.Yield {
 		row.State = driver.JobStateAvailable
@@ -309,10 +319,10 @@ func (e *executor) JobCancel(_ context.Context, id string) error {
 	defer e.d.mu.Unlock()
 	row, ok := e.d.jobs[id]
 	if !ok {
-		return fmt.Errorf("job %q not found", id)
+		return fmt.Errorf("%w: job %q", driver.ErrNotFound, id)
 	}
 	if row.State != driver.JobStateAvailable && row.State != driver.JobStateScheduled {
-		return fmt.Errorf("job %q is in state %s, can only cancel available/scheduled", id, row.State)
+		return fmt.Errorf("%w: job %q is in state %s, can only cancel available/scheduled", driver.ErrConflict, id, row.State)
 	}
 	row.State = driver.JobStateCancelled
 	now := e.d.clk.Now()
@@ -323,6 +333,9 @@ func (e *executor) JobCancel(_ context.Context, id string) error {
 func (e *executor) JobDelete(_ context.Context, id string) error {
 	e.d.mu.Lock()
 	defer e.d.mu.Unlock()
+	if _, ok := e.d.jobs[id]; !ok {
+		return fmt.Errorf("%w: job %q", driver.ErrNotFound, id)
+	}
 	delete(e.d.jobs, id)
 	return nil
 }
@@ -332,7 +345,7 @@ func (e *executor) JobReschedule(_ context.Context, params driver.ReschedulePara
 	defer e.d.mu.Unlock()
 	row, ok := e.d.jobs[params.ID]
 	if !ok {
-		return fmt.Errorf("job %q not found", params.ID)
+		return fmt.Errorf("%w: job %q", driver.ErrNotFound, params.ID)
 	}
 	row.RunAt = params.RunAt
 	row.State = driver.JobStateScheduled
@@ -344,7 +357,7 @@ func (e *executor) QueueGet(_ context.Context, name string) (*driver.QueueRow, e
 	defer e.d.mu.Unlock()
 	q, ok := e.d.queues[name]
 	if !ok {
-		return nil, fmt.Errorf("queue %q not found", name)
+		return nil, fmt.Errorf("%w: queue %q", driver.ErrNotFound, name)
 	}
 	cp := *q
 	return &cp, nil
@@ -366,13 +379,32 @@ func (e *executor) QueueResume(_ context.Context, name string) error {
 	return nil
 }
 
-func (e *executor) QueueList(_ context.Context, _ driver.QueueListParams) ([]*driver.QueueRow, error) {
+func (e *executor) QueueList(_ context.Context, params driver.QueueListParams) ([]*driver.QueueRow, error) {
 	e.d.mu.Lock()
 	defer e.d.mu.Unlock()
+	cursor := ""
+	if params.Cursor != "" {
+		var err error
+		cursor, err = driver.DecodeQueueCursor(params.Cursor)
+		if err != nil {
+			return nil, err
+		}
+	}
 	rows := make([]*driver.QueueRow, 0, len(e.d.queues))
 	for _, q := range e.d.queues {
+		if q.Name <= cursor {
+			continue
+		}
 		cp := *q
 		rows = append(rows, &cp)
+	}
+	sort.Slice(rows, func(i, j int) bool { return rows[i].Name < rows[j].Name })
+	limit := params.Limit
+	if limit <= 0 || limit > 1000 {
+		limit = 100
+	}
+	if len(rows) > limit {
+		rows = rows[:limit]
 	}
 	return rows, nil
 }

@@ -240,6 +240,15 @@ func selectJob(ctx context.Context, session *gocql.Session, id string) (cassandr
 }
 
 func jobList(ctx context.Context, session *gocql.Session, params driver.JobListParams) ([]driver.JobRow, error) {
+	var cursorAt time.Time
+	var cursorID string
+	if params.Cursor != "" {
+		var err error
+		cursorAt, cursorID, err = driver.DecodeJobCursor(params.Cursor)
+		if err != nil {
+			return nil, err
+		}
+	}
 	iter := session.Query(`SELECT id,queue,kind,args,state,priority,run_at,created_at,
 		attempted_at,finalized_at,attempt_num,max_retry,timeout_ms,
 		unique_key,worker_id,tags,errors_json,version,pipeline_id FROM goncordia_jobs`).WithContext(ctx).Iter()
@@ -252,10 +261,11 @@ func jobList(ctx context.Context, session *gocql.Session, params driver.JobListP
 			&j.UniqueKey, &j.WorkerID, &j.Tags, &j.ErrorsJSON, &j.Version, &j.PipelineID) {
 			break
 		}
-		if params.Queue != "" && j.Queue != params.Queue || params.State != "" && driver.JobState(j.State) != params.State || params.Kind != "" && j.Kind != params.Kind || params.Cursor != "" && j.ID >= params.Cursor {
+		row := jobToRow(j)
+		if params.Queue != "" && j.Queue != params.Queue || params.State != "" && driver.JobState(j.State) != params.State || params.Kind != "" && j.Kind != params.Kind || params.Cursor != "" && !driver.JobFollowsCursor(*row, cursorAt, cursorID) {
 			continue
 		}
-		rows = append(rows, *jobToRow(j))
+		rows = append(rows, *row)
 	}
 	if err := iter.Close(); err != nil {
 		return nil, err
@@ -392,7 +402,7 @@ func jobInsertMany(ctx context.Context, session *gocql.Session, clk clock.Clock,
 func jobGetByID(ctx context.Context, session *gocql.Session, id string) (*driver.JobRow, error) {
 	j, err := selectJob(ctx, session, id)
 	if err == gocql.ErrNotFound {
-		return nil, nil
+		return nil, fmt.Errorf("%w: job %q", driver.ErrNotFound, id)
 	}
 	if err != nil {
 		return nil, err
@@ -598,13 +608,13 @@ func jobHeartbeat(ctx context.Context, session *gocql.Session, params driver.Job
 func jobSetStateIfRunning(ctx context.Context, session *gocql.Session, clk clock.Clock, params driver.JobSetStateParams) error {
 	j, err := selectJob(ctx, session, params.ID)
 	if err == gocql.ErrNotFound {
-		return nil
+		return fmt.Errorf("%w: job %q", driver.ErrStaleClaim, params.ID)
 	}
 	if err != nil {
 		return err
 	}
 	if j.State != string(driver.JobStateRunning) || !params.MatchesClaim(j.WorkerID, j.AttemptNum) {
-		return nil
+		return fmt.Errorf("%w: job %q", driver.ErrStaleClaim, params.ID)
 	}
 
 	if params.Yield {
@@ -613,8 +623,11 @@ func jobSetStateIfRunning(ctx context.Context, session *gocql.Session, clk clock
 			 WHERE id=? IF state=? AND version=?`,
 			string(driver.JobStateAvailable), time.Time{}, params.ID, string(driver.JobStateRunning), j.Version,
 		).WithContext(ctx).MapScanCAS(map[string]interface{}{})
-		if err != nil || !applied {
+		if err != nil {
 			return err
+		}
+		if !applied {
+			return fmt.Errorf("%w: job %q", driver.ErrStaleClaim, params.ID)
 		}
 		if err := deleteRunningLookup(ctx, session, j); err != nil {
 			return err
@@ -650,7 +663,7 @@ func jobSetStateIfRunning(ctx context.Context, session *gocql.Session, clk clock
 			return err
 		}
 		if !applied {
-			return nil
+			return fmt.Errorf("%w: job %q", driver.ErrStaleClaim, params.ID)
 		}
 		if err := deleteRunningLookup(ctx, session, j); err != nil {
 			return err
@@ -668,8 +681,11 @@ func jobSetStateIfRunning(ctx context.Context, session *gocql.Session, clk clock
 		 WHERE id=? IF state=? AND version=?`,
 		string(params.State), now, errJSON, params.ID, string(driver.JobStateRunning), j.Version,
 	).WithContext(ctx).MapScanCAS(map[string]interface{}{})
-	if stateErr != nil || !applied {
+	if stateErr != nil {
 		return stateErr
+	}
+	if !applied {
+		return fmt.Errorf("%w: job %q", driver.ErrStaleClaim, params.ID)
 	}
 	if err := deleteRunningLookup(ctx, session, j); err != nil {
 		return err
@@ -693,22 +709,26 @@ func deleteRunningLookup(ctx context.Context, session *gocql.Session, job cassan
 func jobCancel(ctx context.Context, session *gocql.Session, clk clock.Clock, id string) error {
 	j, err := selectJob(ctx, session, id)
 	if err == gocql.ErrNotFound {
-		return fmt.Errorf("job %q not found", id)
+		return fmt.Errorf("%w: job %q", driver.ErrNotFound, id)
 	}
 	if err != nil {
 		return err
 	}
 	if j.State != string(driver.JobStateAvailable) && j.State != string(driver.JobStateScheduled) {
-		return fmt.Errorf("job %q is in state %s, can only cancel available/scheduled", id, j.State)
+		return fmt.Errorf("%w: job %q is in state %s, can only cancel available/scheduled", driver.ErrConflict, id, j.State)
 	}
 
 	now := clk.Now()
-	if _, cancelErr := session.Query(
+	applied, cancelErr := session.Query(
 		`UPDATE goncordia_jobs SET state=?, finalized_at=?, version=version+1
 		 WHERE id=? IF state IN ('available','scheduled')`,
 		string(driver.JobStateCancelled), now, id,
-	).WithContext(ctx).MapScanCAS(map[string]interface{}{}); cancelErr != nil {
+	).WithContext(ctx).MapScanCAS(map[string]interface{}{})
+	if cancelErr != nil {
 		return cancelErr
+	}
+	if !applied {
+		return fmt.Errorf("%w: job %q changed before cancellation", driver.ErrConflict, id)
 	}
 
 	// Clean up avail lookup if it was available (not scheduled).
@@ -729,7 +749,7 @@ func jobCancel(ctx context.Context, session *gocql.Session, clk clock.Clock, id 
 func jobDelete(ctx context.Context, session *gocql.Session, id string) error {
 	j, err := selectJob(ctx, session, id)
 	if err == gocql.ErrNotFound {
-		return nil
+		return fmt.Errorf("%w: job %q", driver.ErrNotFound, id)
 	}
 	if err != nil {
 		return err
@@ -754,7 +774,7 @@ func jobDelete(ctx context.Context, session *gocql.Session, id string) error {
 func jobReschedule(ctx context.Context, session *gocql.Session, params driver.RescheduleParams) error {
 	j, err := selectJob(ctx, session, params.ID)
 	if err == gocql.ErrNotFound {
-		return fmt.Errorf("job %q not found", params.ID)
+		return fmt.Errorf("%w: job %q", driver.ErrNotFound, params.ID)
 	}
 	if err != nil {
 		return err
@@ -795,7 +815,7 @@ func queueGet(ctx context.Context, session *gocql.Session, name string) (*driver
 	err := session.Query(`SELECT name, paused, created_at, updated_at FROM goncordia_queues WHERE name=?`, name).
 		WithContext(ctx).Scan(&row.Name, &row.Paused, &createdAt, &updatedAt)
 	if err == gocql.ErrNotFound {
-		return nil, fmt.Errorf("queue %q not found", name)
+		return nil, fmt.Errorf("%w: queue %q", driver.ErrNotFound, name)
 	}
 	if err != nil {
 		return nil, err
@@ -814,17 +834,28 @@ func queueSetPaused(ctx context.Context, session *gocql.Session, clk clock.Clock
 }
 
 func queueList(ctx context.Context, session *gocql.Session, params driver.QueueListParams) ([]*driver.QueueRow, error) {
+	cursor := ""
+	if params.Cursor != "" {
+		var err error
+		cursor, err = driver.DecodeQueueCursor(params.Cursor)
+		if err != nil {
+			return nil, err
+		}
+	}
 	limit := params.Limit
-	if limit <= 0 {
+	if limit <= 0 || limit > 1000 {
 		limit = 100
 	}
-	iter := session.Query(`SELECT name, paused, created_at, updated_at FROM goncordia_queues LIMIT ?`, limit).
+	iter := session.Query(`SELECT name, paused, created_at, updated_at FROM goncordia_queues`).
 		WithContext(ctx).Iter()
 	var rows []*driver.QueueRow
 	var name string
 	var paused bool
 	var createdAt, updatedAt time.Time
 	for iter.Scan(&name, &paused, &createdAt, &updatedAt) {
+		if name <= cursor {
+			continue
+		}
 		rows = append(rows, &driver.QueueRow{
 			Name:      name,
 			Paused:    paused,
@@ -832,7 +863,14 @@ func queueList(ctx context.Context, session *gocql.Session, params driver.QueueL
 			UpdatedAt: updatedAt.UTC(),
 		})
 	}
-	return rows, iter.Close()
+	if err := iter.Close(); err != nil {
+		return nil, err
+	}
+	sort.Slice(rows, func(i, j int) bool { return rows[i].Name < rows[j].Name })
+	if len(rows) > limit {
+		rows = rows[:limit]
+	}
+	return rows, nil
 }
 
 // ---- Leader election ----

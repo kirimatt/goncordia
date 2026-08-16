@@ -237,8 +237,6 @@ const sqlJobReschedule = `UPDATE goncordia_jobs SET state = 'scheduled', run_at 
 
 const sqlQueueGet = `SELECT name, paused, created_at, updated_at FROM goncordia_queues WHERE name = ?`
 
-const sqlQueueList = `SELECT name, paused, created_at, updated_at FROM goncordia_queues ORDER BY name LIMIT ?`
-
 const sqlQueueUpsertPostgres = `INSERT INTO goncordia_queues (name, paused, created_at, updated_at)
 VALUES ($1, $2, $3, $3)
 ON CONFLICT (name) DO UPDATE SET paused = EXCLUDED.paused, updated_at = EXCLUDED.updated_at`
@@ -380,7 +378,11 @@ LIMIT 1`)
 
 func jobGetByID(ctx context.Context, q querier, d Dialect, id string) (*driver.JobRow, error) {
 	query := d.q(`SELECT ` + selectJobCols + ` FROM goncordia_jobs WHERE id = ?`)
-	return scanJobRow(d, q.QueryRowContext(ctx, query, id))
+	row, err := scanJobRow(d, q.QueryRowContext(ctx, query, id))
+	if err == sql.ErrNoRows {
+		return nil, fmt.Errorf("%w: job %q", driver.ErrNotFound, id)
+	}
+	return row, err
 }
 
 func jobList(ctx context.Context, q querier, d Dialect, params driver.JobListParams) ([]driver.JobRow, error) {
@@ -399,8 +401,12 @@ func jobList(ctx context.Context, q querier, d Dialect, params driver.JobListPar
 		args = append(args, params.Kind)
 	}
 	if params.Cursor != "" {
-		query += ` AND id<?`
-		args = append(args, params.Cursor)
+		cursorAt, cursorID, err := driver.DecodeJobCursor(params.Cursor)
+		if err != nil {
+			return nil, err
+		}
+		query += ` AND (created_at<? OR (created_at=? AND id<?))`
+		args = append(args, cursorAt, cursorAt, cursorID)
 	}
 	limit := params.Limit
 	if limit <= 0 || limit > 1000 {
@@ -559,10 +565,10 @@ WHERE id IN (`+inList+`)`),
 
 func jobSetStateIfRunning(ctx context.Context, q querier, d Dialect, clk clock.Clock, params driver.JobSetStateParams) error {
 	if params.Yield {
-		_, err := q.ExecContext(ctx, d.q(sqlYield), params.ID,
+		result, err := q.ExecContext(ctx, d.q(sqlYield), params.ID,
 			params.ExpectedWorkerID, params.ExpectedWorkerID,
 			params.ExpectedAttempt, params.ExpectedAttempt)
-		return err
+		return staleClaimIfNoRows(result, err, params.ID)
 	}
 
 	var finalizedAt *time.Time
@@ -595,9 +601,9 @@ func jobSetStateIfRunning(ctx context.Context, q querier, d Dialect, clk clock.C
 	}
 
 	if d == Postgres {
-		_, err := q.ExecContext(ctx, sqlSetStatePostgres, params.ID, targetState, finalizedAt, retryAt, errJSON,
+		result, err := q.ExecContext(ctx, sqlSetStatePostgres, params.ID, targetState, finalizedAt, retryAt, errJSON,
 			params.ExpectedWorkerID, params.ExpectedAttempt, terminal)
-		return err
+		return staleClaimIfNoRows(result, err, params.ID)
 	}
 
 	if errJSON != nil {
@@ -611,31 +617,64 @@ func jobSetStateIfRunning(ctx context.Context, q querier, d Dialect, clk clock.C
 			return err
 		}
 	}
-	if _, err := q.ExecContext(ctx, sqlSetStateMain, targetState, finalizedAt, retryAt, terminal, params.ID,
+	result, err := q.ExecContext(ctx, sqlSetStateMain, targetState, finalizedAt, retryAt, terminal, params.ID,
 		params.ExpectedWorkerID, params.ExpectedWorkerID,
-		params.ExpectedAttempt, params.ExpectedAttempt); err != nil {
+		params.ExpectedAttempt, params.ExpectedAttempt)
+	return staleClaimIfNoRows(result, err, params.ID)
+}
+
+func staleClaimIfNoRows(result sql.Result, err error, id string) error {
+	if err != nil {
 		return err
+	}
+	if rows, rowsErr := result.RowsAffected(); rowsErr == nil && rows == 0 {
+		return fmt.Errorf("%w: job %q", driver.ErrStaleClaim, id)
 	}
 	return nil
 }
 
 func jobCancel(ctx context.Context, q querier, d Dialect, clk clock.Clock, id string) error {
-	_, err := q.ExecContext(ctx, d.q(sqlJobCancel), clk.Now(), id)
-	return err
+	result, err := q.ExecContext(ctx, d.q(sqlJobCancel), clk.Now(), id)
+	if err != nil {
+		return err
+	}
+	if rows, _ := result.RowsAffected(); rows == 0 {
+		if _, getErr := jobGetByID(ctx, q, d, id); getErr != nil {
+			return getErr
+		}
+		return fmt.Errorf("%w: job %q cannot be cancelled in its current state", driver.ErrConflict, id)
+	}
+	return nil
 }
 
 func jobDelete(ctx context.Context, q querier, d Dialect, id string) error {
-	_, err := q.ExecContext(ctx, d.q(sqlJobDelete), id)
-	return err
+	result, err := q.ExecContext(ctx, d.q(sqlJobDelete), id)
+	if err != nil {
+		return err
+	}
+	if rows, _ := result.RowsAffected(); rows == 0 {
+		return fmt.Errorf("%w: job %q", driver.ErrNotFound, id)
+	}
+	return nil
 }
 
 func jobReschedule(ctx context.Context, q querier, d Dialect, params driver.RescheduleParams) error {
-	_, err := q.ExecContext(ctx, d.q(sqlJobReschedule), params.RunAt, params.ID)
-	return err
+	result, err := q.ExecContext(ctx, d.q(sqlJobReschedule), params.RunAt, params.ID)
+	if err != nil {
+		return err
+	}
+	if rows, _ := result.RowsAffected(); rows == 0 {
+		return fmt.Errorf("%w: job %q", driver.ErrNotFound, params.ID)
+	}
+	return nil
 }
 
 func queueGet(ctx context.Context, q querier, d Dialect, name string) (*driver.QueueRow, error) {
-	return scanQueueRow(q.QueryRowContext(ctx, d.q(sqlQueueGet), name))
+	row, err := scanQueueRow(q.QueryRowContext(ctx, d.q(sqlQueueGet), name))
+	if err == sql.ErrNoRows {
+		return nil, fmt.Errorf("%w: queue %q", driver.ErrNotFound, name)
+	}
+	return row, err
 }
 
 func queueSetPaused(ctx context.Context, q querier, d Dialect, clk clock.Clock, name string, paused bool) error {
@@ -655,10 +694,22 @@ func queueSetPaused(ctx context.Context, q querier, d Dialect, clk clock.Clock, 
 
 func queueList(ctx context.Context, q querier, d Dialect, params driver.QueueListParams) ([]*driver.QueueRow, error) {
 	limit := params.Limit
-	if limit <= 0 {
+	if limit <= 0 || limit > 1000 {
 		limit = 100
 	}
-	rows, err := q.QueryContext(ctx, d.q(sqlQueueList), limit)
+	query := `SELECT name, paused, created_at, updated_at FROM goncordia_queues`
+	var args []any
+	if params.Cursor != "" {
+		cursor, err := driver.DecodeQueueCursor(params.Cursor)
+		if err != nil {
+			return nil, err
+		}
+		query += ` WHERE name>?`
+		args = append(args, cursor)
+	}
+	query += ` ORDER BY name LIMIT ?`
+	args = append(args, limit)
+	rows, err := q.QueryContext(ctx, d.q(query), args...)
 	if err != nil {
 		return nil, err
 	}

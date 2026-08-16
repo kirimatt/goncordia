@@ -464,7 +464,7 @@ func jobInsertMany(ctx context.Context, rdb *redis.Client, clk clock.Clock, para
 func jobGetByID(ctx context.Context, rdb *redis.Client, id string) (*driver.JobRow, error) {
 	raw, err := rdb.Get(ctx, jobKey(id)).Bytes()
 	if err == redis.Nil {
-		return nil, nil
+		return nil, fmt.Errorf("%w: job %q", driver.ErrNotFound, id)
 	}
 	if err != nil {
 		return nil, err
@@ -477,6 +477,15 @@ func jobGetByID(ctx context.Context, rdb *redis.Client, id string) (*driver.JobR
 }
 
 func scanJobs(ctx context.Context, rdb *redis.Client, params driver.JobListParams) ([]driver.JobRow, error) {
+	var cursorAt time.Time
+	var cursorID string
+	if params.Cursor != "" {
+		var err error
+		cursorAt, cursorID, err = driver.DecodeJobCursor(params.Cursor)
+		if err != nil {
+			return nil, err
+		}
+	}
 	var cursor uint64
 	var rows []driver.JobRow
 	for {
@@ -493,10 +502,11 @@ func scanJobs(ctx context.Context, rdb *redis.Client, params driver.JobListParam
 			if err := json.Unmarshal(raw, &job); err != nil {
 				return nil, fmt.Errorf("decode %s: %w", key, err)
 			}
-			if params.Queue != "" && job.Queue != params.Queue || params.State != "" && driver.JobState(job.State) != params.State || params.Kind != "" && job.Kind != params.Kind || params.Cursor != "" && job.ID >= params.Cursor {
+			row := jobToRow(job)
+			if params.Queue != "" && job.Queue != params.Queue || params.State != "" && driver.JobState(job.State) != params.State || params.Kind != "" && job.Kind != params.Kind || params.Cursor != "" && !driver.JobFollowsCursor(*row, cursorAt, cursorID) {
 				continue
 			}
-			rows = append(rows, *jobToRow(job))
+			rows = append(rows, *row)
 		}
 		cursor = next
 		if cursor == 0 {
@@ -577,7 +587,7 @@ func jobSetStateIfRunning(ctx context.Context, rdb *redis.Client, clk clock.Cloc
 		err := rdb.Watch(ctx, func(tx *redis.Tx) error {
 			raw, err := tx.Get(ctx, key).Bytes()
 			if err == redis.Nil {
-				return nil
+				return fmt.Errorf("%w: job %q", driver.ErrStaleClaim, params.ID)
 			}
 			if err != nil {
 				return err
@@ -588,7 +598,7 @@ func jobSetStateIfRunning(ctx context.Context, rdb *redis.Client, clk clock.Cloc
 				return err
 			}
 			if job.State != string(driver.JobStateRunning) || !params.MatchesClaim(job.WorkerID, job.AttemptNum) {
-				return nil
+				return fmt.Errorf("%w: job %q", driver.ErrStaleClaim, params.ID)
 			}
 
 			now := clk.Now()
@@ -655,7 +665,7 @@ func jobSetStateIfRunning(ctx context.Context, rdb *redis.Client, clk clock.Cloc
 func jobCancel(ctx context.Context, rdb *redis.Client, clk clock.Clock, id string) error {
 	raw, err := rdb.Get(ctx, jobKey(id)).Bytes()
 	if err == redis.Nil {
-		return fmt.Errorf("job %q not found", id)
+		return fmt.Errorf("%w: job %q", driver.ErrNotFound, id)
 	}
 	if err != nil {
 		return err
@@ -665,7 +675,7 @@ func jobCancel(ctx context.Context, rdb *redis.Client, clk clock.Clock, id strin
 		return err
 	}
 	if job.State != string(driver.JobStateAvailable) && job.State != string(driver.JobStateScheduled) {
-		return fmt.Errorf("job %q is in state %s, can only cancel available/scheduled", id, job.State)
+		return fmt.Errorf("%w: job %q is in state %s, can only cancel available/scheduled", driver.ErrConflict, id, job.State)
 	}
 
 	now := clk.Now()
@@ -687,14 +697,14 @@ func jobCancel(ctx context.Context, rdb *redis.Client, clk clock.Clock, id strin
 func jobDelete(ctx context.Context, rdb *redis.Client, id string) error {
 	raw, err := rdb.Get(ctx, jobKey(id)).Bytes()
 	if err == redis.Nil {
-		return nil
+		return fmt.Errorf("%w: job %q", driver.ErrNotFound, id)
 	}
 	if err != nil {
 		return err
 	}
 	var job redisJob
 	if err := json.Unmarshal(raw, &job); err != nil {
-		return nil
+		return err
 	}
 	pipe := rdb.Pipeline()
 	pipe.Del(ctx, jobKey(id))
@@ -711,7 +721,7 @@ func jobDelete(ctx context.Context, rdb *redis.Client, id string) error {
 func jobReschedule(ctx context.Context, rdb *redis.Client, params driver.RescheduleParams) error {
 	raw, err := rdb.Get(ctx, jobKey(params.ID)).Bytes()
 	if err == redis.Nil {
-		return fmt.Errorf("job %q not found", params.ID)
+		return fmt.Errorf("%w: job %q", driver.ErrNotFound, params.ID)
 	}
 	if err != nil {
 		return err
@@ -749,7 +759,7 @@ func queueGet(ctx context.Context, rdb *redis.Client, clk clock.Clock, name stri
 		return nil, err
 	}
 	if len(vals) == 0 {
-		return nil, fmt.Errorf("queue %q not found", name)
+		return nil, fmt.Errorf("%w: queue %q", driver.ErrNotFound, name)
 	}
 	return parseQueueRow(name, vals), nil
 }
@@ -769,17 +779,36 @@ func queueSetPaused(ctx context.Context, rdb *redis.Client, clk clock.Clock, nam
 }
 
 func queueList(ctx context.Context, rdb *redis.Client, clk clock.Clock, params driver.QueueListParams) ([]*driver.QueueRow, error) {
+	cursor := ""
+	if params.Cursor != "" {
+		var err error
+		cursor, err = driver.DecodeQueueCursor(params.Cursor)
+		if err != nil {
+			return nil, err
+		}
+	}
 	names, err := rdb.SMembers(ctx, queuesSetKey).Result()
 	if err != nil {
 		return nil, err
 	}
 	rows := make([]*driver.QueueRow, 0, len(names))
 	for _, name := range names {
+		if name <= cursor {
+			continue
+		}
 		vals, err := rdb.HGetAll(ctx, metaKey(name)).Result()
 		if err != nil || len(vals) == 0 {
 			continue
 		}
 		rows = append(rows, parseQueueRow(name, vals))
+	}
+	sort.Slice(rows, func(i, j int) bool { return rows[i].Name < rows[j].Name })
+	limit := params.Limit
+	if limit <= 0 || limit > 1000 {
+		limit = 100
+	}
+	if len(rows) > limit {
+		rows = rows[:limit]
 	}
 	return rows, nil
 }

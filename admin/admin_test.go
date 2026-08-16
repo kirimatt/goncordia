@@ -45,12 +45,60 @@ func TestHandler(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer response.Body.Close()
-	var jobs []driver.JobRow
-	if err := json.NewDecoder(response.Body).Decode(&jobs); err != nil {
+	var page driver.JobPage
+	if err := json.NewDecoder(response.Body).Decode(&page); err != nil {
 		t.Fatal(err)
 	}
-	if len(jobs) != 1 || jobs[0].Kind != "admin_test" {
-		t.Fatalf("unexpected jobs: %+v", jobs)
+	if len(page.Items) != 1 || page.Items[0].Kind != "admin_test" || page.HasMore || page.NextCursor != "" {
+		t.Fatalf("unexpected page: %+v", page)
+	}
+
+	response, err = http.Get(server.URL + "/api/jobs?cursor=invalid")
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if response.StatusCode != http.StatusBadRequest {
+		t.Fatalf("invalid cursor status=%d, want 400", response.StatusCode)
+	}
+
+	response, err = http.Get(server.URL + "/api/jobs?id=missing")
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if response.StatusCode != http.StatusNotFound {
+		t.Fatalf("missing job status=%d, want 404", response.StatusCode)
+	}
+
+	for _, value := range []string{"two", "three"} {
+		if _, err := client.Enqueue(context.Background(), args{Value: value}, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	response, err = http.Get(server.URL + "/api/jobs?limit=2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var firstPage driver.JobPage
+	if err := json.NewDecoder(response.Body).Decode(&firstPage); err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if len(firstPage.Items) != 2 || !firstPage.HasMore || firstPage.NextCursor == "" {
+		t.Fatalf("unexpected first page: %+v", firstPage)
+	}
+	response, err = http.Get(server.URL + "/api/jobs?limit=2&cursor=" + firstPage.NextCursor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var secondPage driver.JobPage
+	if err := json.NewDecoder(response.Body).Decode(&secondPage); err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if len(secondPage.Items) != 1 || secondPage.HasMore || secondPage.NextCursor != "" {
+		t.Fatalf("unexpected second page: %+v", secondPage)
 	}
 
 	response, err = http.Post(server.URL+"/api/queues/default/pause", "application/json", nil)

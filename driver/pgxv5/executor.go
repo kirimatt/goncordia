@@ -267,7 +267,11 @@ SELECT id, queue, kind, args, state, priority, run_at, created_at,
        attempted_at, finalized_at, attempt_num, max_retry, timeout_ms,
        unique_key, worker_id, tags, errors, pipeline_id
 FROM goncordia_jobs WHERE id = $1`
-	return scanJobRow(q.QueryRow(ctx, sql, idInt))
+	row, err := scanJobRow(q.QueryRow(ctx, sql, idInt))
+	if err == pgx.ErrNoRows {
+		return nil, fmt.Errorf("%w: job %q", driver.ErrNotFound, id)
+	}
+	return row, err
 }
 
 func jobList(ctx context.Context, q querier, params driver.JobListParams) ([]driver.JobRow, error) {
@@ -290,11 +294,16 @@ FROM goncordia_jobs WHERE TRUE`
 		add(" AND kind=$%d", params.Kind)
 	}
 	if params.Cursor != "" {
-		cursor, err := strconv.ParseInt(params.Cursor, 10, 64)
+		cursorAt, cursorID, err := driver.DecodeJobCursor(params.Cursor)
 		if err != nil {
-			return nil, fmt.Errorf("invalid cursor %q: %w", params.Cursor, err)
+			return nil, err
 		}
-		add(" AND id<$%d", cursor)
+		id, err := strconv.ParseInt(cursorID, 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("%w: invalid postgres job id", driver.ErrInvalidCursor)
+		}
+		args = append(args, cursorAt, id)
+		query += fmt.Sprintf(" AND (created_at<$%d OR (created_at=$%d AND id<$%d))", len(args)-1, len(args)-1, len(args))
 	}
 	limit := params.Limit
 	if limit <= 0 || limit > 1000 {
@@ -401,7 +410,10 @@ UPDATE goncordia_jobs SET
 WHERE id = $1 AND state = 'running'
   AND ($2 = '' OR worker_id = $2)
   AND ($3 = 0 OR attempt_num = $3)`
-		_, err = q.Exec(ctx, yieldSQL, idInt, params.ExpectedWorkerID, params.ExpectedAttempt)
+		tag, err := q.Exec(ctx, yieldSQL, idInt, params.ExpectedWorkerID, params.ExpectedAttempt)
+		if err == nil && tag.RowsAffected() == 0 {
+			return fmt.Errorf("%w: job %q", driver.ErrStaleClaim, params.ID)
+		}
 		return err
 	}
 
@@ -441,7 +453,10 @@ WHERE id = $1 AND state = 'running'
   AND ($6 = '' OR worker_id = $6)
   AND ($7 = 0 OR attempt_num = $7)`
 
-	_, err = q.Exec(ctx, sql, idInt, targetState, finalizedAt, retryAt, errJSON, params.ExpectedWorkerID, params.ExpectedAttempt, terminal)
+	tag, err := q.Exec(ctx, sql, idInt, targetState, finalizedAt, retryAt, errJSON, params.ExpectedWorkerID, params.ExpectedAttempt, terminal)
+	if err == nil && tag.RowsAffected() == 0 {
+		return fmt.Errorf("%w: job %q", driver.ErrStaleClaim, params.ID)
+	}
 	return err
 }
 
@@ -456,8 +471,17 @@ UPDATE goncordia_jobs
 SET state = 'cancelled', finalized_at = $2,
     unique_key = CASE WHEN unique_key LIKE 'uf2_%' THEN unique_key ELSE NULL END
 WHERE id = $1 AND state IN ('available', 'scheduled')`
-	_, err = q.Exec(ctx, sql, idInt, now)
-	return err
+	tag, err := q.Exec(ctx, sql, idInt, now)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		if _, getErr := jobGetByID(ctx, q, id); getErr != nil {
+			return getErr
+		}
+		return fmt.Errorf("%w: job %q cannot be cancelled in its current state", driver.ErrConflict, id)
+	}
+	return nil
 }
 
 func jobDelete(ctx context.Context, q querier, id string) error {
@@ -465,7 +489,10 @@ func jobDelete(ctx context.Context, q querier, id string) error {
 	if err != nil {
 		return fmt.Errorf("invalid job id %q: %w", id, err)
 	}
-	_, err = q.Exec(ctx, `DELETE FROM goncordia_jobs WHERE id = $1`, idInt)
+	tag, err := q.Exec(ctx, `DELETE FROM goncordia_jobs WHERE id = $1`, idInt)
+	if err == nil && tag.RowsAffected() == 0 {
+		return fmt.Errorf("%w: job %q", driver.ErrNotFound, id)
+	}
 	return err
 }
 
@@ -475,13 +502,20 @@ func jobReschedule(ctx context.Context, q querier, params driver.RescheduleParam
 		return fmt.Errorf("invalid job id %q: %w", params.ID, err)
 	}
 	const sql = `UPDATE goncordia_jobs SET state = 'scheduled', run_at = $2 WHERE id = $1`
-	_, err = q.Exec(ctx, sql, idInt, params.RunAt)
+	tag, err := q.Exec(ctx, sql, idInt, params.RunAt)
+	if err == nil && tag.RowsAffected() == 0 {
+		return fmt.Errorf("%w: job %q", driver.ErrNotFound, params.ID)
+	}
 	return err
 }
 
 func queueGet(ctx context.Context, q querier, name string) (*driver.QueueRow, error) {
 	const sql = `SELECT name, paused, created_at, updated_at FROM goncordia_queues WHERE name = $1`
-	return scanQueueRow(q.QueryRow(ctx, sql, name))
+	row, err := scanQueueRow(q.QueryRow(ctx, sql, name))
+	if err == pgx.ErrNoRows {
+		return nil, fmt.Errorf("%w: queue %q", driver.ErrNotFound, name)
+	}
+	return row, err
 }
 
 func queueSetPaused(ctx context.Context, q querier, clk clock.Clock, name string, paused bool) error {
@@ -495,11 +529,22 @@ ON CONFLICT (name) DO UPDATE SET paused = EXCLUDED.paused, updated_at = EXCLUDED
 
 func queueList(ctx context.Context, q querier, params driver.QueueListParams) ([]*driver.QueueRow, error) {
 	limit := params.Limit
-	if limit <= 0 {
+	if limit <= 0 || limit > 1000 {
 		limit = 100
 	}
-	const sql = `SELECT name, paused, created_at, updated_at FROM goncordia_queues ORDER BY name LIMIT $1`
-	rows, err := q.Query(ctx, sql, limit)
+	query := `SELECT name, paused, created_at, updated_at FROM goncordia_queues`
+	var args []any
+	if params.Cursor != "" {
+		cursor, err := driver.DecodeQueueCursor(params.Cursor)
+		if err != nil {
+			return nil, err
+		}
+		query += ` WHERE name>$1`
+		args = append(args, cursor)
+	}
+	query += fmt.Sprintf(` ORDER BY name LIMIT $%d`, len(args)+1)
+	args = append(args, limit)
+	rows, err := q.Query(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}

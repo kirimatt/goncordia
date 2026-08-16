@@ -285,7 +285,7 @@ func jobGetByID(ctx context.Context, db *mongo.Database, id string) (*driver.Job
 	var doc jobDoc
 	if err := db.Collection(jobsCollection).FindOne(ctx, bson.M{"_id": oid}).Decode(&doc); err != nil {
 		if err == mongo.ErrNoDocuments {
-			return nil, nil
+			return nil, fmt.Errorf("%w: job %q", driver.ErrNotFound, id)
 		}
 		return nil, err
 	}
@@ -305,11 +305,18 @@ func jobList(ctx context.Context, db *mongo.Database, params driver.JobListParam
 		filter["kind"] = params.Kind
 	}
 	if params.Cursor != "" {
-		cursor, err := primitive.ObjectIDFromHex(params.Cursor)
+		cursorAt, cursorID, err := driver.DecodeJobCursor(params.Cursor)
 		if err != nil {
-			return nil, fmt.Errorf("invalid cursor %q: %w", params.Cursor, err)
+			return nil, err
 		}
-		filter["_id"] = bson.M{"$lt": cursor}
+		cursorOID, err := primitive.ObjectIDFromHex(cursorID)
+		if err != nil {
+			return nil, fmt.Errorf("%w: invalid mongodb job id", driver.ErrInvalidCursor)
+		}
+		filter["$or"] = bson.A{
+			bson.M{"created_at": bson.M{"$lt": cursorAt}},
+			bson.M{"created_at": cursorAt, "_id": bson.M{"$lt": cursorOID}},
+		}
 	}
 	limit := params.Limit
 	if limit <= 0 || limit > 1000 {
@@ -447,7 +454,7 @@ func jobSetStateIfRunning(ctx context.Context, db *mongo.Database, clk clock.Clo
 	}
 
 	if params.Yield {
-		_, err = db.Collection(jobsCollection).UpdateOne(ctx,
+		result, updateErr := db.Collection(jobsCollection).UpdateOne(ctx,
 			filter,
 			bson.M{
 				"$set":   bson.M{"state": string(driver.JobStateAvailable), "attempted_at": nil},
@@ -455,7 +462,10 @@ func jobSetStateIfRunning(ctx context.Context, db *mongo.Database, clk clock.Clo
 				"$unset": bson.M{"worker_id": ""},
 			},
 		)
-		return err
+		if updateErr == nil && result.ModifiedCount == 0 {
+			return fmt.Errorf("%w: job %q", driver.ErrStaleClaim, params.ID)
+		}
+		return updateErr
 	}
 
 	now := clk.Now()
@@ -471,7 +481,7 @@ func jobSetStateIfRunning(ctx context.Context, db *mongo.Database, clk clock.Clo
 		}
 		if err := db.Collection(jobsCollection).FindOne(ctx, filter,
 			options.FindOne().SetProjection(bson.M{"unique_key": 1})).Decode(&current); err == mongo.ErrNoDocuments {
-			return nil
+			return fmt.Errorf("%w: job %q", driver.ErrStaleClaim, params.ID)
 		} else if err != nil {
 			return err
 		}
@@ -501,10 +511,13 @@ func jobSetStateIfRunning(ctx context.Context, db *mongo.Database, clk clock.Clo
 		update["$push"] = push
 	}
 
-	_, err = db.Collection(jobsCollection).UpdateOne(ctx,
+	result, err := db.Collection(jobsCollection).UpdateOne(ctx,
 		filter,
 		update,
 	)
+	if err == nil && result.ModifiedCount == 0 {
+		return fmt.Errorf("%w: job %q", driver.ErrStaleClaim, params.ID)
+	}
 	return err
 }
 
@@ -521,7 +534,10 @@ func jobCancel(ctx context.Context, db *mongo.Database, clk clock.Clock, id stri
 	}
 	if err := db.Collection(jobsCollection).FindOne(ctx, filter,
 		options.FindOne().SetProjection(bson.M{"unique_key": 1})).Decode(&current); err == mongo.ErrNoDocuments {
-		return nil
+		if _, getErr := jobGetByID(ctx, db, id); getErr != nil {
+			return getErr
+		}
+		return fmt.Errorf("%w: job %q cannot be cancelled in its current state", driver.ErrConflict, id)
 	} else if err != nil {
 		return err
 	}
@@ -538,7 +554,10 @@ func jobDelete(ctx context.Context, db *mongo.Database, id string) error {
 	if err != nil {
 		return fmt.Errorf("invalid job id %q: %w", id, err)
 	}
-	_, err = db.Collection(jobsCollection).DeleteOne(ctx, bson.M{"_id": oid})
+	result, err := db.Collection(jobsCollection).DeleteOne(ctx, bson.M{"_id": oid})
+	if err == nil && result.DeletedCount == 0 {
+		return fmt.Errorf("%w: job %q", driver.ErrNotFound, id)
+	}
 	return err
 }
 
@@ -547,10 +566,13 @@ func jobReschedule(ctx context.Context, db *mongo.Database, params driver.Resche
 	if err != nil {
 		return fmt.Errorf("invalid job id %q: %w", params.ID, err)
 	}
-	_, err = db.Collection(jobsCollection).UpdateOne(ctx,
+	result, err := db.Collection(jobsCollection).UpdateOne(ctx,
 		bson.M{"_id": oid},
 		bson.M{"$set": bson.M{"run_at": params.RunAt, "state": string(driver.JobStateScheduled)}},
 	)
+	if err == nil && result.MatchedCount == 0 {
+		return fmt.Errorf("%w: job %q", driver.ErrNotFound, params.ID)
+	}
 	return err
 }
 
@@ -592,11 +614,19 @@ func queueSetPaused(ctx context.Context, db *mongo.Database, clk clock.Clock, na
 
 func queueList(ctx context.Context, db *mongo.Database, params driver.QueueListParams) ([]*driver.QueueRow, error) {
 	limit := int64(params.Limit)
-	if limit <= 0 {
+	if limit <= 0 || limit > 1000 {
 		limit = 100
 	}
+	filter := bson.M{}
+	if params.Cursor != "" {
+		cursor, err := driver.DecodeQueueCursor(params.Cursor)
+		if err != nil {
+			return nil, err
+		}
+		filter["name"] = bson.M{"$gt": cursor}
+	}
 	cur, err := db.Collection(queuesCollection).Find(ctx,
-		bson.M{},
+		filter,
 		options.Find().SetLimit(limit).SetSort(bson.D{{Key: "name", Value: 1}}),
 	)
 	if err != nil {

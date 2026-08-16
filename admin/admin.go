@@ -6,6 +6,7 @@ import (
 	"context"
 	_ "embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -85,11 +86,32 @@ type queueView struct {
 	Stats *driver.QueueStats `json:"stats,omitempty"`
 }
 
+type queuePage struct {
+	Items      []queueView `json:"items"`
+	NextCursor string      `json:"next_cursor,omitempty"`
+	HasMore    bool        `json:"has_more"`
+}
+
 func (h *handler[TTx]) queues(w http.ResponseWriter, r *http.Request) {
-	rows, err := h.driver.Executor().QueueList(r.Context(), driver.QueueListParams{Limit: parseLimit(r, 100)})
+	limit := parseLimit(r, 100)
+	params := driver.QueueListParams{Limit: limit, Cursor: r.URL.Query().Get("cursor")}
+	rows, err := h.driver.Executor().QueueList(r.Context(), params)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
+		writeDriverError(w, err)
 		return
+	}
+	nextCursor, hasMore := "", false
+	if len(rows) == limit && len(rows) > 0 {
+		candidate := driver.EncodeQueueCursor(*rows[len(rows)-1])
+		params.Cursor, params.Limit = candidate, 1
+		following, probeErr := h.driver.Executor().QueueList(r.Context(), params)
+		if probeErr != nil {
+			writeDriverError(w, probeErr)
+			return
+		}
+		if len(following) > 0 {
+			nextCursor, hasMore = candidate, true
+		}
 	}
 	adminExec, hasStats := h.driver.Executor().(driver.AdminExecutor)
 	views := make([]queueView, 0, len(rows))
@@ -98,14 +120,14 @@ func (h *handler[TTx]) queues(w http.ResponseWriter, r *http.Request) {
 		if hasStats {
 			stats, err := adminExec.QueueStats(r.Context(), row.Name)
 			if err != nil {
-				writeError(w, http.StatusInternalServerError, err)
+				writeDriverError(w, err)
 				return
 			}
 			view.Stats = &stats
 		}
 		views = append(views, view)
 	}
-	writeJSON(w, http.StatusOK, views)
+	writeJSON(w, http.StatusOK, queuePage{Items: views, NextCursor: nextCursor, HasMore: hasMore})
 }
 
 func (h *handler[TTx]) queueAction(w http.ResponseWriter, r *http.Request) {
@@ -125,7 +147,7 @@ func (h *handler[TTx]) queueAction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
+		writeDriverError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
@@ -135,7 +157,11 @@ func (h *handler[TTx]) jobs(w http.ResponseWriter, r *http.Request) {
 	if id := r.URL.Query().Get("id"); id != "" {
 		row, err := h.driver.Executor().JobGetByID(r.Context(), id)
 		if err != nil {
-			writeError(w, http.StatusNotFound, err)
+			writeDriverError(w, err)
+			return
+		}
+		if row == nil {
+			writeDriverError(w, fmt.Errorf("%w: job %q", driver.ErrNotFound, id))
 			return
 		}
 		writeJSON(w, http.StatusOK, row)
@@ -143,21 +169,39 @@ func (h *handler[TTx]) jobs(w http.ResponseWriter, r *http.Request) {
 	}
 	adminExec, ok := h.driver.Executor().(driver.AdminExecutor)
 	if !ok {
-		writeError(w, http.StatusNotImplemented, fmt.Errorf("driver %q does not support job listing", h.driver.Name()))
+		writeDriverError(w, fmt.Errorf("%w: driver %q does not support job listing", driver.ErrUnsupported, h.driver.Name()))
 		return
 	}
-	rows, err := adminExec.JobList(r.Context(), driver.JobListParams{
+	limit := parseLimit(r, 100)
+	params := driver.JobListParams{
 		Queue:  r.URL.Query().Get("queue"),
 		State:  driver.JobState(r.URL.Query().Get("state")),
 		Kind:   r.URL.Query().Get("kind"),
 		Cursor: r.URL.Query().Get("cursor"),
-		Limit:  parseLimit(r, 100),
-	})
+		Limit:  limit,
+	}
+	rows, err := adminExec.JobList(r.Context(), params)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, err)
+		writeDriverError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, rows)
+	if rows == nil {
+		rows = []driver.JobRow{}
+	}
+	nextCursor, hasMore := "", false
+	if len(rows) == limit && len(rows) > 0 {
+		candidate := driver.EncodeJobCursor(rows[len(rows)-1])
+		params.Cursor, params.Limit = candidate, 1
+		following, probeErr := adminExec.JobList(r.Context(), params)
+		if probeErr != nil {
+			writeDriverError(w, probeErr)
+			return
+		}
+		if len(following) > 0 {
+			nextCursor, hasMore = candidate, true
+		}
+	}
+	writeJSON(w, http.StatusOK, driver.JobPage{Items: rows, NextCursor: nextCursor, HasMore: hasMore})
 }
 
 func (h *handler[TTx]) jobAction(w http.ResponseWriter, r *http.Request) {
@@ -190,7 +234,7 @@ func (h *handler[TTx]) jobAction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
+		writeDriverError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
@@ -240,6 +284,21 @@ func writeJSON(w http.ResponseWriter, status int, value any) {
 
 func writeError(w http.ResponseWriter, status int, err error) {
 	writeJSON(w, status, map[string]string{"error": err.Error()})
+}
+
+func writeDriverError(w http.ResponseWriter, err error) {
+	status := http.StatusInternalServerError
+	switch {
+	case errors.Is(err, driver.ErrInvalidCursor):
+		status = http.StatusBadRequest
+	case errors.Is(err, driver.ErrNotFound):
+		status = http.StatusNotFound
+	case errors.Is(err, driver.ErrConflict), errors.Is(err, driver.ErrStaleClaim):
+		status = http.StatusConflict
+	case errors.Is(err, driver.ErrUnsupported):
+		status = http.StatusNotImplemented
+	}
+	writeError(w, status, err)
 }
 
 // Probe can be used without HTTP to verify that the backing store is reachable.

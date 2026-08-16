@@ -154,7 +154,7 @@ func (t *txExecutor) JobGetByID(ctx context.Context, id string) (*driver.JobRow,
 	snap, err := t.tx.Get(t.client.Collection(colJobs).Doc(id))
 	if err != nil {
 		if status.Code(err) == codes.NotFound {
-			return nil, nil
+			return nil, fmt.Errorf("%w: job %q", driver.ErrNotFound, id)
 		}
 		return nil, err
 	}
@@ -394,6 +394,15 @@ func jobGetByID(ctx context.Context, client *firestore.Client, id string) (*driv
 }
 
 func jobList(ctx context.Context, client *firestore.Client, params driver.JobListParams) ([]driver.JobRow, error) {
+	var cursorAt time.Time
+	var cursorID string
+	if params.Cursor != "" {
+		var err error
+		cursorAt, cursorID, err = driver.DecodeJobCursor(params.Cursor)
+		if err != nil {
+			return nil, err
+		}
+	}
 	query := client.Collection(colJobs).Query
 	if params.Queue != "" {
 		query = query.Where("queue", "==", params.Queue)
@@ -411,10 +420,14 @@ func jobList(ctx context.Context, client *firestore.Client, params driver.JobLis
 	rows := make([]driver.JobRow, 0, len(snaps))
 	for _, snap := range snaps {
 		var job jobDoc
-		if snap.DataTo(&job) != nil || params.Cursor != "" && job.ID >= params.Cursor {
+		if snap.DataTo(&job) != nil {
 			continue
 		}
-		rows = append(rows, *docToRow(job))
+		row := docToRow(job)
+		if params.Cursor != "" && !driver.JobFollowsCursor(*row, cursorAt, cursorID) {
+			continue
+		}
+		rows = append(rows, *row)
 	}
 	sort.Slice(rows, func(i, j int) bool {
 		if !rows[i].CreatedAt.Equal(rows[j].CreatedAt) {
@@ -608,7 +621,7 @@ func jobHeartbeat(ctx context.Context, client *firestore.Client, params driver.J
 		snap, err := tx.Get(jobRef)
 		if err != nil {
 			if status.Code(err) == codes.NotFound {
-				return nil
+				return fmt.Errorf("%w: job %q", driver.ErrStaleClaim, params.ID)
 			}
 			return err
 		}
@@ -642,7 +655,7 @@ func jobSetStateIfRunning(ctx context.Context, client *firestore.Client, clk clo
 			return err
 		}
 		if j.State != string(driver.JobStateRunning) || !params.MatchesClaim(j.WorkerID, j.AttemptNum) {
-			return nil
+			return fmt.Errorf("%w: job %q", driver.ErrStaleClaim, params.ID)
 		}
 
 		now := clk.Now()
@@ -703,7 +716,7 @@ func jobCancel(ctx context.Context, client *firestore.Client, clk clock.Clock, i
 		snap, err := tx.Get(jobRef)
 		if err != nil {
 			if status.Code(err) == codes.NotFound {
-				return fmt.Errorf("job %q not found", id)
+				return fmt.Errorf("%w: job %q", driver.ErrNotFound, id)
 			}
 			return err
 		}
@@ -712,7 +725,7 @@ func jobCancel(ctx context.Context, client *firestore.Client, clk clock.Clock, i
 			return err
 		}
 		if j.State != string(driver.JobStateAvailable) && j.State != string(driver.JobStateScheduled) {
-			return fmt.Errorf("job %q is in state %s, can only cancel available/scheduled", id, j.State)
+			return fmt.Errorf("%w: job %q is in state %s, can only cancel available/scheduled", driver.ErrConflict, id, j.State)
 		}
 		now := clk.Now()
 		if err := tx.Update(jobRef, []firestore.Update{
@@ -736,7 +749,7 @@ func jobDelete(ctx context.Context, client *firestore.Client, id string) error {
 	snap, err := client.Collection(colJobs).Doc(id).Get(ctx)
 	if err != nil {
 		if status.Code(err) == codes.NotFound {
-			return nil
+			return fmt.Errorf("%w: job %q", driver.ErrNotFound, id)
 		}
 		return err
 	}
@@ -761,6 +774,9 @@ func jobReschedule(ctx context.Context, client *firestore.Client, params driver.
 		{Path: "run_at", Value: params.RunAt.UTC()},
 		{Path: "version", Value: firestore.Increment(1)},
 	})
+	if status.Code(err) == codes.NotFound {
+		return fmt.Errorf("%w: job %q", driver.ErrNotFound, params.ID)
+	}
 	return err
 }
 
@@ -801,11 +817,19 @@ func queueSetPaused(ctx context.Context, client *firestore.Client, clk clock.Clo
 }
 
 func queueList(ctx context.Context, client *firestore.Client, params driver.QueueListParams) ([]*driver.QueueRow, error) {
+	cursor := ""
+	if params.Cursor != "" {
+		var err error
+		cursor, err = driver.DecodeQueueCursor(params.Cursor)
+		if err != nil {
+			return nil, err
+		}
+	}
 	limit := params.Limit
-	if limit <= 0 {
+	if limit <= 0 || limit > 1000 {
 		limit = 100
 	}
-	snaps, err := client.Collection(colQueues).Limit(limit).Documents(ctx).GetAll()
+	snaps, err := client.Collection(colQueues).Documents(ctx).GetAll()
 	if err != nil {
 		return nil, err
 	}
@@ -815,12 +839,19 @@ func queueList(ctx context.Context, client *firestore.Client, params driver.Queu
 		if err := snap.DataTo(&q); err != nil {
 			continue
 		}
+		if q.Name <= cursor {
+			continue
+		}
 		rows = append(rows, &driver.QueueRow{
 			Name:      q.Name,
 			Paused:    q.Paused,
 			CreatedAt: q.CreatedAt,
 			UpdatedAt: q.UpdatedAt,
 		})
+	}
+	sort.Slice(rows, func(i, j int) bool { return rows[i].Name < rows[j].Name })
+	if len(rows) > limit {
+		rows = rows[:limit]
 	}
 	return rows, nil
 }

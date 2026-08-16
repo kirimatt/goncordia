@@ -3,6 +3,7 @@ package drivertest
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync/atomic"
 	"testing"
@@ -170,8 +171,8 @@ func Run(t *testing.T, exec driver.Executor) {
 	if err := exec.JobSetStateIfRunning(ctx, driver.JobSetStateParams{
 		ID: id, State: driver.JobStateCompleted,
 		ExpectedWorkerID: firstClaim.WorkerID, ExpectedAttempt: firstClaim.AttemptNum,
-	}); err != nil {
-		t.Fatalf("stale completion: %v", err)
+	}); !errors.Is(err, driver.ErrStaleClaim) {
+		t.Fatalf("stale completion error=%v, want ErrStaleClaim", err)
 	}
 	current, err := exec.JobGetByID(ctx, id)
 	if err != nil || current == nil || current.State != driver.JobStateRunning || current.AttemptNum != claimed.AttemptNum {
@@ -236,6 +237,48 @@ func Run(t *testing.T, exec driver.Executor) {
 			id := result.Job.ID
 			t.Cleanup(func() { _ = exec.JobDelete(context.Background(), id) })
 		}
+	}
+	if adminExec, ok := exec.(driver.AdminExecutor); ok {
+		firstPage, listErr := adminExec.JobList(ctx, driver.JobListParams{Kind: "ordering-low", Limit: 3})
+		if listErr != nil || len(firstPage) != 3 {
+			t.Fatalf("first job page: rows=%+v err=%v", firstPage, listErr)
+		}
+		secondPage, listErr := adminExec.JobList(ctx, driver.JobListParams{
+			Kind: "ordering-low", Limit: 3, Cursor: driver.EncodeJobCursor(firstPage[len(firstPage)-1]),
+		})
+		if listErr != nil || len(secondPage) != 3 {
+			t.Fatalf("second job page: rows=%+v err=%v", secondPage, listErr)
+		}
+		seen := make(map[string]struct{}, len(firstPage))
+		for _, row := range firstPage {
+			seen[row.ID] = struct{}{}
+		}
+		for _, row := range secondPage {
+			if _, duplicate := seen[row.ID]; duplicate {
+				t.Fatalf("job %q appeared on consecutive pages", row.ID)
+			}
+		}
+		if _, listErr := adminExec.JobList(ctx, driver.JobListParams{Cursor: "invalid", Limit: 1}); !errors.Is(listErr, driver.ErrInvalidCursor) {
+			t.Fatalf("invalid job cursor error=%v, want ErrInvalidCursor", listErr)
+		}
+	}
+	for _, suffix := range []string{"-pagination-a", "-pagination-b", "-pagination-c"} {
+		if err := exec.QueuePause(ctx, queue+suffix); err != nil {
+			t.Fatalf("create pagination queue: %v", err)
+		}
+	}
+	firstQueues, err := exec.QueueList(ctx, driver.QueueListParams{Limit: 2})
+	if err != nil || len(firstQueues) != 2 {
+		t.Fatalf("first queue page: rows=%+v err=%v", firstQueues, err)
+	}
+	secondQueues, err := exec.QueueList(ctx, driver.QueueListParams{
+		Limit: 2, Cursor: driver.EncodeQueueCursor(*firstQueues[len(firstQueues)-1]),
+	})
+	if err != nil || len(secondQueues) == 0 || secondQueues[0].Name <= firstQueues[len(firstQueues)-1].Name {
+		t.Fatalf("second queue page: rows=%+v err=%v", secondQueues, err)
+	}
+	if _, err := exec.QueueList(ctx, driver.QueueListParams{Cursor: "invalid", Limit: 1}); !errors.Is(err, driver.ErrInvalidCursor) {
+		t.Fatalf("invalid queue cursor error=%v, want ErrInvalidCursor", err)
 	}
 	orderedClaim := fetchEventually(t, ctx, exec, queue)
 	if orderedClaim.Kind != "ordering-high" || orderedClaim.Priority != 100 {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sort"
@@ -600,7 +601,7 @@ func (p *WorkerPool[TTx]) setState(ctx context.Context, exec driver.Executor, pa
 		stateCtx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 	}
-	if err := exec.JobSetStateIfRunning(stateCtx, params); err != nil {
+	if err := exec.JobSetStateIfRunning(stateCtx, params); err != nil && !errors.Is(err, driver.ErrStaleClaim) {
 		p.reportError(fmt.Errorf("set state for job %s: %w", params.ID, err))
 	}
 }

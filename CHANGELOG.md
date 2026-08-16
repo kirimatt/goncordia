@@ -19,6 +19,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `StuckJobTimeout`.
 - Stable driver error categories, beginning with `driver.ErrUnsupported` for
   `errors.Is` checks.
+- Opaque versioned job and queue cursors plus `driver.JobPage` and
+  `driver.QueuePage` response types.
 - Worker-returned `core.Discard`, `core.RetryAfter`, and `core.RetryAt`
   directives.
 - `UniqueOpts.Key` for caller-defined deduplication dimensions.
@@ -52,12 +54,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   run context.
 - Durable cron occurrences use permanent idempotency keys and only advance their
   persisted cursor after enqueue succeeds or is recognized as a duplicate.
+- Administrative job ordering now uses the composite `created_at DESC, id DESC`
+  cursor on every backend; queues are consistently ordered by name.
+- The admin jobs and queues endpoints return `items`, `next_cursor`, and
+  `has_more` instead of bare arrays.
+- Built-in drivers classify missing records, invalid state transitions, and
+  stale fenced claims with `ErrNotFound`, `ErrConflict`, and `ErrStaleClaim`.
+- Admin API errors map invalid cursors to 400, missing records to 404, conflicts
+  and stale claims to 409, and unsupported operations to 501.
 
 ### Testing
 - Driver conformance now covers stale-worker fencing, heartbeat protection, and
   global priority selection beyond a storage-ordered candidate subset, plus
   uniqueness across queues, durable uniqueness after cancellation, and
-  ownership-safe leader resignation.
+  ownership-safe leader resignation, opaque pagination without duplicates, and
+  invalid cursor classification.
 - Added deterministic worker tests for heartbeat renewal, cancellation yield,
   bounded pending work, and pipeline/global-concurrency isolation.
 
@@ -78,6 +89,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Cassandra compensates failed writes after reserving a key, but a process crash
   between the cross-partition writes can leave an orphaned reservation in
   `goncordia_uniq_v2`. ClickHouse uniqueness remains best-effort.
+- Admin API consumers must read list results from the `items` field and follow
+  `next_cursor`; the previous bare-array response is replaced by a page envelope.
 
 ---
 

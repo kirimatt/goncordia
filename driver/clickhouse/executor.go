@@ -2,7 +2,9 @@ package clickhousedriver
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -329,10 +331,13 @@ func jobInsertMany(ctx context.Context, conn chdriver.Conn, clk clock.Clock, par
 func jobGetByID(ctx context.Context, conn chdriver.Conn, id string) (*driver.JobRow, error) {
 	j, err := queryJob(ctx, conn, id)
 	if err != nil {
-		return nil, nil // not found or error — treat as not found
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, fmt.Errorf("%w: job %q", driver.ErrNotFound, id)
+		}
+		return nil, err
 	}
 	if j.ID == "" {
-		return nil, nil
+		return nil, fmt.Errorf("%w: job %q", driver.ErrNotFound, id)
 	}
 	return j.toRow(), nil
 }
@@ -353,8 +358,12 @@ func jobList(ctx context.Context, conn chdriver.Conn, params driver.JobListParam
 		args = append(args, params.Kind)
 	}
 	if params.Cursor != "" {
-		query += ` AND id<?`
-		args = append(args, params.Cursor)
+		cursorAt, cursorID, err := driver.DecodeJobCursor(params.Cursor)
+		if err != nil {
+			return nil, err
+		}
+		query += ` AND (created_at<? OR (created_at=? AND id<?))`
+		args = append(args, cursorAt, cursorAt, cursorID)
 	}
 	limit := params.Limit
 	if limit <= 0 || limit > 1000 {
@@ -568,11 +577,14 @@ func jobHeartbeat(ctx context.Context, conn chdriver.Conn, params driver.JobHear
 
 func jobSetStateIfRunning(ctx context.Context, conn chdriver.Conn, clk clock.Clock, params driver.JobSetStateParams) error {
 	j, err := queryJob(ctx, conn, params.ID)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
 	if err != nil || j.ID == "" {
-		return nil
+		return fmt.Errorf("%w: job %q", driver.ErrStaleClaim, params.ID)
 	}
 	if j.State != string(driver.JobStateRunning) || !params.MatchesClaim(j.WorkerID, int(j.AttemptNum)) {
-		return nil
+		return fmt.Errorf("%w: job %q", driver.ErrStaleClaim, params.ID)
 	}
 
 	if params.Yield {
@@ -616,11 +628,14 @@ func jobSetStateIfRunning(ctx context.Context, conn chdriver.Conn, clk clock.Clo
 
 func jobCancel(ctx context.Context, conn chdriver.Conn, clk clock.Clock, id string) error {
 	j, err := queryJob(ctx, conn, id)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
 	if err != nil || j.ID == "" {
-		return fmt.Errorf("job %q not found", id)
+		return fmt.Errorf("%w: job %q", driver.ErrNotFound, id)
 	}
 	if j.State != string(driver.JobStateAvailable) && j.State != string(driver.JobStateScheduled) {
-		return fmt.Errorf("job %q is in state %s, can only cancel available/scheduled", id, j.State)
+		return fmt.Errorf("%w: job %q is in state %s, can only cancel available/scheduled", driver.ErrConflict, id, j.State)
 	}
 
 	now := clk.Now()
@@ -638,8 +653,11 @@ func jobDelete(ctx context.Context, conn chdriver.Conn, id string) error {
 	// way as OLTP databases. We mark the job as deleted by setting a terminal state.
 	// Physical deletion happens via TTL or ALTER TABLE DELETE (async mutation).
 	j, err := queryJob(ctx, conn, id)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
 	if err != nil || j.ID == "" {
-		return nil
+		return fmt.Errorf("%w: job %q", driver.ErrNotFound, id)
 	}
 	deleted := j
 	deleted.State = "deleted"
@@ -651,8 +669,11 @@ func jobDelete(ctx context.Context, conn chdriver.Conn, id string) error {
 
 func jobReschedule(ctx context.Context, conn chdriver.Conn, params driver.RescheduleParams) error {
 	j, err := queryJob(ctx, conn, params.ID)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
 	if err != nil || j.ID == "" {
-		return fmt.Errorf("job %q not found", params.ID)
+		return fmt.Errorf("%w: job %q", driver.ErrNotFound, params.ID)
 	}
 	rescheduled := j
 	rescheduled.State = string(driver.JobStateScheduled)
@@ -692,7 +713,10 @@ func queueGet(ctx context.Context, conn chdriver.Conn, name string) (*driver.Que
 	row := conn.QueryRow(ctx,
 		`SELECT name, paused, created_at, updated_at FROM goncordia_queues FINAL WHERE name=? LIMIT 1`, name)
 	if err := row.Scan(&q.Name, &paused, &q.CreatedAt, &q.UpdatedAt); err != nil {
-		return nil, fmt.Errorf("queue %q not found", name)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, fmt.Errorf("%w: queue %q", driver.ErrNotFound, name)
+		}
+		return nil, err
 	}
 	q.Paused = paused == 1
 	return &q, nil
@@ -715,11 +739,22 @@ func queueSetPaused(ctx context.Context, conn chdriver.Conn, clk clock.Clock, na
 
 func queueList(ctx context.Context, conn chdriver.Conn, params driver.QueueListParams) ([]*driver.QueueRow, error) {
 	limit := params.Limit
-	if limit <= 0 {
+	if limit <= 0 || limit > 1000 {
 		limit = 100
 	}
-	rows, err := conn.Query(ctx,
-		`SELECT name, paused, created_at, updated_at FROM goncordia_queues FINAL LIMIT ?`, limit)
+	query := `SELECT name, paused, created_at, updated_at FROM goncordia_queues FINAL`
+	var args []any
+	if params.Cursor != "" {
+		cursor, err := driver.DecodeQueueCursor(params.Cursor)
+		if err != nil {
+			return nil, err
+		}
+		query += ` WHERE name>?`
+		args = append(args, cursor)
+	}
+	query += ` ORDER BY name LIMIT ?`
+	args = append(args, limit)
+	rows, err := conn.Query(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
