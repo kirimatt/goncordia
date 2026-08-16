@@ -1,5 +1,10 @@
 name: CI
 
+env:
+  ACTIONLINT_VERSION: v1.7.7
+  STATICCHECK_VERSION: v0.7.0
+  GOVULNCHECK_VERSION: v1.7.0
+
 on:
   push:
     branches: [main]
@@ -10,25 +15,35 @@ jobs:
   quality:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-go@v6
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           go-version-file: go.mod
           cache: true
       - name: Format check
         run: test -z "$(gofmt -l .)"
+      - name: Workflow lint
+        run: go run github.com/rhysd/actionlint/cmd/actionlint@${ACTIONLINT_VERSION}
       - name: Module files are tidy
         run: go mod tidy -diff
       - name: Vet
         run: go vet ./...
       - name: Staticcheck
-        run: go run honnef.co/go/tools/cmd/staticcheck@latest ./...
+        run: go run honnef.co/go/tools/cmd/staticcheck@${STATICCHECK_VERSION} ./...
+      - name: Release metadata
+        run: ./scripts/check-release.sh
+      - name: Core coverage threshold
+        run: |
+          go test ./admin ./clock ./core ./driver ./driver/memory ./gontest ./otel \
+            -covermode=atomic -coverprofile=coverage.out
+          total=$(go tool cover -func=coverage.out | awk '/^total:/ {gsub("%", "", $3); print $3}')
+          awk -v total="$total" 'BEGIN { if (total < 68.0) { printf "coverage %.1f%% is below 68.0%%\n", total; exit 1 } }'
 
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-go@v6
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           go-version-file: go.mod
           cache: true
@@ -40,10 +55,10 @@ jobs:
   vulnerability-scan:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-go@v6
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           go-version-file: go.mod
           cache: true
       - name: Govulncheck
-        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+        run: go run golang.org/x/vuln/cmd/govulncheck@${GOVULNCHECK_VERSION} ./...

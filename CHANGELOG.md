@@ -38,6 +38,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `CronCatchUpAll`, `CronCatchUpLatest`, and `CronSkipMissed` policies.
 - Admin read-only mode, per-operation authorization hooks, and configurable job
   response redaction with secure payload-hiding defaults.
+- Reproducible CI/release checks, a core-package coverage floor, cursor fuzz
+  tests, automated changelog-derived GitHub releases, and grouped dependency
+  update automation.
 
 ### Changed
 - Pipeline and per-kind waiters no longer occupy global execution slots.
@@ -83,6 +86,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   storage readiness are separate probes, metrics failures return 503 without
   partial samples, and dashboard assets now comply with a strict CSP without
   inline scripts or styles.
+- Updated the AWS SDK, Firestore, ClickHouse, pgx, Redis, Testcontainers,
+  OpenTelemetry, gRPC, GORM, and modernc SQLite dependency families in isolated
+  batches validated against their affected driver suites.
 
 ### Testing
 - Driver conformance now covers stale-worker fencing, heartbeat protection, and
@@ -102,6 +108,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added admin security and failure-mode tests for authorization, read-only mode,
   payload redaction, explicit mutation confirmation, independent probes, strict
   CSP assets, and all-or-nothing metrics output.
+- CI actions and analysis tools are pinned to immutable revisions or explicit
+  versions; release tags must match the latest dated changelog section and the
+  README installation version.
 
 ### Upgrade notes
 - SQL users must run `Migrate` before starting workers. Migration 004 replaces

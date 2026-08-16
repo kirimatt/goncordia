@@ -1,0 +1,26 @@
+version: 2
+updates:
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      aws:
+        patterns:
+          - github.com/aws/aws-sdk-go-v2*
+      google-cloud:
+        patterns:
+          - cloud.google.com/go*
+          - google.golang.org/*
+      observability:
+        patterns:
+          - go.opentelemetry.io/*
+      testcontainers:
+        patterns:
+          - github.com/testcontainers/testcontainers-go*
+    open-pull-requests-limit: 6
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 4
