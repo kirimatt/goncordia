@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+---
+
+## [v0.16.0] — 2026-08-16
+
 ### Added
 - Fenced worker state transitions using the expected worker ID and attempt
   number, preventing a rescued stale worker from completing a newer claim.
@@ -421,6 +425,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Clock` interface + `MockClock` for deterministic time control in tests
 - MIT License
 
+[v0.16.0]: https://github.com/kirimatt/goncordia/releases/tag/v0.16.0
+[v0.15.1]: https://github.com/kirimatt/goncordia/releases/tag/v0.15.1
+[v0.15.0]: https://github.com/kirimatt/goncordia/releases/tag/v0.15.0
+[v0.14.0]: https://github.com/kirimatt/goncordia/releases/tag/v0.14.0
+[v0.13.0]: https://github.com/kirimatt/goncordia/releases/tag/v0.13.0
+[v0.12.0]: https://github.com/kirimatt/goncordia/releases/tag/v0.12.0
 [v0.11.0]: https://github.com/kirimatt/goncordia/releases/tag/v0.11.0
 [v0.10.0]: https://github.com/kirimatt/goncordia/releases/tag/v0.10.0
 [v0.9.0]: https://github.com/kirimatt/goncordia/releases/tag/v0.9.0
