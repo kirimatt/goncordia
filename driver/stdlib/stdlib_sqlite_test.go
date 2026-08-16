@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -16,6 +18,55 @@ import (
 	"github.com/kirimatt/goncordia/driver/drivertest"
 	stdlibdriver "github.com/kirimatt/goncordia/driver/stdlib"
 )
+
+func TestStdlibSQLite_ConcurrentMigrateAndOwnership(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "goncordia.db")
+	db1, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db1.Close()
+	db2, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db2.Close()
+
+	drivers := []*stdlibdriver.Driver{
+		stdlibdriver.New(db1, stdlibdriver.SQLite),
+		stdlibdriver.New(db2, stdlibdriver.SQLite),
+	}
+	var wg sync.WaitGroup
+	errs := make(chan error, 8)
+	for i := range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs <- drivers[i%len(drivers)].Migrate(context.Background())
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent migrate: %v", err)
+		}
+	}
+
+	var migrations int
+	if err := db1.QueryRow(`SELECT COUNT(*) FROM goncordia_schema_migrations`).Scan(&migrations); err != nil {
+		t.Fatal(err)
+	}
+	if migrations != 5 {
+		t.Fatalf("migration count=%d, want 5", migrations)
+	}
+	if err := drivers[0].Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := db1.Ping(); err != nil {
+		t.Fatalf("driver closed caller-owned database: %v", err)
+	}
+}
 
 func newSQLiteDriver(t *testing.T, opts ...stdlibdriver.Option) (*stdlibdriver.Driver, *sql.DB) {
 	t.Helper()

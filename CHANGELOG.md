@@ -62,6 +62,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stale fenced claims with `ErrNotFound`, `ErrConflict`, and `ErrStaleClaim`.
 - Admin API errors map invalid cursors to 400, missing records to 404, conflicts
   and stale claims to 409, and unsupported operations to 501.
+- Drivers no longer close caller-supplied clients, pools, connections,
+  databases, or sessions; resource ownership is consistently retained by the
+  caller.
+- SQL migrations are serialized across application instances with PostgreSQL/
+  MySQL advisory locks and a SQLite immediate transaction. Concurrent DynamoDB
+  migration calls now wait for tables another instance is creating.
 
 ### Testing
 - Driver conformance now covers stale-worker fencing, heartbeat protection, and
@@ -71,6 +77,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   invalid cursor classification.
 - Added deterministic worker tests for heartbeat renewal, cancellation yield,
   bounded pending work, and pipeline/global-concurrency isolation.
+- Added concurrent migration tests for pgx, PostgreSQL, MySQL, and SQLite, plus
+  ownership checks proving `Driver.Close` leaves supplied resources usable.
 
 ### Upgrade notes
 - SQL users must run `Migrate` before starting workers. Migration 004 replaces
@@ -91,6 +99,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `goncordia_uniq_v2`. ClickHouse uniqueness remains best-effort.
 - Admin API consumers must read list results from the `items` field and follow
   `next_cursor`; the previous bare-array response is replaced by a page envelope.
+- Callers that previously relied on `Driver.Close` to close a supplied resource
+  must now close that resource directly.
 
 ---
 

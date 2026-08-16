@@ -50,7 +50,8 @@ type Option func(*Driver)
 // WithClock injects a custom clock (useful for tests).
 func WithClock(c clock.Clock) Option { return func(d *Driver) { d.clk = c } }
 
-// New creates a Driver connected to the given *mongo.Client.
+// New creates a Driver connected to the given *mongo.Client. The caller retains
+// ownership of client and must disconnect it after the driver is no longer in use.
 // dbName is the database that will hold the goncordia collections.
 // Returns an error if the server is not a replica set member (transactions require replica set).
 func New(ctx context.Context, client *mongo.Client, dbName string, opts ...Option) (*Driver, error) {
@@ -150,7 +151,7 @@ func (d *Driver) UnwrapTx(sc mongo.SessionContext) driver.ExecutorTx {
 }
 
 func (d *Driver) Listener() driver.Listener { return &listener{db: d.db} }
-func (d *Driver) Close() error              { return d.client.Disconnect(context.Background()) }
+func (d *Driver) Close() error              { return nil }
 
 // Client is a type alias so callers never write goncordia.Client[mongo.SessionContext].
 type Client = goncordia.Client[mongo.SessionContext]

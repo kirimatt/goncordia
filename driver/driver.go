@@ -38,7 +38,9 @@ type Driver[TTx any] interface {
 	// Listener returns a push-notification listener, or nil if polling must be used.
 	Listener() Listener
 
-	// Close releases any resources held by the driver.
+	// Close releases resources created by the driver itself. Constructors that
+	// accept a client, pool, connection, or session never take ownership of it;
+	// the caller remains responsible for closing that resource.
 	Close() error
 }
 

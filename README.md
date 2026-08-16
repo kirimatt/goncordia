@@ -140,6 +140,7 @@ import (
 )
 
 pool, _ := pgxpool.New(ctx, os.Getenv("DATABASE_URL"))
+defer pool.Close()
 d := pgxdriver.New(pool)
 d.Migrate(ctx)
 
@@ -185,6 +186,7 @@ import (
 )
 
 client, _ := mongo.Connect(ctx, options.Client().ApplyURI(os.Getenv("MONGO_URI")))
+defer client.Disconnect(ctx)
 d, err := mongodriver.New(ctx, client, "myapp")  // fails if not a replica set
 d.Migrate(ctx)
 
@@ -247,6 +249,7 @@ import (
 )
 
 rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379"})
+defer rdb.Close()
 d := redisdriver.New(rdb)
 d.Migrate(ctx)  // pings Redis to verify connectivity
 
@@ -292,6 +295,7 @@ conn, _ := clickhouse.Open(&clickhouse.Options{
     Addr: []string{"localhost:9000"},
     Auth: clickhouse.Auth{Database: "myapp"},
 })
+defer conn.Close()
 
 d := clickhousedriver.New(conn)
 d.Migrate(ctx)  // creates ReplacingMergeTree tables (idempotent)
@@ -335,6 +339,7 @@ import (
 )
 
 fsClient, _ := firestore.NewClient(ctx, "my-gcp-project")
+defer fsClient.Close()
 d := firestoredriver.New(fsClient)
 // Migrate is a no-op; create composite index in Firebase console:
 //   collection: goncordia_jobs, fields: queue (ASC), state (ASC), run_at (ASC)
@@ -359,11 +364,23 @@ import (
 )
 
 db, _ := sql.Open("sqlite", "./jobs.db")
+defer db.Close()
 db.SetMaxOpenConns(1)  // SQLite: single writer
 
 d := stdlibdriver.New(db, stdlibdriver.SQLite)
 d.Migrate(ctx)
 ```
+
+All driver constructors are non-owning: a client, pool, connection, database,
+or session passed to `New` remains the caller's responsibility. `Driver.Close`
+only releases resources created internally by a driver and never closes the
+supplied resource.
+
+`Migrate` may be called concurrently during a rolling deployment. PostgreSQL
+and MySQL use database advisory locks, while SQLite holds an immediate write
+transaction across the complete migration set. Cassandra, ClickHouse, MongoDB,
+DynamoDB, Redis, and Firestore use idempotent server-side schema operations;
+DynamoDB also waits for tables created by another instance to become active.
 
 ---
 

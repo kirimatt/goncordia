@@ -61,7 +61,8 @@ type Option func(*Driver)
 // WithClock injects a custom clock (useful for tests).
 func WithClock(c clock.Clock) Option { return func(d *Driver) { d.clk = c } }
 
-// New creates a Driver wrapping the given *firestore.Client.
+// New creates a Driver wrapping the given *firestore.Client. The caller retains
+// ownership of client and must close it after the driver is no longer in use.
 func New(client *firestore.Client, opts ...Option) *Driver {
 	d := &Driver{client: client, clk: clock.Real{}}
 	for _, o := range opts {
@@ -102,7 +103,7 @@ func (d *Driver) UnwrapTx(tx *firestore.Transaction) driver.ExecutorTx {
 // Listener returns nil — Firestore driver uses polling.
 func (d *Driver) Listener() driver.Listener { return nil }
 
-func (d *Driver) Close() error { return d.client.Close() }
+func (d *Driver) Close() error { return nil }
 
 // Client is a type alias so callers never write goncordia.Client[*firestore.Transaction].
 type Client = goncordia.Client[*firestore.Transaction]

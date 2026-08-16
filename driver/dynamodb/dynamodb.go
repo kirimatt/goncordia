@@ -148,10 +148,9 @@ func (d *Driver) Migrate(ctx context.Context) error {
 	for _, input := range tables {
 		if _, err := d.svc.CreateTable(ctx, input); err != nil {
 			var riu *types.ResourceInUseException
-			if errors.As(err, &riu) {
-				continue
+			if !errors.As(err, &riu) {
+				return fmt.Errorf("dynamodb migrate: create %s: %w", *input.TableName, err)
 			}
-			return fmt.Errorf("dynamodb migrate: create %s: %w", *input.TableName, err)
 		}
 		if err := waiter.Wait(ctx, &dynamodb.DescribeTableInput{TableName: input.TableName}, 30*time.Second); err != nil {
 			return fmt.Errorf("dynamodb migrate: wait %s: %w", *input.TableName, err)
