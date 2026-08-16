@@ -522,6 +522,37 @@ not found to 404, conflict or stale claim to 409, and unsupported operations to
 
 ---
 
+## Retention, bulk actions, and dead letters
+
+The portable maintenance service works with every built-in driver and uses the
+same injected-clock model as clients, workers, and schedulers:
+
+```go
+maintenance := goncordia.NewMaintenance(d, goncordia.MaintenanceConfig{
+    Clock: appClock,
+})
+
+result, err := maintenance.Prune(ctx, goncordia.RetentionPolicy{
+    Completed: 30 * 24 * time.Hour,
+    Discarded: 90 * 24 * time.Hour,
+    Cancelled: 7 * 24 * time.Hour,
+})
+
+cancelled, err := maintenance.BulkCancel(ctx, jobIDs)
+retried, err := maintenance.BulkRetry(ctx, jobIDs, time.Time{}) // now via Clock
+deleted, err := maintenance.BulkDelete(ctx, jobIDs)
+
+page, err := maintenance.DeadLetterList(ctx, driver.JobListParams{Limit: 100})
+replayed, err := maintenance.DeadLetterReplay(ctx, jobIDs, time.Time{})
+```
+
+Bulk operations preserve partial progress in `BulkResult`; their returned error
+joins per-job failures, so `errors.Is` still recognizes typed driver errors.
+Dead-letter replay first verifies that each job is still discarded. Retention
+durations of zero disable that state, and negative durations are rejected.
+
+---
+
 ## Periodic / cron jobs
 
 `CronScheduler` enqueues jobs on a schedule. Pair it with a `WorkerPool` that processes them.

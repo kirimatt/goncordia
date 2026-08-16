@@ -21,6 +21,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `errors.Is` checks.
 - Opaque versioned job and queue cursors plus `driver.JobPage` and
   `driver.QueuePage` response types.
+- A portable `Maintenance` service with retention pruning, partial-result bulk
+  retry/cancel/delete, and paginated dead-letter inspection/replay.
 - Worker-returned `core.Discard`, `core.RetryAfter`, and `core.RetryAt`
   directives.
 - `UniqueOpts.Key` for caller-defined deduplication dimensions.
@@ -79,6 +81,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bounded pending work, and pipeline/global-concurrency isolation.
 - Added concurrent migration tests for pgx, PostgreSQL, MySQL, and SQLite, plus
   ownership checks proving `Driver.Close` leaves supplied resources usable.
+- Added deterministic maintenance tests driven entirely by an injected manual
+  clock, including retention cutoffs, partial bulk failures, and dead-letter
+  state validation.
 
 ### Upgrade notes
 - SQL users must run `Migrate` before starting workers. Migration 004 replaces
