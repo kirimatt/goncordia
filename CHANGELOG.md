@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Tag creation now publishes its GitHub Release in the same workflow because
+  GitHub does not emit recursive workflow events for tags pushed with the
+  repository `GITHUB_TOKEN`. The release workflow also supports manual recovery
+  for an existing tag.
+
 ---
 
 ## [v0.16.0] — 2026-08-16
