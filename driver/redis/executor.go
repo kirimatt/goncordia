@@ -29,7 +29,7 @@ func schedKey(q string) string      { return "goncordia:q:" + q + ":sched" }
 func runKey(q string) string        { return "goncordia:q:" + q + ":run" }
 func metaKey(q string) string       { return "goncordia:q:" + q + ":meta" }
 func jobKey(id string) string       { return jobKeyPrefix + id }
-func uniqKey(q, k string) string    { return "goncordia:uniq:" + q + ":" + k }
+func uniqKey(k string) string       { return "goncordia:uniq:" + k }
 func leaderKey(n string) string     { return "goncordia:leader:" + n }
 func notifyChannel(q string) string { return "goncordia:notify:" + q }
 
@@ -118,7 +118,32 @@ func jobToRow(j redisJob) *driver.JobRow {
 }
 
 // ---- Lua: atomic fetch-and-claim ----
-//
+
+// KEYS[1] = job key
+// KEYS[2] = unique reservation key (ignored when ARGV[1] is "0")
+// KEYS[3] = ready sorted set (available or scheduled)
+// KEYS[4] = queue names set
+// KEYS[5] = queue metadata hash
+// KEYS[6] = notification channel
+// ARGV[1] = has_unique, ARGV[2] = job JSON, ARGV[3] = job id
+// ARGV[4] = ready score, ARGV[5] = queue name, ARGV[6] = now_ms
+var insertJobScript = redis.NewScript(`
+if ARGV[1] == '1' and redis.call('EXISTS', KEYS[2]) == 1 then
+    return 0
+end
+if ARGV[1] == '1' then
+    redis.call('SET', KEYS[2], ARGV[3])
+end
+redis.call('SET', KEYS[1], ARGV[2])
+redis.call('ZADD', KEYS[3], ARGV[4], ARGV[3])
+redis.call('SADD', KEYS[4], ARGV[5])
+redis.call('HSETNX', KEYS[5], 'paused', '0')
+redis.call('HSETNX', KEYS[5], 'created_at_ms', ARGV[6])
+redis.call('HSETNX', KEYS[5], 'updated_at_ms', ARGV[6])
+redis.call('PUBLISH', KEYS[6], '1')
+return 1
+`)
+
 // KEYS[1] = avail sorted set
 // KEYS[2] = sched sorted set
 // KEYS[3] = running hash
@@ -370,18 +395,6 @@ func jobInsertMany(ctx context.Context, rdb *redis.Client, clk clock.Clock, para
 
 		id := uuid.New().String()
 
-		// Unique-key deduplication: SET NX
-		if p.UniqueKey != "" {
-			ok, err := rdb.SetNX(ctx, uniqKey(p.Queue, p.UniqueKey), id, 0).Result()
-			if err != nil {
-				return nil, fmt.Errorf("unique key check: %w", err)
-			}
-			if !ok {
-				results[i] = driver.JobInsertResult{UniqueSkip: true}
-				continue
-			}
-		}
-
 		tags := p.Tags
 		if tags == nil {
 			tags = []string{}
@@ -408,17 +421,26 @@ func jobInsertMany(ctx context.Context, rdb *redis.Client, clk clock.Clock, para
 			return nil, fmt.Errorf("marshal job: %w", err)
 		}
 
-		pipe := rdb.Pipeline()
-		pipe.Set(ctx, jobKey(id), raw, 0)
+		readyKey := availKey(p.Queue)
+		readyScore := priorityScore(p.Priority, runAt)
 		if state == driver.JobStateScheduled {
-			pipe.ZAdd(ctx, schedKey(p.Queue), redis.Z{Score: float64(runAt.UnixMilli()), Member: id})
-		} else {
-			pipe.ZAdd(ctx, availKey(p.Queue), redis.Z{Score: priorityScore(p.Priority, runAt), Member: id})
+			readyKey = schedKey(p.Queue)
+			readyScore = float64(runAt.UnixMilli())
 		}
-		ensureQueueMeta(pipe, ctx, p.Queue, now)
-		pipe.Publish(ctx, notifyChannel(p.Queue), "1")
-		if _, err := pipe.Exec(ctx); err != nil {
+		hasUnique := "0"
+		if p.UniqueKey != "" {
+			hasUnique = "1"
+		}
+		inserted, err := insertJobScript.Run(ctx, rdb,
+			[]string{jobKey(id), uniqKey(p.UniqueKey), readyKey, queuesSetKey, metaKey(p.Queue), notifyChannel(p.Queue)},
+			hasUnique, raw, id, readyScore, p.Queue, now.UnixMilli(),
+		).Int64()
+		if err != nil {
 			return nil, fmt.Errorf("insert job: %w", err)
+		}
+		if inserted == 0 {
+			results[i] = driver.JobInsertResult{UniqueSkip: true}
+			continue
 		}
 
 		results[i] = driver.JobInsertResult{Job: jobToRow(job)}
@@ -603,7 +625,7 @@ func jobSetStateIfRunning(ctx context.Context, rdb *redis.Client, clk clock.Cloc
 						pipe.ZAdd(ctx, availKey(job.Queue), redis.Z{Score: priorityScore(job.Priority, retryAt), Member: params.ID})
 					}
 				case job.UniqueKey != "":
-					pipe.Del(ctx, uniqKey(job.Queue, job.UniqueKey))
+					pipe.Del(ctx, uniqKey(job.UniqueKey))
 				}
 				return nil
 			})
@@ -637,7 +659,7 @@ func jobCancel(ctx context.Context, rdb *redis.Client, clk clock.Clock, id strin
 	job.State = string(driver.JobStateCancelled)
 	job.FinalizedAtMs = millis(now.UnixMilli())
 	if job.UniqueKey != "" {
-		rdb.Del(ctx, uniqKey(job.Queue, job.UniqueKey)) //nolint:errcheck
+		rdb.Del(ctx, uniqKey(job.UniqueKey)) //nolint:errcheck
 	}
 
 	pipe := rdb.Pipeline()
@@ -667,7 +689,7 @@ func jobDelete(ctx context.Context, rdb *redis.Client, id string) error {
 	pipe.ZRem(ctx, schedKey(job.Queue), id)
 	pipe.HDel(ctx, runKey(job.Queue), id)
 	if job.UniqueKey != "" {
-		pipe.Del(ctx, uniqKey(job.Queue, job.UniqueKey))
+		pipe.Del(ctx, uniqKey(job.UniqueKey))
 	}
 	_, err = pipe.Exec(ctx)
 	return err
@@ -695,17 +717,6 @@ func jobReschedule(ctx context.Context, rdb *redis.Client, params driver.Resched
 	pipe.Set(ctx, jobKey(params.ID), updated, 0)
 	_, err = pipe.Exec(ctx)
 	return err
-}
-
-// ---- queue metadata ----
-
-func ensureQueueMeta(pipe redis.Pipeliner, ctx context.Context, name string, now time.Time) {
-	nowMs := now.UnixMilli()
-	pipe.SAdd(ctx, queuesSetKey, name)
-	// HSetNX: only sets if field doesn't already exist.
-	pipe.HSetNX(ctx, metaKey(name), "paused", "0")
-	pipe.HSetNX(ctx, metaKey(name), "created_at_ms", strconv.FormatInt(nowMs, 10))
-	pipe.HSetNX(ctx, metaKey(name), "updated_at_ms", strconv.FormatInt(nowMs, 10))
 }
 
 func isQueuePaused(ctx context.Context, rdb *redis.Client, name string) (bool, error) {

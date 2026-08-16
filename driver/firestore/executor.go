@@ -236,7 +236,7 @@ func jobInsertMany(ctx context.Context, client *firestore.Client, clk clock.Cloc
 		jobRef := client.Collection(colJobs).Doc(id)
 
 		if p.UniqueKey != "" {
-			uniqRef := client.Collection(colUniq).Doc(p.Queue + "#" + p.UniqueKey)
+			uniqRef := client.Collection(colUniq).Doc(p.UniqueKey)
 			var skip bool
 			if err := client.RunTransaction(ctx, func(ctx context.Context, tx *firestore.Transaction) error {
 				snap, err := tx.Get(uniqRef)
@@ -333,7 +333,7 @@ func jobInsertManyTx(ctx context.Context, client *firestore.Client, tx *firestor
 		}
 
 		if p.UniqueKey != "" {
-			uniqRef := client.Collection(colUniq).Doc(p.Queue + "#" + p.UniqueKey)
+			uniqRef := client.Collection(colUniq).Doc(p.UniqueKey)
 			entries[i].uniqRef = uniqRef
 			snap, err := tx.Get(uniqRef)
 			if err != nil && status.Code(err) != codes.NotFound {
@@ -675,7 +675,7 @@ func jobSetStateIfRunning(ctx context.Context, client *firestore.Client, clk clo
 				firestore.Update{Path: "finalized_at", Value: now.UTC()},
 			)
 			if j.UniqueKey != "" {
-				tx.Delete(client.Collection(colUniq).Doc(j.Queue + "#" + j.UniqueKey)) //nolint:errcheck
+				tx.Delete(client.Collection(colUniq).Doc(j.UniqueKey)) //nolint:errcheck
 			}
 		}
 
@@ -711,7 +711,7 @@ func jobCancel(ctx context.Context, client *firestore.Client, clk clock.Clock, i
 			return err
 		}
 		if j.UniqueKey != "" {
-			tx.Delete(client.Collection(colUniq).Doc(j.Queue + "#" + j.UniqueKey)) //nolint:errcheck
+			tx.Delete(client.Collection(colUniq).Doc(j.UniqueKey)) //nolint:errcheck
 		}
 		return nil
 	})
@@ -736,7 +736,7 @@ func jobDelete(ctx context.Context, client *firestore.Client, id string) error {
 		return err
 	}
 	if j.UniqueKey != "" {
-		client.Collection(colUniq).Doc(j.Queue + "#" + j.UniqueKey).Delete(ctx) //nolint:errcheck
+		client.Collection(colUniq).Doc(j.UniqueKey).Delete(ctx) //nolint:errcheck
 	}
 	return nil
 }

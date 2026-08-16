@@ -303,8 +303,8 @@ func jobInsertMany(ctx context.Context, session *gocql.Session, clk clock.Clock,
 		if p.UniqueKey != "" {
 			m := map[string]interface{}{}
 			applied, err := session.Query(
-				`INSERT INTO goncordia_uniq (queue, ukey, job_id) VALUES (?, ?, ?) IF NOT EXISTS`,
-				p.Queue, p.UniqueKey, id,
+				`INSERT INTO goncordia_uniq_v2 (ukey, job_id) VALUES (?, ?) IF NOT EXISTS`,
+				p.UniqueKey, id,
 			).WithContext(ctx).MapScanCAS(m)
 			if err != nil {
 				return nil, fmt.Errorf("unique key check: %w", err)
@@ -341,6 +341,9 @@ func jobInsertMany(ctx context.Context, session *gocql.Session, clk clock.Clock,
 			j.ID, j.Queue, j.Kind, j.Args, j.State, j.Priority, j.RunAt, j.CreatedAt,
 			j.MaxRetry, j.TimeoutMs, j.UniqueKey, j.WorkerID, j.Tags, j.ErrorsJSON, j.PipelineID,
 		).WithContext(ctx).Exec(); err != nil {
+			if p.UniqueKey != "" {
+				_ = session.Query(`DELETE FROM goncordia_uniq_v2 WHERE ukey=?`, p.UniqueKey).WithContext(ctx).Exec()
+			}
 			return nil, fmt.Errorf("insert job: %w", err)
 		}
 
@@ -351,6 +354,10 @@ func jobInsertMany(ctx context.Context, session *gocql.Session, clk clock.Clock,
 				`INSERT INTO goncordia_jobs_avail (queue, run_at, priority, id) VALUES (?, ?, ?, ?)`,
 				j.Queue, j.RunAt, j.Priority, j.ID,
 			).WithContext(ctx).Exec(); err != nil {
+				_ = session.Query(`DELETE FROM goncordia_jobs WHERE id=?`, j.ID).WithContext(ctx).Exec()
+				if p.UniqueKey != "" {
+					_ = session.Query(`DELETE FROM goncordia_uniq_v2 WHERE ukey=?`, p.UniqueKey).WithContext(ctx).Exec()
+				}
 				return nil, fmt.Errorf("insert avail: %w", err)
 			}
 		}
@@ -656,8 +663,8 @@ func jobSetStateIfRunning(ctx context.Context, session *gocql.Session, clk clock
 		return err
 	}
 	if j.UniqueKey != "" {
-		return session.Query(`DELETE FROM goncordia_uniq WHERE queue=? AND ukey=?`,
-			j.Queue, j.UniqueKey).WithContext(ctx).Exec()
+		return session.Query(`DELETE FROM goncordia_uniq_v2 WHERE ukey=?`,
+			j.UniqueKey).WithContext(ctx).Exec()
 	}
 	return nil
 }
@@ -699,8 +706,8 @@ func jobCancel(ctx context.Context, session *gocql.Session, clk clock.Clock, id 
 	}
 
 	if j.UniqueKey != "" {
-		_ = session.Query(`DELETE FROM goncordia_uniq WHERE queue=? AND ukey=?`,
-			j.Queue, j.UniqueKey).WithContext(ctx).Exec()
+		_ = session.Query(`DELETE FROM goncordia_uniq_v2 WHERE ukey=?`,
+			j.UniqueKey).WithContext(ctx).Exec()
 	}
 	return nil
 }
@@ -724,8 +731,8 @@ func jobDelete(ctx context.Context, session *gocql.Session, id string) error {
 			j.Queue, j.RunAt, j.Priority, id).WithContext(ctx).Exec()
 	}
 	if j.UniqueKey != "" {
-		_ = session.Query(`DELETE FROM goncordia_uniq WHERE queue=? AND ukey=?`,
-			j.Queue, j.UniqueKey).WithContext(ctx).Exec()
+		_ = session.Query(`DELETE FROM goncordia_uniq_v2 WHERE ukey=?`,
+			j.UniqueKey).WithContext(ctx).Exec()
 	}
 	return nil
 }

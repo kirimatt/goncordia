@@ -185,6 +185,7 @@ SET state        = $2,
     worker_id    = NULL,
     finalized_at = COALESCE($3, finalized_at),
     run_at       = COALESCE($4, run_at),
+    unique_key   = CASE WHEN $8 THEN NULL ELSE unique_key END,
     errors       = CASE WHEN $5::jsonb IS NOT NULL THEN errors || $5::jsonb ELSE errors END
 WHERE id = $1 AND state = 'running'
   AND ($6 = '' OR worker_id = $6)
@@ -195,7 +196,8 @@ const sqlSetStateMain = `UPDATE goncordia_jobs
 SET state        = ?,
     worker_id    = NULL,
     finalized_at = COALESCE(?, finalized_at),
-    run_at       = COALESCE(?, run_at)
+    run_at       = COALESCE(?, run_at),
+    unique_key   = CASE WHEN ? THEN NULL ELSE unique_key END
 WHERE id = ? AND state = 'running'
   AND (? = '' OR worker_id = ?)
   AND (? = 0 OR attempt_num = ?)`
@@ -271,7 +273,7 @@ func jobInsertMany(ctx context.Context, q querier, d Dialect, clk clock.Clock, p
 		}
 
 		if uniqueKey != nil {
-			existing, err := findUniqueJob(ctx, q, d, p.Queue, *uniqueKey)
+			existing, err := findUniqueJob(ctx, q, d, *uniqueKey)
 			if err != nil {
 				return nil, err
 			}
@@ -311,9 +313,17 @@ func jobInsertMany(ctx context.Context, q querier, d Dialect, clk clock.Clock, p
 		if d == Postgres {
 			insertSQL := d.q(`INSERT INTO goncordia_jobs (` + insertJobCols + `)
 VALUES (` + insertJobVals + `)
+ON CONFLICT (unique_key) WHERE unique_key IS NOT NULL DO NOTHING
 RETURNING id`)
 			var insertedID string
-			if err := q.QueryRowContext(ctx, insertSQL, sqlArgs...).Scan(&insertedID); err != nil {
+			if err := q.QueryRowContext(ctx, insertSQL, sqlArgs...).Scan(&insertedID); err == sql.ErrNoRows && uniqueKey != nil {
+				existing, findErr := findUniqueJob(ctx, q, d, *uniqueKey)
+				if findErr != nil {
+					return nil, findErr
+				}
+				results = append(results, driver.JobInsertResult{Job: existing, UniqueSkip: true})
+				continue
+			} else if err != nil {
 				return nil, fmt.Errorf("insert job: %w", err)
 			}
 			row, rowErr = jobGetByID(ctx, q, d, insertedID)
@@ -321,6 +331,13 @@ RETURNING id`)
 			insertSQL := `INSERT INTO goncordia_jobs (` + insertJobCols + `) VALUES (` + insertJobVals + `)`
 			res, err := q.ExecContext(ctx, insertSQL, sqlArgs...)
 			if err != nil {
+				if uniqueKey != nil {
+					existing, findErr := findUniqueJob(ctx, q, d, *uniqueKey)
+					if findErr == nil && existing != nil {
+						results = append(results, driver.JobInsertResult{Job: existing, UniqueSkip: true})
+						continue
+					}
+				}
 				return nil, fmt.Errorf("insert job: %w", err)
 			}
 			id, err := res.LastInsertId()
@@ -337,12 +354,12 @@ RETURNING id`)
 	return results, nil
 }
 
-func findUniqueJob(ctx context.Context, q querier, d Dialect, queue, uniqueKey string) (*driver.JobRow, error) {
+func findUniqueJob(ctx context.Context, q querier, d Dialect, uniqueKey string) (*driver.JobRow, error) {
 	query := d.q(`SELECT ` + selectJobCols + ` FROM goncordia_jobs
-WHERE queue = ? AND unique_key = ?
+WHERE unique_key = ?
   AND state IN ('available', 'running', 'scheduled', 'retryable')
 LIMIT 1`)
-	j, err := scanJobRow(d, q.QueryRowContext(ctx, query, queue, uniqueKey))
+	j, err := scanJobRow(d, q.QueryRowContext(ctx, query, uniqueKey))
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -537,10 +554,12 @@ func jobSetStateIfRunning(ctx context.Context, q querier, d Dialect, clk clock.C
 	}
 
 	var finalizedAt *time.Time
+	terminal := false
 	switch params.State {
 	case driver.JobStateCompleted, driver.JobStateDiscarded, driver.JobStateCancelled:
 		t := clk.Now()
 		finalizedAt = &t
+		terminal = true
 	}
 
 	targetState := string(params.State)
@@ -565,7 +584,7 @@ func jobSetStateIfRunning(ctx context.Context, q querier, d Dialect, clk clock.C
 
 	if d == Postgres {
 		_, err := q.ExecContext(ctx, sqlSetStatePostgres, params.ID, targetState, finalizedAt, retryAt, errJSON,
-			params.ExpectedWorkerID, params.ExpectedAttempt)
+			params.ExpectedWorkerID, params.ExpectedAttempt, terminal)
 		return err
 	}
 
@@ -580,13 +599,9 @@ func jobSetStateIfRunning(ctx context.Context, q querier, d Dialect, clk clock.C
 			return err
 		}
 	}
-	if _, err := q.ExecContext(ctx, sqlSetStateMain, targetState, finalizedAt, retryAt, params.ID,
+	if _, err := q.ExecContext(ctx, sqlSetStateMain, targetState, finalizedAt, retryAt, terminal, params.ID,
 		params.ExpectedWorkerID, params.ExpectedWorkerID,
 		params.ExpectedAttempt, params.ExpectedAttempt); err != nil {
-		return err
-	}
-	if d == MySQL && (params.State == driver.JobStateCompleted || params.State == driver.JobStateDiscarded || params.State == driver.JobStateCancelled) {
-		_, err := q.ExecContext(ctx, `UPDATE goncordia_jobs SET unique_key=NULL WHERE id=?`, params.ID)
 		return err
 	}
 	return nil

@@ -16,6 +16,7 @@ package goncordia
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"reflect"
@@ -250,20 +251,31 @@ func buildUniqueKey(args core.JobArgs, queue string, opts *core.UniqueOpts, now 
 		return "", nil
 	}
 
-	key := args.Kind()
+	canonical := struct {
+		Version     int             `json:"version"`
+		Kind        string          `json:"kind"`
+		Queue       string          `json:"queue,omitempty"`
+		CallerKey   string          `json:"caller_key,omitempty"`
+		Args        json.RawMessage `json:"args,omitempty"`
+		PeriodStart int64           `json:"period_start,omitempty"`
+	}{Version: 2, Kind: args.Kind(), CallerKey: opts.Key}
 	if opts.ByQueue {
-		key += ":" + queue
+		canonical.Queue = queue
 	}
 	if opts.ByArgs {
 		b, err := json.Marshal(args)
 		if err != nil {
 			return "", fmt.Errorf("marshal args for unique key: %w", err)
 		}
-		key += ":" + string(b)
+		canonical.Args = b
 	}
 	if opts.ByPeriod > 0 {
-		window := now.Truncate(opts.ByPeriod)
-		key += ":" + window.Format(time.RFC3339)
+		canonical.PeriodStart = now.Truncate(opts.ByPeriod).UnixNano()
 	}
-	return key, nil
+	payload, err := json.Marshal(canonical)
+	if err != nil {
+		return "", fmt.Errorf("marshal canonical unique key: %w", err)
+	}
+	digest := sha256.Sum256(payload)
+	return fmt.Sprintf("u2_%x", digest[:]), nil
 }

@@ -92,7 +92,7 @@ func (e *executor) JobInsertMany(_ context.Context, params []driver.JobInsertPar
 	results := make([]driver.JobInsertResult, 0, len(params))
 	for _, p := range params {
 		if p.UniqueKey != "" {
-			if dup := e.d.findUniqueJob(p.Queue, p.UniqueKey); dup != nil {
+			if dup := e.d.findUniqueJob(p.UniqueKey); dup != nil {
 				results = append(results, driver.JobInsertResult{Job: dup, UniqueSkip: true})
 				continue
 			}
@@ -472,9 +472,9 @@ func (d *Driver) broadcastNotify(queue string) {
 	}
 }
 
-func (d *Driver) findUniqueJob(queue, uniqueKey string) *driver.JobRow {
+func (d *Driver) findUniqueJob(uniqueKey string) *driver.JobRow {
 	for _, j := range d.jobs {
-		if j.Queue == queue && j.UniqueKey == uniqueKey &&
+		if j.UniqueKey == uniqueKey &&
 			j.State != driver.JobStateCompleted &&
 			j.State != driver.JobStateDiscarded &&
 			j.State != driver.JobStateCancelled {

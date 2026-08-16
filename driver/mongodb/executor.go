@@ -235,11 +235,8 @@ func jobInsertMany(ctx context.Context, db *mongo.Database, clk clock.Clock, par
 		}
 
 		if p.UniqueKey != "" {
-			// Atomic upsert: only insert if no active job with this unique key exists.
-			filter := bson.M{
-				"queue":      p.Queue,
-				"unique_key": p.UniqueKey,
-			}
+			// Atomic upsert: the canonical key already captures the requested scope.
+			filter := bson.M{"unique_key": p.UniqueKey}
 			update := bson.M{"$setOnInsert": doc}
 			res, err := col.UpdateOne(ctx, filter, update, options.Update().SetUpsert(true))
 			if err != nil {

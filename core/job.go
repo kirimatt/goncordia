@@ -79,9 +79,12 @@ type UniqueOpts struct {
 	// This rule is identical across all drivers.
 	// ByArgs deduplicates based on the job arguments (JSON equality).
 	ByArgs bool
+	// Key is an optional caller-defined deduplication key. It is combined with
+	// the job kind and other enabled dimensions before hashing.
+	Key string
 	// ByQueue includes the queue name in the uniqueness key.
 	ByQueue bool
-	// ByPeriod deduplicates within a rolling time window.
+	// ByPeriod deduplicates within fixed UTC windows aligned to this duration.
 	ByPeriod time.Duration
 }
 

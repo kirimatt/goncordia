@@ -129,6 +129,11 @@ func (d *Driver) Migrate(ctx context.Context) error {
 			PRIMARY KEY ((queue, ukey))
 		)`,
 
+		`CREATE TABLE IF NOT EXISTS goncordia_uniq_v2 (
+			ukey   text PRIMARY KEY,
+			job_id text
+		)`,
+
 		// Leader election. Row TTL is set per insert to expire stale leaders.
 		`CREATE TABLE IF NOT EXISTS goncordia_leaders (
 			name       text PRIMARY KEY,

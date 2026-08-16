@@ -92,6 +92,15 @@ func (d *Driver) Migrate(ctx context.Context) error {
 					"unique_key": bson.M{"$exists": true},
 				}),
 		},
+		{
+			Keys: bson.D{{Key: "unique_key", Value: 1}},
+			Options: options.Index().
+				SetName("goncordia_jobs_unique_key_v2").
+				SetUnique(true).
+				SetPartialFilterExpression(bson.M{
+					"unique_key": bson.M{"$exists": true},
+				}),
+		},
 	}
 	if _, err := jobs.Indexes().CreateMany(ctx, jobIndexes); err != nil {
 		return fmt.Errorf("create jobs indexes: %w", err)

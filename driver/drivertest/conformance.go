@@ -32,7 +32,7 @@ func Run(t *testing.T, exec driver.Executor) {
 
 	insert := driver.JobInsertParams{
 		Queue: queue, Kind: "conformance", Args: []byte(`{"value":1}`),
-		RunAt: now, UniqueKey: "unique", Timeout: time.Second,
+		RunAt: now, UniqueKey: "unique-" + queue, Timeout: time.Second,
 		Tags: []string{"contract"}, PipelineID: "entity-1",
 	}
 	results, err := exec.JobInsertMany(ctx, []driver.JobInsertParams{insert})
@@ -45,6 +45,12 @@ func Run(t *testing.T, exec driver.Executor) {
 	duplicates, err := exec.JobInsertMany(ctx, []driver.JobInsertParams{insert})
 	if err != nil || len(duplicates) != 1 || !duplicates[0].UniqueSkip {
 		t.Fatalf("unique insert: results=%+v err=%v", duplicates, err)
+	}
+	crossQueueDuplicate := insert
+	crossQueueDuplicate.Queue = queue + "-other"
+	duplicates, err = exec.JobInsertMany(ctx, []driver.JobInsertParams{crossQueueDuplicate})
+	if err != nil || len(duplicates) != 1 || !duplicates[0].UniqueSkip {
+		t.Fatalf("global unique insert: results=%+v err=%v", duplicates, err)
 	}
 
 	row, err := exec.JobGetByID(ctx, id)

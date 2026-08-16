@@ -125,7 +125,7 @@ type JobInsertParams struct {
 	Args       []byte    // JSON-encoded job arguments
 	Priority   int       // higher = processed first; default 0
 	RunAt      time.Time // zero means "immediately"
-	UniqueKey  string    // optional; prevents duplicate jobs with the same key+state
+	UniqueKey  string    // optional; globally prevents duplicate active jobs with the same canonical key
 	MaxRetry   int
 	Timeout    time.Duration
 	Tags       []string

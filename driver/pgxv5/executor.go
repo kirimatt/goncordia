@@ -204,8 +204,7 @@ INSERT INTO goncordia_jobs
     (queue, kind, args, state, priority, run_at, created_at, max_retry, timeout_ms, unique_key, tags, pipeline_id)
 VALUES
     ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-ON CONFLICT (queue, unique_key) WHERE unique_key IS NOT NULL
-    AND state IN ('available', 'running', 'scheduled', 'retryable')
+ON CONFLICT (unique_key) WHERE unique_key IS NOT NULL
 DO NOTHING
 RETURNING id, queue, kind, args, state, priority, run_at, created_at,
           attempted_at, finalized_at, attempt_num, max_retry, timeout_ms,
@@ -221,7 +220,7 @@ RETURNING id, queue, kind, args, state, priority, run_at, created_at,
 		if err != nil {
 			if isNoRows(err) {
 				// Duplicate — find the existing job
-				existing, ferr := findUniqueJob(ctx, q, p.Queue, p.UniqueKey)
+				existing, ferr := findUniqueJob(ctx, q, p.UniqueKey)
 				if ferr != nil {
 					return nil, ferr
 				}
@@ -235,16 +234,16 @@ RETURNING id, queue, kind, args, state, priority, run_at, created_at,
 	return results, nil
 }
 
-func findUniqueJob(ctx context.Context, q querier, queue, uniqueKey string) (*driver.JobRow, error) {
+func findUniqueJob(ctx context.Context, q querier, uniqueKey string) (*driver.JobRow, error) {
 	const sql = `
 SELECT id, queue, kind, args, state, priority, run_at, created_at,
        attempted_at, finalized_at, attempt_num, max_retry, timeout_ms,
        unique_key, worker_id, tags, errors, pipeline_id
 FROM goncordia_jobs
-WHERE queue = $1 AND unique_key = $2
+WHERE unique_key = $1
   AND state IN ('available', 'running', 'scheduled', 'retryable')
 LIMIT 1`
-	return scanJobRow(q.QueryRow(ctx, sql, queue, uniqueKey))
+	return scanJobRow(q.QueryRow(ctx, sql, uniqueKey))
 }
 
 func jobGetByID(ctx context.Context, q querier, id string) (*driver.JobRow, error) {
@@ -398,10 +397,12 @@ WHERE id = $1 AND state = 'running'
 	errJSON := encodeError(params.Err, params.Attempt, clk)
 
 	var finalizedAt *time.Time
+	terminal := false
 	switch params.State {
 	case driver.JobStateCompleted, driver.JobStateDiscarded, driver.JobStateCancelled:
 		t := clk.Now()
 		finalizedAt = &t
+		terminal = true
 	}
 
 	var retryAt *time.Time
@@ -421,6 +422,7 @@ UPDATE goncordia_jobs SET
     worker_id    = NULL,
     finalized_at = COALESCE($3, finalized_at),
     run_at       = COALESCE($4, run_at),
+    unique_key   = CASE WHEN $8 THEN NULL ELSE unique_key END,
     errors       = CASE WHEN $5::jsonb IS NOT NULL
                         THEN errors || $5::jsonb
                         ELSE errors END
@@ -428,7 +430,7 @@ WHERE id = $1 AND state = 'running'
   AND ($6 = '' OR worker_id = $6)
   AND ($7 = 0 OR attempt_num = $7)`
 
-	_, err = q.Exec(ctx, sql, idInt, targetState, finalizedAt, retryAt, errJSON, params.ExpectedWorkerID, params.ExpectedAttempt)
+	_, err = q.Exec(ctx, sql, idInt, targetState, finalizedAt, retryAt, errJSON, params.ExpectedWorkerID, params.ExpectedAttempt, terminal)
 	return err
 }
 
@@ -440,7 +442,7 @@ func jobCancel(ctx context.Context, q querier, clk clock.Clock, id string) error
 	now := clk.Now()
 	const sql = `
 UPDATE goncordia_jobs
-SET state = 'cancelled', finalized_at = $2
+SET state = 'cancelled', finalized_at = $2, unique_key = NULL
 WHERE id = $1 AND state IN ('available', 'scheduled')`
 	_, err = q.Exec(ctx, sql, idInt, now)
 	return err

@@ -270,9 +270,9 @@ func jobInsertMany(ctx context.Context, conn chdriver.Conn, clk clock.Clock, par
 			var existing string
 			row := conn.QueryRow(ctx,
 				`SELECT id FROM goncordia_jobs FINAL
-				 WHERE queue=? AND unique_key=? AND state IN ('available','running','retryable','scheduled')
+					 WHERE unique_key=? AND state IN ('available','running','retryable','scheduled')
 				 LIMIT 1`,
-				p.Queue, p.UniqueKey)
+				p.UniqueKey)
 			if err := row.Scan(&existing); err == nil && existing != "" {
 				results[i] = driver.JobInsertResult{UniqueSkip: true}
 				continue

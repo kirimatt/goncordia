@@ -273,28 +273,6 @@ func jobInsertMany(ctx context.Context, svc *dynamodb.Client, clk clock.Clock, p
 			tags = []string{}
 		}
 
-		// Unique-key check via conditional PutItem.
-		if p.UniqueKey != "" {
-			pk := p.Queue + "#" + p.UniqueKey
-			_, err := svc.PutItem(ctx, &dynamodb.PutItemInput{
-				TableName: aws.String(tableUniq),
-				Item: map[string]types.AttributeValue{
-					"pk":     &types.AttributeValueMemberS{Value: pk},
-					"job_id": &types.AttributeValueMemberS{Value: id},
-				},
-				ConditionExpression:      aws.String("attribute_not_exists(#pk)"),
-				ExpressionAttributeNames: map[string]string{"#pk": "pk"},
-			})
-			if err != nil {
-				var cce *types.ConditionalCheckFailedException
-				if errors.As(err, &cce) {
-					results[i] = driver.JobInsertResult{UniqueSkip: true}
-					continue
-				}
-				return nil, fmt.Errorf("unique key check: %w", err)
-			}
-		}
-
 		j := dynamoJob{
 			ID:         id,
 			Queue:      p.Queue,
@@ -319,9 +297,30 @@ func jobInsertMany(ctx context.Context, svc *dynamodb.Client, clk clock.Clock, p
 		if err != nil {
 			return nil, err
 		}
-		if _, err := svc.PutItem(ctx, &dynamodb.PutItemInput{
-			TableName: aws.String(tableJobs),
-			Item:      item,
+		if p.UniqueKey != "" {
+			_, err = svc.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{
+				TransactItems: []types.TransactWriteItem{
+					{Put: &types.Put{TableName: aws.String(tableJobs), Item: item}},
+					{Put: &types.Put{
+						TableName: aws.String(tableUniq),
+						Item: map[string]types.AttributeValue{
+							"pk": &types.AttributeValueMemberS{Value: p.UniqueKey}, "job_id": &types.AttributeValueMemberS{Value: id},
+						},
+						ConditionExpression:      aws.String("attribute_not_exists(#pk)"),
+						ExpressionAttributeNames: map[string]string{"#pk": "pk"},
+					}},
+				},
+			})
+			if err != nil {
+				var cancelled *types.TransactionCanceledException
+				if errors.As(err, &cancelled) {
+					results[i] = driver.JobInsertResult{UniqueSkip: true}
+					continue
+				}
+				return nil, fmt.Errorf("insert unique job: %w", err)
+			}
+		} else if _, err := svc.PutItem(ctx, &dynamodb.PutItemInput{
+			TableName: aws.String(tableJobs), Item: item,
 		}); err != nil {
 			return nil, fmt.Errorf("insert job: %w", err)
 		}
@@ -762,7 +761,7 @@ func jobSetStateIfRunning(ctx context.Context, svc *dynamodb.Client, clk clock.C
 		_, err = svc.DeleteItem(ctx, &dynamodb.DeleteItemInput{
 			TableName: aws.String(tableUniq),
 			Key: map[string]types.AttributeValue{
-				"pk": &types.AttributeValueMemberS{Value: j.Queue + "#" + j.UniqueKey},
+				"pk": &types.AttributeValueMemberS{Value: j.UniqueKey},
 			},
 		})
 		return err
@@ -821,7 +820,7 @@ func jobCancel(ctx context.Context, svc *dynamodb.Client, clk clock.Clock, id st
 		_, _ = svc.DeleteItem(ctx, &dynamodb.DeleteItemInput{
 			TableName: aws.String(tableUniq),
 			Key: map[string]types.AttributeValue{
-				"pk": &types.AttributeValueMemberS{Value: j.Queue + "#" + j.UniqueKey},
+				"pk": &types.AttributeValueMemberS{Value: j.UniqueKey},
 			},
 		})
 	}
@@ -850,7 +849,7 @@ func jobDelete(ctx context.Context, svc *dynamodb.Client, id string) error {
 		_, _ = svc.DeleteItem(ctx, &dynamodb.DeleteItemInput{
 			TableName: aws.String(tableUniq),
 			Key: map[string]types.AttributeValue{
-				"pk": &types.AttributeValueMemberS{Value: j.Queue + "#" + j.UniqueKey},
+				"pk": &types.AttributeValueMemberS{Value: j.UniqueKey},
 			},
 		})
 	}

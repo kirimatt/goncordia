@@ -88,7 +88,7 @@ tx.Commit(ctx)  // job and order appear atomically
 Requires Go 1.26.6 or newer.
 
 ```bash
-go get github.com/kirimatt/goncordia@v0.15.0
+go get github.com/kirimatt/goncordia@v0.15.1
 ```
 
 Pick a driver:
@@ -393,12 +393,27 @@ client.Enqueue(ctx, SendEmailArgs{To: "user@example.com", Subject: "Welcome"}, &
     UniqueOpts: &core.UniqueOpts{            // deduplicate
         ByArgs:  true,
         ByQueue: true,
+        Key:     "welcome-email",           // optional caller-defined dimension
+        ByPeriod: 24 * time.Hour,            // fixed UTC-aligned windows
     },
 
     MaxRetry: &maxRetry,
     Tags:     []string{"user:42"},
 })
 ```
+
+Unique jobs are global by default: the same canonical key is rejected even if
+the second enqueue targets another queue. Set `ByQueue` to include the queue in
+the key and allow one active job per queue. `ByArgs`, `Key`, and `ByPeriod` add
+the serialized arguments, a caller-defined value, and the start of a fixed UTC
+window respectively. The stored key is a bounded SHA-256 digest, so large job
+arguments or caller keys do not expand database indexes. Completed, discarded,
+and cancelled jobs release their key.
+
+ClickHouse uniqueness is best-effort because concurrent inserts cannot be
+serialized by `ReplacingMergeTree`. Cassandra uses an LWT reservation followed
+by job writes; failed writes are compensated, but a process crash between them
+can leave an orphaned reservation that must be removed operationally.
 
 ---
 
