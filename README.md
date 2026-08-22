@@ -31,7 +31,7 @@ tx.Commit(ctx)  // job and order appear atomically
 - **Crash recovery** — abandoned `running` jobs are automatically returned to the queue
 - **Execution controls** — global and per-kind concurrency, per-job timeouts, stable worker IDs
 - **Pipelines** — serialize jobs sharing a `PipelineID` locally or, optionally, across worker processes
-- **Fair multi-queue scheduling** — weighted round-robin with per-queue concurrency and rate limits
+- **Fair multi-queue scheduling** — weighted round-robin with per-queue concurrency and composable local/global execution rate limits
 - **Payload evolution** — versioned payloads with ordered upcasters and permanent decode failures
 - **Batch enqueue** — shared options or independent per-item options, with transactional variants
 - **Queue pause/resume** — drain a queue without stopping workers
@@ -90,7 +90,7 @@ tx.Commit(ctx)  // job and order appear atomically
 Requires Go 1.25 or newer.
 
 ```bash
-go get github.com/kirimatt/goncordia@v0.17.0
+go get github.com/kirimatt/goncordia@v0.18.0
 ```
 
 Pick a driver:
@@ -451,7 +451,14 @@ goncordia.WorkerConfig{
 	Queues:          []string{"default", "critical"},
 	QueuePolicies: map[string]goncordia.QueuePolicy{
 		"critical": {Weight: 4, Concurrency: 12},
-		"default":  {Weight: 1, RateLimit: 100, RatePeriod: time.Second},
+		"default": {
+			Weight: 1,
+			RateLimits: []goncordia.QueueRateLimit{
+				{Limit: 10, Period: time.Second, Burst: 2},
+				{Limit: 300, Period: time.Minute, Burst: 10},
+				{Limit: 5_000, Period: 24 * time.Hour, Scope: goncordia.RateLimitScopeGlobal},
+			},
+		},
 	},
     Concurrency:     20,
     MaxPending:      80,                             // claimed jobs waiting/running; defaults to 4x concurrency
@@ -464,6 +471,7 @@ goncordia.WorkerConfig{
 	HeartbeatInterval: 20 * time.Minute,              // defaults to one third of StuckJobTimeout
 	DistributedPipelines: true,                        // optional cross-process PipelineID lock
 	PipelineLeaseDuration: 30 * time.Second,
+	RateLimitPollInterval: time.Second,                 // maximum global-permit retry interval
     Clock:           clock.NewManual(time.Now()),     // omit in production; inject for tests
     ErrorHandler:    func(err error) { logger.Error("worker", "err", err) },
 }
@@ -480,6 +488,24 @@ so rescue does not duplicate healthy long-running work. `Shutdown(ctx)` stops
 new claims, keeps active heartbeats alive, and returns `ctx.Err()` if the drain
 does not finish. Cancelling the pool context yields an interrupted claim without
 consuming an attempt.
+
+`QueuePolicy.RateLimits` are combined: a handler starts only after every rule
+has granted a permit. `Limit` and `Period` express the sustained rate, while
+`Burst` controls how many starts may happen without spacing (default 1). Periods
+are ordinary Go durations, so second, minute, hour, and day limits use
+`time.Second`, `time.Minute`, `time.Hour`, and `24*time.Hour` respectively.
+
+Local rules coordinate one `WorkerPool`. Set `Scope: RateLimitScopeGlobal` to
+coordinate all pools that share the same backend, queue name, and rule. Global
+permits use bounded ownership-safe leader leases and require no extra migration.
+Waiting jobs retain and heartbeat their claims, consume at most one execution
+slot per rate-limited queue, and yield without entering the handler during
+shutdown. The deprecated `RateLimit`/`RatePeriod` fields remain compatible and
+behave as a local rule whose burst equals its limit.
+
+ClickHouse leader election is best-effort under concurrent inserts, so global
+rate limits on ClickHouse inherit that limitation. Use a local rule or a backend
+with atomic leader leases when exceeding the global limit is unacceptable.
 
 Across all built-in drivers, due jobs are selected by `priority DESC`, then
 `run_at ASC`, `created_at ASC`, and `id ASC`.
