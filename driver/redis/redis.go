@@ -22,6 +22,7 @@ package redisdriver
 
 import (
 	"context"
+	"encoding/json"
 
 	"github.com/redis/go-redis/v9"
 
@@ -58,9 +59,35 @@ func New(rdb *redis.Client, opts ...Option) *Driver {
 	return d
 }
 
-// Migrate pings Redis to verify connectivity. Safe to call multiple times.
+// Migrate verifies connectivity and backfills the created-at administrative
+// index for jobs written by releases before v0.17. Safe to call multiple times.
 func (d *Driver) Migrate(ctx context.Context) error {
-	return d.rdb.Ping(ctx).Err()
+	if err := d.rdb.Ping(ctx).Err(); err != nil {
+		return err
+	}
+	var cursor uint64
+	for {
+		keys, next, err := d.rdb.Scan(ctx, cursor, jobKeyPrefix+"*", 500).Result()
+		if err != nil {
+			return err
+		}
+		for _, key := range keys {
+			raw, err := d.rdb.Get(ctx, key).Bytes()
+			if err != nil {
+				continue
+			}
+			var job redisJob
+			if json.Unmarshal(raw, &job) == nil {
+				if err := d.rdb.ZAdd(ctx, jobsIndexKey, redis.Z{Score: float64(job.CreatedAtMs), Member: job.ID}).Err(); err != nil {
+					return err
+				}
+			}
+		}
+		cursor = next
+		if cursor == 0 {
+			return nil
+		}
+	}
 }
 
 func (d *Driver) Name() string { return "redis" }

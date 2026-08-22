@@ -219,7 +219,7 @@ VALUES
 ON CONFLICT (unique_key) WHERE unique_key IS NOT NULL
 DO NOTHING
 RETURNING id, queue, kind, args, state, priority, run_at, created_at,
-          attempted_at, finalized_at, attempt_num, max_retry, timeout_ms,
+          attempted_at, lease_expires_at, finalized_at, attempt_num, max_retry, timeout_ms,
           unique_key, worker_id, tags, errors, pipeline_id`
 
 		row := q.QueryRow(ctx, insertSQL,
@@ -249,7 +249,7 @@ RETURNING id, queue, kind, args, state, priority, run_at, created_at,
 func findUniqueJob(ctx context.Context, q querier, uniqueKey string) (*driver.JobRow, error) {
 	const sql = `
 SELECT id, queue, kind, args, state, priority, run_at, created_at,
-       attempted_at, finalized_at, attempt_num, max_retry, timeout_ms,
+       attempted_at, lease_expires_at, finalized_at, attempt_num, max_retry, timeout_ms,
        unique_key, worker_id, tags, errors, pipeline_id
 FROM goncordia_jobs
 WHERE unique_key = $1
@@ -264,7 +264,7 @@ func jobGetByID(ctx context.Context, q querier, id string) (*driver.JobRow, erro
 	}
 	const sql = `
 SELECT id, queue, kind, args, state, priority, run_at, created_at,
-       attempted_at, finalized_at, attempt_num, max_retry, timeout_ms,
+       attempted_at, lease_expires_at, finalized_at, attempt_num, max_retry, timeout_ms,
        unique_key, worker_id, tags, errors, pipeline_id
 FROM goncordia_jobs WHERE id = $1`
 	row, err := scanJobRow(q.QueryRow(ctx, sql, idInt))
@@ -276,7 +276,7 @@ FROM goncordia_jobs WHERE id = $1`
 
 func jobList(ctx context.Context, q querier, params driver.JobListParams) ([]driver.JobRow, error) {
 	query := `SELECT id, queue, kind, args, state, priority, run_at, created_at,
-       attempted_at, finalized_at, attempt_num, max_retry, timeout_ms,
+       attempted_at, lease_expires_at, finalized_at, attempt_num, max_retry, timeout_ms,
        unique_key, worker_id, tags, errors, pipeline_id
 FROM goncordia_jobs WHERE TRUE`
 	args := make([]any, 0, 5)
@@ -355,16 +355,22 @@ WITH fetched AS (
 UPDATE goncordia_jobs j
 SET state       = 'running',
     attempted_at = $4,
+    lease_expires_at = $5,
     attempt_num  = attempt_num + 1,
-    worker_id    = $5
+    worker_id    = $6
 FROM fetched
 WHERE j.id = fetched.id
 RETURNING j.id, j.queue, j.kind, j.args, j.state, j.priority, j.run_at,
-          j.created_at, j.attempted_at, j.finalized_at, j.attempt_num,
+          j.created_at, j.attempted_at, j.lease_expires_at, j.finalized_at, j.attempt_num,
           j.max_retry, j.timeout_ms, j.unique_key, j.worker_id, j.tags, j.errors, j.pipeline_id`
 
 	now := clk.Now()
-	rows, err := q.Query(ctx, sql, params.Queue, now, params.Limit, now, params.WorkerID)
+	var leaseExpiresAt *time.Time
+	if params.LeaseDuration > 0 {
+		expires := now.Add(params.LeaseDuration)
+		leaseExpiresAt = &expires
+	}
+	rows, err := q.Query(ctx, sql, params.Queue, now, params.Limit, now, leaseExpiresAt, params.WorkerID)
 	if err != nil {
 		return nil, fmt.Errorf("fetch batch: %w", err)
 	}
@@ -375,9 +381,11 @@ RETURNING j.id, j.queue, j.kind, j.args, j.state, j.priority, j.run_at,
 func jobRescueStuck(ctx context.Context, q querier, params driver.JobRescueParams) (int64, error) {
 	const sql = `
 UPDATE goncordia_jobs SET
-    state = 'available', attempted_at = NULL, worker_id = NULL
-WHERE queue = $1 AND state = 'running' AND attempted_at <= $2`
-	tag, err := q.Exec(ctx, sql, params.Queue, params.Before)
+    state = 'available', attempted_at = NULL, lease_expires_at = NULL, worker_id = NULL
+WHERE queue = $1 AND state = 'running'
+  AND ((lease_expires_at IS NOT NULL AND lease_expires_at <= $2)
+       OR (lease_expires_at IS NULL AND attempted_at <= $3))`
+	tag, err := q.Exec(ctx, sql, params.Queue, params.At, params.Before)
 	if err != nil {
 		return 0, fmt.Errorf("rescue stuck jobs: %w", err)
 	}
@@ -385,9 +393,13 @@ WHERE queue = $1 AND state = 'running' AND attempted_at <= $2`
 }
 
 func jobHeartbeat(ctx context.Context, q querier, params driver.JobHeartbeatParams) (bool, error) {
-	tag, err := q.Exec(ctx, `UPDATE goncordia_jobs SET attempted_at = $1
+	leaseExpiresAt := params.LeaseExpiresAt
+	if leaseExpiresAt.IsZero() {
+		leaseExpiresAt = params.At
+	}
+	tag, err := q.Exec(ctx, `UPDATE goncordia_jobs SET lease_expires_at = $1
 WHERE id = $2 AND state = 'running' AND worker_id = $3 AND attempt_num = $4`,
-		params.At.UTC(), params.ID, params.WorkerID, params.Attempt)
+		leaseExpiresAt.UTC(), params.ID, params.WorkerID, params.Attempt)
 	if err != nil {
 		return false, err
 	}
@@ -406,6 +418,7 @@ UPDATE goncordia_jobs SET
     state        = 'available',
     attempt_num  = attempt_num - 1,
     attempted_at = NULL,
+    lease_expires_at = NULL,
     worker_id    = NULL
 WHERE id = $1 AND state = 'running'
   AND ($2 = '' OR worker_id = $2)
@@ -443,6 +456,7 @@ WHERE id = $1 AND state = 'running'
 UPDATE goncordia_jobs SET
     state        = $2,
     worker_id    = NULL,
+    lease_expires_at = NULL,
     finalized_at = COALESCE($3, finalized_at),
     run_at       = COALESCE($4, run_at),
     unique_key   = CASE WHEN $8 AND unique_key NOT LIKE 'uf2_%' THEN NULL ELSE unique_key END,
@@ -624,7 +638,7 @@ func scanJobRow(s scanner) (*driver.JobRow, error) {
 	)
 	err := s.Scan(
 		&id, &r.Queue, &r.Kind, &r.Args, &state, &r.Priority, &r.RunAt,
-		&r.CreatedAt, &r.AttemptedAt, &r.FinalizedAt, &r.AttemptNum,
+		&r.CreatedAt, &r.AttemptedAt, &r.LeaseExpiresAt, &r.FinalizedAt, &r.AttemptNum,
 		&r.MaxRetry, &timeoutMS, &uniqueKey, &workerID, &tags, &errorsJSON, &r.PipelineID,
 	)
 	if err != nil {

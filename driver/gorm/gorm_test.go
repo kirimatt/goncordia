@@ -26,7 +26,7 @@ func (EmailJob) Kind() string { return "email" }
 
 func newGormDB(t *testing.T) *gormpkg.DB {
 	t.Helper()
-	db, err := gormpkg.Open(sqlite.Open(":memory:"), &gormpkg.Config{})
+	db, err := gormpkg.Open(sqlite.Open("file::memory:?cache=shared"), &gormpkg.Config{})
 	if err != nil {
 		t.Fatalf("open gorm db: %v", err)
 	}

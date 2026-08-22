@@ -30,7 +30,9 @@ tx.Commit(ctx)  // job and order appear atomically
 - **Retry with backoff** — exponential (default), fixed, or custom `RetryPolicy`
 - **Crash recovery** — abandoned `running` jobs are automatically returned to the queue
 - **Execution controls** — global and per-kind concurrency, per-job timeouts, stable worker IDs
-- **Pipelines** — serialize jobs sharing a `PipelineID` within a worker-pool process
+- **Pipelines** — serialize jobs sharing a `PipelineID` locally or, optionally, across worker processes
+- **Fair multi-queue scheduling** — weighted round-robin with per-queue concurrency and rate limits
+- **Payload evolution** — versioned payloads with ordered upcasters and permanent decode failures
 - **Batch enqueue** — shared options or independent per-item options, with transactional variants
 - **Queue pause/resume** — drain a queue without stopping workers
 - **Push notifications** — LISTEN/NOTIFY (Postgres), Change Streams (MongoDB), Pub/Sub (Redis); polling fallback elsewhere
@@ -85,10 +87,10 @@ tx.Commit(ctx)  // job and order appear atomically
 
 ## Installation
 
-Requires Go 1.26.6 or newer.
+Requires Go 1.25 or newer.
 
 ```bash
-go get github.com/kirimatt/goncordia@v0.16.0
+go get github.com/kirimatt/goncordia@v0.17.0
 ```
 
 Pick a driver:
@@ -164,7 +166,11 @@ wp := pgxdriver.NewWorkerPool(d, registry, goncordia.WorkerConfig{
     Queues:      []string{"default"},
     Concurrency: 10,
 })
-wp.Start(ctx)  // blocks; call wp.Stop() to drain gracefully
+wp.Start(ctx)  // blocks
+
+shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+defer cancel()
+_ = wp.Shutdown(shutdownCtx) // reports an incomplete drain
 ```
 
 ### Transactional insert (PostgreSQL)
@@ -251,7 +257,7 @@ import (
 rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379"})
 defer rdb.Close()
 d := redisdriver.New(rdb)
-d.Migrate(ctx)  // pings Redis to verify connectivity
+d.Migrate(ctx)  // verifies connectivity and backfills the admin index
 
 client := redisdriver.NewClient(d, goncordia.ClientConfig{})
 client.Enqueue(ctx, SendEmailArgs{To: "user@example.com", Subject: "Welcome"}, nil)
@@ -442,7 +448,11 @@ can leave an orphaned reservation that must be removed operationally.
 
 ```go
 goncordia.WorkerConfig{
-    Queues:          []string{"default", "critical"},
+	Queues:          []string{"default", "critical"},
+	QueuePolicies: map[string]goncordia.QueuePolicy{
+		"critical": {Weight: 4, Concurrency: 12},
+		"default":  {Weight: 1, RateLimit: 100, RatePeriod: time.Second},
+	},
     Concurrency:     20,
     MaxPending:      80,                             // claimed jobs waiting/running; defaults to 4x concurrency
     WorkerID:        "mailer-eu-1",                  // generated when empty
@@ -451,7 +461,9 @@ goncordia.WorkerConfig{
     ShutdownTimeout: 30 * time.Second,
     StuckJobTimeout: time.Hour,                       // negative disables rescue
     RescueInterval: time.Minute,
-    HeartbeatInterval: 20 * time.Minute,              // defaults to one third of StuckJobTimeout
+	HeartbeatInterval: 20 * time.Minute,              // defaults to one third of StuckJobTimeout
+	DistributedPipelines: true,                        // optional cross-process PipelineID lock
+	PipelineLeaseDuration: 30 * time.Second,
     Clock:           clock.NewManual(time.Now()),     // omit in production; inject for tests
     ErrorHandler:    func(err error) { logger.Error("worker", "err", err) },
 }
@@ -462,10 +474,12 @@ core.RegisterWorker(registry, worker, core.WorkerOpts{
 })
 ```
 
-Running claims are fenced by worker ID and attempt number. Active and waiting
-claims heartbeat while they are owned, so rescue does not duplicate a healthy
-long-running job. Cancelling the pool context yields an interrupted claim back
-to the queue without consuming an attempt.
+Running claims are fenced by worker ID and attempt number. `attempted_at` remains
+the immutable attempt start; active and waiting claims renew `lease_expires_at`,
+so rescue does not duplicate healthy long-running work. `Shutdown(ctx)` stops
+new claims, keeps active heartbeats alive, and returns `ctx.Err()` if the drain
+does not finish. Cancelling the pool context yields an interrupted claim without
+consuming an attempt.
 
 Across all built-in drivers, due jobs are selected by `priority DESC`, then
 `run_at ASC`, `created_at ASC`, and `id ASC`.
@@ -484,9 +498,33 @@ client.EnqueueBatch(ctx, []goncordia.InsertRequest{
 })
 ```
 
-Jobs with the same non-empty `PipelineID` run sequentially in claim order inside one
-`WorkerPool`. This is a process-local ordering guarantee; separate worker
-processes require application-level partitioning if they must share a pipeline.
+Jobs with the same non-empty `PipelineID` run sequentially in claim order inside
+one `WorkerPool`. Set `DistributedPipelines: true` to extend the guarantee across
+worker processes sharing the same driver. The pool renews an ownership-fenced
+lease while the handler runs and cancels the handler context if renewal is lost.
+
+### Versioned payloads
+
+Version 1 remains plain legacy JSON. A type may declare a newer version and the
+worker registers each adjacent upcast step:
+
+```go
+func (SendEmailArgs) PayloadVersion() int { return 2 }
+
+core.RegisterWorker(registry, emailWorker, core.WorkerOpts{
+    PayloadVersion: 2,
+    Upcasters: map[int]core.PayloadUpcaster{
+        1: func(old json.RawMessage) (json.RawMessage, error) {
+            // Decode v1 and return v2 JSON.
+            return upgradeEmailV1ToV2(old)
+        },
+    },
+})
+```
+
+Malformed payloads, future versions, and missing/failed upcasters are permanent
+decode failures and go directly to `discarded`; they do not consume the retry
+schedule. `InsertOpts.PayloadVersion` can override the type-provided version.
 
 ---
 
@@ -512,9 +550,10 @@ http.Handle("/jobs/", http.StripPrefix("/jobs", handler))
 
 The handler exposes the embedded dashboard, `/healthz`, `/readyz`, `/metrics`,
 and JSON routes under `/api`. It supports job filtering, cancel/delete/retry/
-reschedule, queue pause/resume, and per-state queue counts. On Redis, Cassandra,
-DynamoDB, and Firestore, administrative list/metric operations scan records and
-are intended for moderate operational use rather than high-frequency scraping.
+reschedule, queue pause/resume, and per-state queue counts. Redis uses a migrated
+created-at index and DynamoDB uses its queue/state GSI for scoped reads. Unscoped
+DynamoDB reads and Cassandra/Firestore administrative paths still scan records
+and are intended for moderate operational use rather than high-frequency scraping.
 
 The default JSON representation removes job arguments, unique keys, and panic
 stack traces. Use `admin.WithJobRedactor` only when an application has a safe,
@@ -963,7 +1002,7 @@ goncordia.WorkerConfig{
 ```
 goncordia/
 ├── client.go              # Client[TTx] — Enqueue, EnqueueTx, Cancel
-├── worker.go              # WorkerPool[TTx] — Start, Stop, JobMiddleware
+├── worker.go              # WorkerPool[TTx] — Start, Shutdown, queue policies, middleware
 ├── cron.go                # CronScheduler[TTx] — periodic/cron job scheduling
 ├── admin/                 # dashboard, JSON API, probes, Prometheus metrics
 ├── clock/                 # injectable Real and Manual clocks

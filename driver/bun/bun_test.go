@@ -28,7 +28,7 @@ func (EmailJob) Kind() string { return "email" }
 
 func newBunDB(t *testing.T) *bun.DB {
 	t.Helper()
-	sqlDB, err := sql.Open("sqlite", ":memory:")
+	sqlDB, err := sql.Open("sqlite", "file::memory:?cache=shared")
 	if err != nil {
 		t.Fatalf("open sqlite: %v", err)
 	}

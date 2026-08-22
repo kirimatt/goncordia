@@ -9,11 +9,68 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+---
+
+## [v0.17.0] — 2026-08-23
+
+### Added
+- `WorkerPool.Shutdown(ctx) error` for observable graceful-drain timeouts while
+  retaining the source-compatible `Stop` wrapper.
+- Explicit persisted claim leases on every built-in driver. `attempted_at` is
+  now the immutable attempt start and `lease_expires_at` is renewed by heartbeat.
+- Weighted queue scheduling through `WorkerConfig.QueuePolicies`, including
+  per-queue concurrency limits and injected-clock fixed-window rate limits.
+- Optional distributed `PipelineID` serialization across worker processes using
+  renewable, ownership-safe driver leader leases.
+- Versioned job payload envelopes, `VersionedJobArgs`, `InsertOpts.PayloadVersion`,
+  and ordered `WorkerOpts.Upcasters` for schema evolution.
+- Permanent decode classification for malformed, unsupported-future, and
+  non-upcastable payloads so incompatible messages are discarded without retry churn.
+- Native Redis created-at job indexing with migration backfill, and DynamoDB
+  queue/state GSI queries for administrative listing and metrics paths.
+
+### Changed
+- Queue polling claims one job per weighted slot instead of allowing the first
+  non-empty queue to consume the whole pending budget.
+- Active jobs keep heartbeating while graceful shutdown drains; only jobs still
+  waiting for execution capacity are yielded.
+- Rescue uses explicit lease deadlines and falls back to legacy `attempted_at`
+  only for rows written before the lease field existed.
+- The supported Go floor is now Go 1.25. CI tests both Go 1.25 and Go 1.26 and
+  uses `actions/setup-go` v7.
+- Redis administrative reads use the maintained job index instead of a keyspace
+  `SCAN`; a `SCAN` is performed only by `Migrate` to backfill legacy jobs.
+- Tag creation continues to publish its GitHub Release in the same workflow;
+  the release workflow retains manual recovery for an existing tag.
+
 ### Fixed
-- Tag creation now publishes its GitHub Release in the same workflow because
-  GitHub does not emit recursive workflow events for tags pushed with the
-  repository `GITHUB_TOKEN`. The release workflow also supports manual recovery
-  for an existing tag.
+- Graceful shutdown no longer stops claim heartbeats before long-running handlers
+  finish, preventing healthy work from being rescued during deployment drains.
+- Heartbeats no longer overwrite the original attempt timestamp.
+- Cassandra lease-column migration is repeatable even when the migration journal
+  is rebuilt, and its running lookup now tracks lease deadlines.
+
+### Testing
+- Expanded reusable driver conformance to assert lease creation, immutable
+  attempt timestamps, heartbeat extension, legacy fallback, and deadline rescue.
+- Added deterministic tests for shutdown timeout reporting, heartbeat continuity,
+  weighted fairness, queue concurrency, rate-window advancement, distributed
+  pipelines across two pools, payload upcasting, and permanent decode failures.
+- CI validates the full build and race suite on both supported Go release lines.
+
+### Upgrade notes
+- Call `Migrate` before starting v0.17 workers. SQL drivers apply migration 006;
+  Cassandra and ClickHouse add `lease_expires_at`; MongoDB creates the lease index;
+  Redis backfills its administrative created-at index.
+- Rolling upgrades are supported for rescue: jobs without `lease_expires_at` use
+  the legacy `attempted_at` cutoff until reclaimed by a v0.17 worker.
+- Use `Shutdown(ctx)` when a deployment must fail or report an incomplete drain.
+  `Stop()` remains available but reports timeout only through `ErrorHandler`.
+- Distributed pipelines are opt-in. Enable `DistributedPipelines` only when all
+  participants use the same backing store and `PipelineID` namespace.
+- Payloads remain unwrapped at version 1. Version 2 and newer are stored in an
+  internal envelope; register every N-to-N+1 upcaster before deploying producers
+  that emit the newer version.
 
 ---
 

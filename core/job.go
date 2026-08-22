@@ -4,6 +4,7 @@ package core
 
 import (
 	"context"
+	"encoding/json"
 	"time"
 )
 
@@ -11,6 +12,13 @@ import (
 // Kind() returns a unique identifier used to route jobs to the right worker.
 type JobArgs interface {
 	Kind() string
+}
+
+// VersionedJobArgs lets enqueue automatically persist a payload schema version.
+// Version 1 is the default for types that do not implement this interface.
+type VersionedJobArgs interface {
+	JobArgs
+	PayloadVersion() int
 }
 
 // Worker processes jobs of a specific type.
@@ -47,8 +55,11 @@ type Job[T JobArgs] struct {
 	// Tags are optional labels attached to the job at enqueue time.
 	Tags []string
 	// PipelineID groups jobs that must not run concurrently. Jobs sharing the same
-	// non-empty PipelineID are serialized within a single WorkerPool process.
+	// non-empty PipelineID are serialized locally and may use a distributed lease
+	// when WorkerConfig.DistributedPipelines is enabled.
 	PipelineID string
+	// PayloadVersion is the schema version after registered upcasters ran.
+	PayloadVersion int
 }
 
 // InsertOpts controls optional parameters when enqueueing a job.
@@ -67,12 +78,13 @@ type InsertOpts struct {
 	Timeout *time.Duration
 	// Tags attaches arbitrary labels to the job for filtering/observability.
 	Tags []string
-	// PipelineID groups jobs that must not run concurrently within the same
-	// WorkerPool process. Jobs sharing the same non-empty PipelineID run
-	// sequentially in claim order. Empty string disables this behaviour.
-	// Note: this guarantee is per-process only — it does not coordinate across
-	// multiple worker pool instances.
+	// PipelineID groups jobs that must not run concurrently. Jobs sharing the same
+	// non-empty PipelineID run sequentially in claim order. Worker pools can opt
+	// into cross-process coordination with WorkerConfig.DistributedPipelines.
 	PipelineID string
+	// PayloadVersion overrides VersionedJobArgs.PayloadVersion. Zero uses the
+	// type-provided version or version 1.
+	PayloadVersion int
 }
 
 // UniqueOpts controls deduplication behavior.
@@ -106,4 +118,11 @@ type WorkerOpts struct {
 	// Concurrency limits how many of this job type run simultaneously.
 	// 0 means inherit from the global pool limit.
 	Concurrency int
+	// PayloadVersion is the schema version accepted by this worker. Default: 1.
+	PayloadVersion int
+	// Upcasters maps source version N to a conversion from N to N+1.
+	Upcasters map[int]PayloadUpcaster
 }
+
+// PayloadUpcaster converts one JSON payload version to the next.
+type PayloadUpcaster func(json.RawMessage) (json.RawMessage, error)
