@@ -11,6 +11,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [v0.18.0] — 2026-08-23
+
+### Added
+- Composable `QueuePolicy.RateLimits`: combine independent per-second,
+  per-minute, per-hour, and per-day execution limits on one queue.
+- `QueueRateLimit.Burst` for explicit burst capacity and
+  `RateLimitScopeGlobal` for storage-backed coordination across worker pools.
+- `WorkerConfig.RateLimitPollInterval` to bound retries for contended global
+  permits.
+
+### Changed
+- Rate limits now account for handler starts immediately before execution rather
+  than jobs claimed from storage. Prefetching therefore does not spend permits.
+- New rate-limit rules use bounded leaky-bucket lanes driven by the injected
+  clock. Every configured rule must grant a permit before the handler starts.
+- Jobs waiting for a rate permit keep their claim lease alive, while a per-queue
+  gate prevents the waiting backlog from consuming all execution slots.
+
+### Compatibility
+- The deprecated `QueuePolicy.RateLimit` and `RatePeriod` fields remain source
+  compatible. They are normalized to a local rule whose burst equals the limit.
+- Global limits reuse ownership-safe leader leases and require no schema
+  migration. Participants must share a backend, queue name, and identical rule.
+- ClickHouse global rate limits inherit its best-effort leader-election semantics;
+  use local limits or an atomic-lease backend for a strict global ceiling.
+
+### Testing
+- Added deterministic injected-clock coverage for legacy fields, combined
+  second/minute limits, global coordination across two worker pools, permit
+  expiry, and shutdown while a job is waiting for execution capacity.
+
+---
+
 ## [v0.17.0] — 2026-08-23
 
 ### Added

@@ -3,12 +3,14 @@ package goncordia
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
 	"runtime/debug"
 	"sort"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -23,15 +25,47 @@ import (
 // so err is never nil when the handler panicked — panics are converted to errors.
 type JobMiddleware func(ctx context.Context, job *core.RawJob, next func(context.Context, *core.RawJob) error) error
 
+// RateLimitScope controls whether a queue rate limit is enforced by one worker
+// pool or coordinated through the shared driver backend.
+type RateLimitScope uint8
+
+const (
+	// RateLimitScopeLocal coordinates starts inside one WorkerPool.
+	RateLimitScopeLocal RateLimitScope = iota
+	// RateLimitScopeGlobal coordinates starts across every WorkerPool using the
+	// same driver backend and queue/rule configuration.
+	RateLimitScopeGlobal
+)
+
+// QueueRateLimit bounds handler starts over time. Multiple limits may be
+// combined on one queue (for example, per-second and per-day limits).
+type QueueRateLimit struct {
+	// Limit is the sustained number of starts allowed per Period. Non-positive
+	// values disable this rule.
+	Limit int
+	// Period is the unit over which Limit is expressed. Default: 1 second.
+	Period time.Duration
+	// Burst is the number of starts that may happen without spacing. Default: 1;
+	// values greater than Limit are clamped to Limit.
+	Burst int
+	// Scope defaults to RateLimitScopeLocal.
+	Scope RateLimitScope
+}
+
 // QueuePolicy controls how a queue shares capacity with other queues in a pool.
 type QueuePolicy struct {
 	// Weight is the number of weighted round-robin slots. Default: 1.
 	Weight int
 	// Concurrency bounds jobs from this queue claimed by this pool. Zero is unlimited.
 	Concurrency int
-	// RateLimit bounds successful claims per RatePeriod. Zero is unlimited.
+	// RateLimits bounds handler starts. Every configured rule must allow a start.
+	RateLimits []QueueRateLimit
+	// RateLimit bounds starts per RatePeriod using a local burst equal to the
+	// limit. Zero is unlimited.
+	// Deprecated: use RateLimits.
 	RateLimit int
-	// RatePeriod is the fixed rate-limit window. Default: 1 second.
+	// RatePeriod is the legacy rate-limit period. Default: 1 second.
+	// Deprecated: use RateLimits.
 	RatePeriod time.Duration
 }
 
@@ -49,6 +83,9 @@ type WorkerConfig struct {
 	PipelineLeaseDuration time.Duration
 	// PipelinePollInterval controls how often a waiting job retries the lease. Default: 250ms.
 	PipelinePollInterval time.Duration
+	// RateLimitPollInterval is the maximum interval between attempts to acquire
+	// a contended global rate permit. Default: 1 second.
+	RateLimitPollInterval time.Duration
 	// Concurrency is the maximum number of jobs running simultaneously.
 	// Default: 10.
 	Concurrency int
@@ -107,6 +144,9 @@ type WorkerPool[TTx any] struct {
 	queueSchedule  []string
 	queueStateMu   sync.Mutex
 	queueStates    map[string]*queueRuntimeState
+	rateLimits     map[string][]normalizedRateLimit
+	rateGates      map[string]chan struct{}
+	rateCursor     atomic.Uint64
 	fetchMu        sync.Mutex
 	pipelineMu     sync.Mutex
 	pipelineTails  map[string]chan struct{}
@@ -115,9 +155,21 @@ type WorkerPool[TTx any] struct {
 }
 
 type queueRuntimeState struct {
-	active      int
-	windowStart time.Time
-	windowCount int
+	active int
+	rates  map[string]*localRateState
+}
+
+type localRateState struct {
+	readyAt []time.Time
+}
+
+type normalizedRateLimit struct {
+	key      string
+	limit    int
+	burst    int
+	period   time.Duration
+	cooldown time.Duration
+	scope    RateLimitScope
 }
 
 // NewWorkerPool creates a WorkerPool.
@@ -146,6 +198,9 @@ func NewWorkerPool[TTx any](d driver.Driver[TTx], registry *core.Registry, cfg W
 	}
 	if cfg.PipelinePollInterval <= 0 {
 		cfg.PipelinePollInterval = 250 * time.Millisecond
+	}
+	if cfg.RateLimitPollInterval <= 0 {
+		cfg.RateLimitPollInterval = time.Second
 	}
 	if cfg.StuckJobTimeout == 0 {
 		cfg.StuckJobTimeout = time.Hour
@@ -186,18 +241,17 @@ func NewWorkerPool[TTx any](d driver.Driver[TTx], registry *core.Registry, cfg W
 		cfg.ErrorHandler = func(err error) { slog.Error("goncordia worker error", "error", err) }
 	}
 	queueSchedule := make([]string, 0, len(cfg.Queues))
+	rateLimits := make(map[string][]normalizedRateLimit, len(cfg.Queues))
+	rateGates := make(map[string]chan struct{}, len(cfg.Queues))
 	for _, queue := range cfg.Queues {
 		policy := cfg.QueuePolicies[queue]
 		weight := policy.Weight
 		if weight <= 0 {
 			weight = 1
 		}
-		if policy.RateLimit > 0 && policy.RatePeriod <= 0 {
-			policy.RatePeriod = time.Second
-			if cfg.QueuePolicies == nil {
-				cfg.QueuePolicies = make(map[string]QueuePolicy)
-			}
-			cfg.QueuePolicies[queue] = policy
+		rateLimits[queue] = normalizeRateLimits(queue, policy)
+		if len(rateLimits[queue]) > 0 {
+			rateGates[queue] = make(chan struct{}, 1)
 		}
 		for range weight {
 			queueSchedule = append(queueSchedule, queue)
@@ -213,10 +267,65 @@ func NewWorkerPool[TTx any](d driver.Driver[TTx], registry *core.Registry, cfg W
 		shutdownCh:     make(chan struct{}),
 		shutdownDone:   make(chan struct{}),
 		queueSchedule:  queueSchedule,
+		rateLimits:     rateLimits,
+		rateGates:      rateGates,
 		queueStates:    make(map[string]*queueRuntimeState),
 		pipelineTails:  make(map[string]chan struct{}),
 		kindSemaphores: make(map[string]chan struct{}),
 	}
+}
+
+func normalizeRateLimits(queue string, policy QueuePolicy) []normalizedRateLimit {
+	configured := append([]QueueRateLimit(nil), policy.RateLimits...)
+	if policy.RateLimit > 0 {
+		configured = append(configured, QueueRateLimit{
+			Limit: policy.RateLimit, Period: policy.RatePeriod, Burst: policy.RateLimit,
+		})
+	}
+	result := make([]normalizedRateLimit, 0, len(configured))
+	seen := make(map[string]struct{}, len(configured))
+	for _, configuredRule := range configured {
+		if configuredRule.Limit <= 0 {
+			continue
+		}
+		if configuredRule.Period <= 0 {
+			configuredRule.Period = time.Second
+		}
+		if configuredRule.Burst <= 0 {
+			configuredRule.Burst = 1
+		}
+		if configuredRule.Burst > configuredRule.Limit {
+			configuredRule.Burst = configuredRule.Limit
+		}
+		if configuredRule.Scope != RateLimitScopeGlobal {
+			configuredRule.Scope = RateLimitScopeLocal
+		}
+		cooldown := time.Duration(float64(configuredRule.Period) *
+			float64(configuredRule.Burst) / float64(configuredRule.Limit))
+		if cooldown < time.Nanosecond {
+			cooldown = time.Nanosecond
+		}
+		if cooldown > configuredRule.Period {
+			cooldown = configuredRule.Period
+		}
+		signature := strconv.Itoa(configuredRule.Limit) + ":" +
+			strconv.FormatInt(int64(configuredRule.Period), 10) + ":" +
+			strconv.Itoa(configuredRule.Burst) + ":" + strconv.Itoa(int(configuredRule.Scope))
+		if _, duplicate := seen[signature]; duplicate {
+			continue
+		}
+		seen[signature] = struct{}{}
+		digest := sha256.Sum256([]byte(queue + "\x00" + signature))
+		result = append(result, normalizedRateLimit{
+			key:      "goncordia:rate:" + hex.EncodeToString(digest[:16]),
+			limit:    configuredRule.Limit,
+			burst:    configuredRule.Burst,
+			period:   configuredRule.Period,
+			cooldown: cooldown,
+			scope:    configuredRule.Scope,
+		})
+	}
+	return result
 }
 
 func newWorkerID() string {
@@ -445,6 +554,12 @@ func (p *WorkerPool[TTx]) fetchAndDispatch(ctx context.Context) {
 				}
 				defer releaseDistributed()
 				claimCtx = distributedCtx
+				releaseRateGate, rateGateAcquired := p.acquireRateGate(claimCtx, row.Queue)
+				if !rateGateAcquired {
+					p.setState(context.Background(), exec, fencedStateParams(row, driver.JobSetStateParams{Yield: true}))
+					return
+				}
+				defer releaseRateGate()
 				kindSem := p.kindSemaphore(row.Kind)
 				if kindSem != nil {
 					select {
@@ -465,6 +580,13 @@ func (p *WorkerPool[TTx]) fetchAndDispatch(ctx context.Context) {
 					p.setState(context.Background(), exec, fencedStateParams(row, driver.JobSetStateParams{Yield: true}))
 					return
 				}
+				if !p.waitForRatePermit(claimCtx, exec, row) {
+					p.setState(context.Background(), exec, fencedStateParams(row, driver.JobSetStateParams{Yield: true}))
+					return
+				}
+				// Let the next job approach execution capacity only after this job has
+				// reserved every configured rate permit.
+				releaseRateGate()
 				p.processRow(claimCtx, exec, row)
 			}()
 		}
@@ -483,15 +605,7 @@ func (p *WorkerPool[TTx]) queueCanClaim(queue string) bool {
 	if policy.Concurrency > 0 && state.active >= policy.Concurrency {
 		return false
 	}
-	if policy.RateLimit <= 0 {
-		return true
-	}
-	now := p.config.Clock.Now()
-	if state.windowStart.IsZero() || !now.Before(state.windowStart.Add(policy.RatePeriod)) {
-		state.windowStart = now
-		state.windowCount = 0
-	}
-	return state.windowCount < policy.RateLimit
+	return true
 }
 
 func (p *WorkerPool[TTx]) queueClaimed(queue string) {
@@ -503,9 +617,6 @@ func (p *WorkerPool[TTx]) queueClaimed(queue string) {
 		p.queueStates[queue] = state
 	}
 	state.active++
-	if p.config.QueuePolicies[queue].RateLimit > 0 {
-		state.windowCount++
-	}
 }
 
 func (p *WorkerPool[TTx]) queueDone(queue string) {
@@ -513,6 +624,243 @@ func (p *WorkerPool[TTx]) queueDone(queue string) {
 	defer p.queueStateMu.Unlock()
 	if state := p.queueStates[queue]; state != nil && state.active > 0 {
 		state.active--
+	}
+}
+
+func (p *WorkerPool[TTx]) acquireRateGate(ctx context.Context, queue string) (func(), bool) {
+	gate := p.rateGates[queue]
+	if gate == nil {
+		return func() {}, true
+	}
+	select {
+	case gate <- struct{}{}:
+		var once sync.Once
+		return func() { once.Do(func() { <-gate }) }, true
+	case <-ctx.Done():
+		return nil, false
+	case <-p.shutdownCh:
+		return nil, false
+	}
+}
+
+type localRateReservation struct {
+	state    *localRateState
+	lane     int
+	previous time.Time
+	reserved time.Time
+}
+
+func (p *WorkerPool[TTx]) localRateDelay(queue string, now time.Time) time.Duration {
+	p.queueStateMu.Lock()
+	defer p.queueStateMu.Unlock()
+	state := p.queueStates[queue]
+	if state == nil {
+		state = &queueRuntimeState{}
+		p.queueStates[queue] = state
+	}
+	if state.rates == nil {
+		state.rates = make(map[string]*localRateState)
+	}
+	var delay time.Duration
+	for _, rule := range p.rateLimits[queue] {
+		if rule.scope != RateLimitScopeLocal {
+			continue
+		}
+		rateState := state.rates[rule.key]
+		if rateState == nil {
+			rateState = &localRateState{readyAt: make([]time.Time, rule.burst)}
+			state.rates[rule.key] = rateState
+		}
+		earliest := rateState.readyAt[0]
+		for _, readyAt := range rateState.readyAt[1:] {
+			if readyAt.Before(earliest) {
+				earliest = readyAt
+			}
+		}
+		if earliest.After(now) && earliest.Sub(now) > delay {
+			delay = earliest.Sub(now)
+		}
+	}
+	return delay
+}
+
+func (p *WorkerPool[TTx]) reserveLocalRateLimits(queue string, now time.Time) (func(), bool) {
+	p.queueStateMu.Lock()
+	state := p.queueStates[queue]
+	if state == nil {
+		state = &queueRuntimeState{}
+		p.queueStates[queue] = state
+	}
+	if state.rates == nil {
+		state.rates = make(map[string]*localRateState)
+	}
+	reservations := make([]localRateReservation, 0, len(p.rateLimits[queue]))
+	for _, rule := range p.rateLimits[queue] {
+		if rule.scope != RateLimitScopeLocal {
+			continue
+		}
+		rateState := state.rates[rule.key]
+		if rateState == nil {
+			rateState = &localRateState{readyAt: make([]time.Time, rule.burst)}
+			state.rates[rule.key] = rateState
+		}
+		lane := 0
+		for i := 1; i < len(rateState.readyAt); i++ {
+			if rateState.readyAt[i].Before(rateState.readyAt[lane]) {
+				lane = i
+			}
+		}
+		if rateState.readyAt[lane].After(now) {
+			p.queueStateMu.Unlock()
+			return nil, false
+		}
+		reserved := now.Add(rule.cooldown)
+		reservations = append(reservations, localRateReservation{
+			state: rateState, lane: lane, previous: rateState.readyAt[lane], reserved: reserved,
+		})
+		rateState.readyAt[lane] = reserved
+	}
+	p.queueStateMu.Unlock()
+
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			p.queueStateMu.Lock()
+			defer p.queueStateMu.Unlock()
+			for _, reservation := range reservations {
+				if reservation.state.readyAt[reservation.lane].Equal(reservation.reserved) {
+					reservation.state.readyAt[reservation.lane] = reservation.previous
+				}
+			}
+		})
+	}, true
+}
+
+type globalRateLease struct {
+	name  string
+	owner string
+}
+
+func (p *WorkerPool[TTx]) tryGlobalRateLimits(
+	ctx context.Context, exec driver.Executor, row driver.JobRow,
+) ([]globalRateLease, bool, error) {
+	leases := make([]globalRateLease, 0, len(p.rateLimits[row.Queue]))
+	for _, rule := range p.rateLimits[row.Queue] {
+		if rule.scope != RateLimitScopeGlobal {
+			continue
+		}
+		ownerDigest := sha256.Sum256([]byte(p.config.WorkerID + "\x00" + row.ID + "\x00" +
+			strconv.Itoa(row.AttemptNum) + "\x00" + rule.key))
+		owner := "rate:" + hex.EncodeToString(ownerDigest[:16])
+		start := int(p.rateCursor.Add(1)-1) % rule.burst
+		acquired := false
+		for offset := range rule.burst {
+			lane := (start + offset) % rule.burst
+			name := rule.key + ":" + strconv.Itoa(lane)
+			elected, err := exec.LeaderAttemptElect(ctx, driver.LeaderElectParams{
+				Name: name, WorkerID: owner, TTL: rule.cooldown,
+			})
+			if err != nil {
+				p.releaseGlobalRateLeases(exec, leases)
+				return nil, false, err
+			}
+			if elected {
+				leases = append(leases, globalRateLease{name: name, owner: owner})
+				acquired = true
+				break
+			}
+		}
+		if !acquired {
+			p.releaseGlobalRateLeases(exec, leases)
+			return nil, false, nil
+		}
+	}
+	return leases, true, nil
+}
+
+func (p *WorkerPool[TTx]) releaseGlobalRateLeases(exec driver.Executor, leases []globalRateLease) {
+	for i := len(leases) - 1; i >= 0; i-- {
+		lease := leases[i]
+		if err := exec.LeaderResign(context.Background(), driver.LeaderResignParams{
+			Name: lease.name, WorkerID: lease.owner,
+		}); err != nil {
+			p.reportError(fmt.Errorf("release global rate permit %q: %w", lease.name, err))
+		}
+	}
+}
+
+func (p *WorkerPool[TTx]) globalRateRetryDelay(queue string) time.Duration {
+	delay := p.config.RateLimitPollInterval
+	for _, rule := range p.rateLimits[queue] {
+		if rule.scope != RateLimitScopeGlobal {
+			continue
+		}
+		candidate := rule.cooldown / 4
+		if candidate < 10*time.Millisecond {
+			candidate = 10 * time.Millisecond
+		}
+		if candidate < delay {
+			delay = candidate
+		}
+	}
+	return delay
+}
+
+func (p *WorkerPool[TTx]) waitForRatePermit(ctx context.Context, exec driver.Executor, row driver.JobRow) bool {
+	if len(p.rateLimits[row.Queue]) == 0 {
+		return true
+	}
+	for {
+		now := p.config.Clock.Now()
+		if delay := p.localRateDelay(row.Queue, now); delay > 0 {
+			if !p.waitForRateDelay(ctx, delay) {
+				return false
+			}
+			continue
+		}
+		rollbackLocal, reserved := p.reserveLocalRateLimits(row.Queue, now)
+		if !reserved {
+			continue
+		}
+		leases, acquired, err := p.tryGlobalRateLimits(ctx, exec, row)
+		if acquired && err == nil {
+			// Successful local reservations and global leases intentionally remain
+			// until their cooldown expires: they account for this handler start.
+			return true
+		}
+		rollbackLocal()
+		if len(leases) > 0 {
+			p.releaseGlobalRateLeases(exec, leases)
+		}
+		if err != nil {
+			p.reportError(fmt.Errorf("acquire global rate permit for queue %q: %w", row.Queue, err))
+		}
+		if !p.waitForRateDelay(ctx, p.globalRateRetryDelay(row.Queue)) {
+			return false
+		}
+	}
+}
+
+func (p *WorkerPool[TTx]) waitForRateDelay(ctx context.Context, delay time.Duration) bool {
+	var timerC <-chan time.Time
+	stop := func() {}
+	if factory, ok := p.config.Clock.(interface {
+		NewTimer(time.Duration) clock.Timer
+	}); ok {
+		timer := factory.NewTimer(delay)
+		timerC = timer.C()
+		stop = timer.Stop
+	} else {
+		timerC = p.config.Clock.After(delay)
+	}
+	defer stop()
+	select {
+	case <-timerC:
+		return true
+	case <-ctx.Done():
+		return false
+	case <-p.shutdownCh:
+		return false
 	}
 }
 

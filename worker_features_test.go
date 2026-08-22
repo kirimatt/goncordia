@@ -497,7 +497,9 @@ func TestQueueRateLimitUsesInjectedClock(t *testing.T) {
 	client := goncordia.NewClient(d, goncordia.ClientConfig{Clock: clk})
 	registry := core.NewRegistry()
 	release := make(chan struct{})
+	var started atomic.Int64
 	core.RegisterWorker(registry, core.WorkerFunc[featureArgs](func(context.Context, *core.Job[featureArgs]) error {
+		started.Add(1)
 		<-release
 		return nil
 	}), core.WorkerOpts{})
@@ -514,16 +516,207 @@ func TestQueueRateLimitUsesInjectedClock(t *testing.T) {
 		},
 	})
 	go pool.Start(context.Background()) //nolint:errcheck
-	waitForCondition(t, time.Second, func() bool { return len(recorder.snapshot()) == 2 }, "initial rate-limited claims")
+	waitForCondition(t, time.Second, func() bool { return len(recorder.snapshot()) == 4 }, "prefetched claims")
+	waitForCondition(t, time.Second, func() bool { return started.Load() == 2 }, "initial rate-limited starts")
 	clk.Advance(59 * time.Second)
 	time.Sleep(10 * time.Millisecond)
-	if got := len(recorder.snapshot()); got != 2 {
-		t.Fatalf("claims before window reset=%d, want 2", got)
+	if got := started.Load(); got != 2 {
+		t.Fatalf("starts before window reset=%d, want 2", got)
 	}
 	clk.Advance(time.Second)
-	waitForCondition(t, time.Second, func() bool { return len(recorder.snapshot()) == 4 }, "claims after rate window")
+	waitForCondition(t, time.Second, func() bool { return started.Load() == 4 }, "starts after rate window")
 	close(release)
 	pool.Stop()
+}
+
+func TestQueueRateLimitsCombineSecondAndMinuteWindows(t *testing.T) {
+	clk := clock.NewManual(time.Date(2026, 8, 23, 12, 0, 0, 0, time.UTC))
+	d := memory.New(memory.WithClock(clk))
+	client := goncordia.NewClient(d, goncordia.ClientConfig{Clock: clk})
+	registry := core.NewRegistry()
+	release := make(chan struct{})
+	var started atomic.Int64
+	core.RegisterWorker(registry, core.WorkerFunc[featureArgs](func(context.Context, *core.Job[featureArgs]) error {
+		started.Add(1)
+		<-release
+		return nil
+	}), core.WorkerOpts{})
+	for i := range 4 {
+		if _, err := client.Enqueue(context.Background(), featureArgs{N: i}, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	pool := goncordia.NewWorkerPool(d, registry, goncordia.WorkerConfig{
+		Concurrency: 4, MaxPending: 4, PollInterval: time.Hour, Clock: clk,
+		QueuePolicies: map[string]goncordia.QueuePolicy{
+			"default": {RateLimits: []goncordia.QueueRateLimit{
+				{Limit: 2, Period: time.Second, Burst: 2},
+				{Limit: 3, Period: time.Minute, Burst: 3},
+			}},
+		},
+	})
+	go pool.Start(context.Background()) //nolint:errcheck
+	waitForCondition(t, time.Second, func() bool { return started.Load() == 2 }, "initial second burst")
+	clk.Advance(time.Second)
+	waitForCondition(t, time.Second, func() bool { return started.Load() == 3 }, "third start after second window")
+	clk.Advance(58 * time.Second)
+	time.Sleep(10 * time.Millisecond)
+	if got := started.Load(); got != 3 {
+		t.Fatalf("starts before minute window=%d, want 3", got)
+	}
+	clk.Advance(time.Second)
+	waitForCondition(t, time.Second, func() bool { return started.Load() == 4 }, "fourth start after minute window")
+	close(release)
+	pool.Stop()
+}
+
+func TestQueueRateLimitDefaultBurstSpacesStarts(t *testing.T) {
+	clk := clock.NewManual(time.Date(2026, 8, 23, 12, 0, 0, 0, time.UTC))
+	d := memory.New(memory.WithClock(clk))
+	client := goncordia.NewClient(d, goncordia.ClientConfig{Clock: clk})
+	registry := core.NewRegistry()
+	release := make(chan struct{})
+	var started atomic.Int64
+	core.RegisterWorker(registry, core.WorkerFunc[featureArgs](func(context.Context, *core.Job[featureArgs]) error {
+		started.Add(1)
+		<-release
+		return nil
+	}), core.WorkerOpts{})
+	for i := range 2 {
+		if _, err := client.Enqueue(context.Background(), featureArgs{N: i}, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	pool := goncordia.NewWorkerPool(d, registry, goncordia.WorkerConfig{
+		Concurrency: 2, MaxPending: 2, PollInterval: time.Hour, Clock: clk,
+		QueuePolicies: map[string]goncordia.QueuePolicy{
+			"default": {RateLimits: []goncordia.QueueRateLimit{{Limit: 2, Period: time.Minute}}},
+		},
+	})
+	go pool.Start(context.Background()) //nolint:errcheck
+	waitForCondition(t, time.Second, func() bool { return started.Load() == 1 }, "first smoothed start")
+	clk.Advance(29 * time.Second)
+	time.Sleep(10 * time.Millisecond)
+	if got := started.Load(); got != 1 {
+		t.Fatalf("starts before default burst cooldown=%d, want 1", got)
+	}
+	clk.Advance(time.Second)
+	waitForCondition(t, time.Second, func() bool { return started.Load() == 2 }, "second smoothed start")
+	close(release)
+	pool.Stop()
+}
+
+func TestGlobalQueueRateLimitCoordinatesWorkerPools(t *testing.T) {
+	clk := clock.NewManual(time.Date(2026, 8, 23, 12, 0, 0, 0, time.UTC))
+	d := memory.New(memory.WithClock(clk))
+	client := goncordia.NewClient(d, goncordia.ClientConfig{Clock: clk})
+	registry := core.NewRegistry()
+	release := make(chan struct{})
+	started := make(chan int, 2)
+	core.RegisterWorker(registry, core.WorkerFunc[featureArgs](func(_ context.Context, job *core.Job[featureArgs]) error {
+		started <- job.Args.N
+		<-release
+		return nil
+	}), core.WorkerOpts{})
+	for i := range 2 {
+		if _, err := client.Enqueue(context.Background(), featureArgs{N: i}, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	config := func(workerID string) goncordia.WorkerConfig {
+		return goncordia.WorkerConfig{
+			WorkerID: workerID, Concurrency: 1, MaxPending: 1, PollInterval: time.Hour,
+			Clock: clk, RateLimitPollInterval: time.Second,
+			QueuePolicies: map[string]goncordia.QueuePolicy{
+				"default": {RateLimits: []goncordia.QueueRateLimit{{
+					Limit: 1, Period: time.Minute, Scope: goncordia.RateLimitScopeGlobal,
+				}}},
+			},
+		}
+	}
+	poolA := goncordia.NewWorkerPool(d, registry, config("rate-worker-a"))
+	poolB := goncordia.NewWorkerPool(d, registry, config("rate-worker-b"))
+	go poolA.Start(context.Background()) //nolint:errcheck
+	go poolB.Start(context.Background()) //nolint:errcheck
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("first globally rate-limited handler did not start")
+	}
+	select {
+	case value := <-started:
+		t.Fatalf("second handler started before global permit expiry: %d", value)
+	case <-time.After(20 * time.Millisecond):
+	}
+	clk.Advance(59 * time.Second)
+	time.Sleep(10 * time.Millisecond)
+	select {
+	case value := <-started:
+		t.Fatalf("second handler started at 59 seconds: %d", value)
+	default:
+	}
+	clk.Advance(time.Second)
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("second handler did not start after global permit expiry")
+	}
+	close(release)
+	waitForCondition(t, time.Second, func() bool {
+		jobs := d.AllJobs()
+		return len(jobs) == 2 && jobs[0].State == driver.JobStateCompleted && jobs[1].State == driver.JobStateCompleted
+	}, "globally rate-limited jobs")
+	poolA.Stop()
+	poolB.Stop()
+}
+
+func TestShutdownYieldsJobWaitingForRatePermit(t *testing.T) {
+	clk := clock.NewManual(time.Date(2026, 8, 23, 12, 0, 0, 0, time.UTC))
+	d := memory.New(memory.WithClock(clk))
+	client := goncordia.NewClient(d, goncordia.ClientConfig{Clock: clk})
+	registry := core.NewRegistry()
+	release := make(chan struct{})
+	var started atomic.Int64
+	core.RegisterWorker(registry, core.WorkerFunc[featureArgs](func(context.Context, *core.Job[featureArgs]) error {
+		started.Add(1)
+		<-release
+		return nil
+	}), core.WorkerOpts{})
+	for i := range 2 {
+		if _, err := client.Enqueue(context.Background(), featureArgs{N: i}, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	pool := goncordia.NewWorkerPool(d, registry, goncordia.WorkerConfig{
+		Concurrency: 2, MaxPending: 2, PollInterval: time.Hour, Clock: clk,
+		QueuePolicies: map[string]goncordia.QueuePolicy{
+			"default": {RateLimits: []goncordia.QueueRateLimit{{Limit: 1, Period: time.Hour}}},
+		},
+	})
+	go pool.Start(context.Background()) //nolint:errcheck
+	waitForCondition(t, time.Second, func() bool { return started.Load() == 1 }, "first rate-limited start")
+	shutdownDone := make(chan error, 1)
+	go func() { shutdownDone <- pool.Shutdown(context.Background()) }()
+	close(release)
+	select {
+	case err := <-shutdownDone:
+		if err != nil {
+			t.Fatalf("shutdown: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("shutdown waited for a blocked rate permit")
+	}
+	if got := started.Load(); got != 1 {
+		t.Fatalf("handler starts during shutdown=%d, want 1", got)
+	}
+	jobs := d.AllJobs()
+	states := map[driver.JobState]int{}
+	for _, job := range jobs {
+		states[job.State]++
+	}
+	if states[driver.JobStateCompleted] != 1 || states[driver.JobStateAvailable] != 1 {
+		t.Fatalf("states after shutdown=%v, want one completed and one available", states)
+	}
 }
 
 func TestDistributedPipelinesSerializeAcrossPools(t *testing.T) {
