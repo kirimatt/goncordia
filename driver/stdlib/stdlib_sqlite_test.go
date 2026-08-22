@@ -57,8 +57,8 @@ func TestStdlibSQLite_ConcurrentMigrateAndOwnership(t *testing.T) {
 	if err := db1.QueryRow(`SELECT COUNT(*) FROM goncordia_schema_migrations`).Scan(&migrations); err != nil {
 		t.Fatal(err)
 	}
-	if migrations != 5 {
-		t.Fatalf("migration count=%d, want 5", migrations)
+	if migrations != 6 {
+		t.Fatalf("migration count=%d, want 6", migrations)
 	}
 	if err := drivers[0].Close(); err != nil {
 		t.Fatal(err)

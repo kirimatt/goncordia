@@ -23,11 +23,32 @@ import (
 // so err is never nil when the handler panicked — panics are converted to errors.
 type JobMiddleware func(ctx context.Context, job *core.RawJob, next func(context.Context, *core.RawJob) error) error
 
+// QueuePolicy controls how a queue shares capacity with other queues in a pool.
+type QueuePolicy struct {
+	// Weight is the number of weighted round-robin slots. Default: 1.
+	Weight int
+	// Concurrency bounds jobs from this queue claimed by this pool. Zero is unlimited.
+	Concurrency int
+	// RateLimit bounds successful claims per RatePeriod. Zero is unlimited.
+	RateLimit int
+	// RatePeriod is the fixed rate-limit window. Default: 1 second.
+	RatePeriod time.Duration
+}
+
 // WorkerConfig configures the worker pool.
 type WorkerConfig struct {
 	// Queues lists the queues this worker pool processes.
 	// If empty, only "default" is polled.
 	Queues []string
+	// QueuePolicies configures weighted fairness and per-queue concurrency/rate limits.
+	QueuePolicies map[string]QueuePolicy
+	// DistributedPipelines serializes PipelineID values across worker processes
+	// using the driver's renewable leader leases.
+	DistributedPipelines bool
+	// PipelineLeaseDuration is the distributed pipeline lease TTL. Default: 30 seconds.
+	PipelineLeaseDuration time.Duration
+	// PipelinePollInterval controls how often a waiting job retries the lease. Default: 250ms.
+	PipelinePollInterval time.Duration
 	// Concurrency is the maximum number of jobs running simultaneously.
 	// Default: 10.
 	Concurrency int
@@ -79,14 +100,24 @@ type WorkerPool[TTx any] struct {
 	pending        chan struct{}
 	shutdownOnce   sync.Once
 	shutdownCh     chan struct{}
+	shutdownDone   chan struct{}
 	isShuttingDown atomic.Bool
 	started        atomic.Bool
 	queueCursor    atomic.Uint64
+	queueSchedule  []string
+	queueStateMu   sync.Mutex
+	queueStates    map[string]*queueRuntimeState
 	fetchMu        sync.Mutex
 	pipelineMu     sync.Mutex
 	pipelineTails  map[string]chan struct{}
 	kindSemMu      sync.Mutex
 	kindSemaphores map[string]chan struct{}
+}
+
+type queueRuntimeState struct {
+	active      int
+	windowStart time.Time
+	windowCount int
 }
 
 // NewWorkerPool creates a WorkerPool.
@@ -109,6 +140,12 @@ func NewWorkerPool[TTx any](d driver.Driver[TTx], registry *core.Registry, cfg W
 	}
 	if cfg.ShutdownTimeout <= 0 {
 		cfg.ShutdownTimeout = 30 * time.Second
+	}
+	if cfg.PipelineLeaseDuration <= 0 {
+		cfg.PipelineLeaseDuration = 30 * time.Second
+	}
+	if cfg.PipelinePollInterval <= 0 {
+		cfg.PipelinePollInterval = 250 * time.Millisecond
 	}
 	if cfg.StuckJobTimeout == 0 {
 		cfg.StuckJobTimeout = time.Hour
@@ -148,6 +185,24 @@ func NewWorkerPool[TTx any](d driver.Driver[TTx], registry *core.Registry, cfg W
 	if cfg.ErrorHandler == nil {
 		cfg.ErrorHandler = func(err error) { slog.Error("goncordia worker error", "error", err) }
 	}
+	queueSchedule := make([]string, 0, len(cfg.Queues))
+	for _, queue := range cfg.Queues {
+		policy := cfg.QueuePolicies[queue]
+		weight := policy.Weight
+		if weight <= 0 {
+			weight = 1
+		}
+		if policy.RateLimit > 0 && policy.RatePeriod <= 0 {
+			policy.RatePeriod = time.Second
+			if cfg.QueuePolicies == nil {
+				cfg.QueuePolicies = make(map[string]QueuePolicy)
+			}
+			cfg.QueuePolicies[queue] = policy
+		}
+		for range weight {
+			queueSchedule = append(queueSchedule, queue)
+		}
+	}
 
 	return &WorkerPool[TTx]{
 		driver:         d,
@@ -156,6 +211,9 @@ func NewWorkerPool[TTx any](d driver.Driver[TTx], registry *core.Registry, cfg W
 		sem:            make(chan struct{}, cfg.Concurrency),
 		pending:        make(chan struct{}, cfg.MaxPending),
 		shutdownCh:     make(chan struct{}),
+		shutdownDone:   make(chan struct{}),
+		queueSchedule:  queueSchedule,
+		queueStates:    make(map[string]*queueRuntimeState),
 		pipelineTails:  make(map[string]chan struct{}),
 		kindSemaphores: make(map[string]chan struct{}),
 	}
@@ -176,6 +234,9 @@ func (p *WorkerPool[TTx]) Start(ctx context.Context) error {
 	if !p.started.CompareAndSwap(false, true) {
 		return fmt.Errorf("worker pool already started")
 	}
+	if p.isShuttingDown.Load() {
+		return fmt.Errorf("worker pool is shutting down")
+	}
 	if listener := p.driver.Listener(); listener != nil {
 		return p.runWithNotifications(ctx, listener)
 	}
@@ -183,7 +244,18 @@ func (p *WorkerPool[TTx]) Start(ctx context.Context) error {
 }
 
 // Stop initiates a graceful shutdown, waiting up to ShutdownTimeout for in-flight jobs.
+// Deprecated: use Shutdown to observe whether the drain completed.
 func (p *WorkerPool[TTx]) Stop() {
+	ctx, cancel := clock.WithTimeout(context.Background(), p.config.Clock, p.config.ShutdownTimeout)
+	defer cancel()
+	if err := p.Shutdown(ctx); err != nil {
+		p.reportError(fmt.Errorf("shutdown worker pool: %w", err))
+	}
+}
+
+// Shutdown stops claiming new jobs and waits for claimed work to complete or
+// yield. Active jobs continue renewing their leases while the pool drains.
+func (p *WorkerPool[TTx]) Shutdown(ctx context.Context) error {
 	p.shutdownOnce.Do(func() {
 		// Serialize shutdown with claiming so no goroutine can be added after
 		// Wait begins.
@@ -191,17 +263,17 @@ func (p *WorkerPool[TTx]) Stop() {
 		p.isShuttingDown.Store(true)
 		close(p.shutdownCh)
 		p.fetchMu.Unlock()
+		go func() {
+			p.wg.Wait()
+			close(p.shutdownDone)
+		}()
 	})
 
-	done := make(chan struct{})
-	go func() {
-		p.wg.Wait()
-		close(done)
-	}()
-
 	select {
-	case <-done:
-	case <-p.config.Clock.After(p.config.ShutdownTimeout):
+	case <-p.shutdownDone:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 
@@ -301,21 +373,32 @@ func (p *WorkerPool[TTx]) fetchAndDispatch(ctx context.Context) {
 
 	exec := p.driver.Executor()
 
-	start := int(p.queueCursor.Add(1)-1) % len(p.config.Queues)
-	for offset := range len(p.config.Queues) {
-		queue := p.config.Queues[(start+offset)%len(p.config.Queues)]
+	misses := 0
+	for free > 0 && misses < len(p.queueSchedule) {
+		index := int(p.queueCursor.Add(1)-1) % len(p.queueSchedule)
+		queue := p.queueSchedule[index]
+		if !p.queueCanClaim(queue) {
+			misses++
+			continue
+		}
 		rows, err := exec.JobFetchBatch(ctx, driver.FetchParams{
-			Queue:    queue,
-			Limit:    free,
-			WorkerID: p.config.WorkerID,
+			Queue:         queue,
+			Limit:         1,
+			WorkerID:      p.config.WorkerID,
+			LeaseDuration: p.config.StuckJobTimeout,
 		})
 		if err != nil {
 			p.reportError(fmt.Errorf("fetch queue %q: %w", queue, err))
+			misses++
 			continue
 		}
 		if len(rows) == 0 {
+			misses++
 			continue
 		}
+		misses = 0
+		p.queueClaimed(queue)
+		free--
 		sort.SliceStable(rows, func(i, j int) bool {
 			if rows[i].Priority != rows[j].Priority {
 				return rows[i].Priority > rows[j].Priority
@@ -340,6 +423,7 @@ func (p *WorkerPool[TTx]) fetchAndDispatch(ctx context.Context) {
 			go func() {
 				defer p.wg.Done()
 				defer func() { <-p.pending }()
+				defer p.queueDone(row.Queue)
 				defer pipelineDone()
 				claimCtx, stopHeartbeat := p.startHeartbeat(ctx, exec, row)
 				defer stopHeartbeat()
@@ -354,6 +438,13 @@ func (p *WorkerPool[TTx]) fetchAndDispatch(ctx context.Context) {
 						return
 					}
 				}
+				distributedCtx, releaseDistributed, acquired := p.acquireDistributedPipeline(claimCtx, exec, row)
+				if !acquired {
+					p.setState(context.Background(), exec, fencedStateParams(row, driver.JobSetStateParams{Yield: true}))
+					return
+				}
+				defer releaseDistributed()
+				claimCtx = distributedCtx
 				kindSem := p.kindSemaphore(row.Kind)
 				if kindSem != nil {
 					select {
@@ -377,9 +468,114 @@ func (p *WorkerPool[TTx]) fetchAndDispatch(ctx context.Context) {
 				p.processRow(claimCtx, exec, row)
 			}()
 		}
-		free = cap(p.pending) - len(p.pending)
-		if free <= 0 {
-			return
+	}
+}
+
+func (p *WorkerPool[TTx]) queueCanClaim(queue string) bool {
+	p.queueStateMu.Lock()
+	defer p.queueStateMu.Unlock()
+	policy := p.config.QueuePolicies[queue]
+	state := p.queueStates[queue]
+	if state == nil {
+		state = &queueRuntimeState{}
+		p.queueStates[queue] = state
+	}
+	if policy.Concurrency > 0 && state.active >= policy.Concurrency {
+		return false
+	}
+	if policy.RateLimit <= 0 {
+		return true
+	}
+	now := p.config.Clock.Now()
+	if state.windowStart.IsZero() || !now.Before(state.windowStart.Add(policy.RatePeriod)) {
+		state.windowStart = now
+		state.windowCount = 0
+	}
+	return state.windowCount < policy.RateLimit
+}
+
+func (p *WorkerPool[TTx]) queueClaimed(queue string) {
+	p.queueStateMu.Lock()
+	defer p.queueStateMu.Unlock()
+	state := p.queueStates[queue]
+	if state == nil {
+		state = &queueRuntimeState{}
+		p.queueStates[queue] = state
+	}
+	state.active++
+	if p.config.QueuePolicies[queue].RateLimit > 0 {
+		state.windowCount++
+	}
+}
+
+func (p *WorkerPool[TTx]) queueDone(queue string) {
+	p.queueStateMu.Lock()
+	defer p.queueStateMu.Unlock()
+	if state := p.queueStates[queue]; state != nil && state.active > 0 {
+		state.active--
+	}
+}
+
+func (p *WorkerPool[TTx]) acquireDistributedPipeline(
+	ctx context.Context, exec driver.Executor, row driver.JobRow,
+) (context.Context, func(), bool) {
+	if !p.config.DistributedPipelines || row.PipelineID == "" {
+		return ctx, func() {}, true
+	}
+	name := "goncordia:pipeline:" + row.PipelineID
+	owner := fmt.Sprintf("%s:%s:%d", p.config.WorkerID, row.ID, row.AttemptNum)
+	ticker := p.config.Clock.NewTicker(p.config.PipelinePollInterval)
+	defer ticker.Stop()
+	for {
+		elected, err := exec.LeaderAttemptElect(ctx, driver.LeaderElectParams{
+			Name: name, WorkerID: owner, TTL: p.config.PipelineLeaseDuration,
+		})
+		if err != nil {
+			p.reportError(fmt.Errorf("acquire distributed pipeline %q: %w", row.PipelineID, err))
+		} else if elected {
+			pipelineCtx, cancel := context.WithCancel(ctx)
+			done := make(chan struct{})
+			renewEvery := p.config.PipelineLeaseDuration / 3
+			if renewEvery <= 0 {
+				renewEvery = time.Second
+			}
+			renewTicker := p.config.Clock.NewTicker(renewEvery)
+			go func() {
+				defer close(done)
+				defer renewTicker.Stop()
+				for {
+					select {
+					case <-pipelineCtx.Done():
+						return
+					case <-renewTicker.C():
+						renewed, renewErr := exec.LeaderAttemptElect(pipelineCtx, driver.LeaderElectParams{
+							Name: name, WorkerID: owner, TTL: p.config.PipelineLeaseDuration,
+						})
+						if renewErr != nil || !renewed {
+							if renewErr != nil {
+								p.reportError(fmt.Errorf("renew distributed pipeline %q: %w", row.PipelineID, renewErr))
+							}
+							cancel()
+							return
+						}
+					}
+				}
+			}()
+			release := func() {
+				cancel()
+				<-done
+				if err := exec.LeaderResign(context.Background(), driver.LeaderResignParams{Name: name, WorkerID: owner}); err != nil {
+					p.reportError(fmt.Errorf("release distributed pipeline %q: %w", row.PipelineID, err))
+				}
+			}
+			return pipelineCtx, release, true
+		}
+		select {
+		case <-ctx.Done():
+			return ctx, func() {}, false
+		case <-p.shutdownCh:
+			return ctx, func() {}, false
+		case <-ticker.C():
 		}
 	}
 }
@@ -563,11 +759,11 @@ func (p *WorkerPool[TTx]) startHeartbeat(ctx context.Context, exec driver.Execut
 			select {
 			case <-claimCtx.Done():
 				return
-			case <-p.shutdownCh:
-				return
 			case <-ticker.C():
+				now := p.config.Clock.Now()
 				params := driver.JobHeartbeatParams{
-					ID: row.ID, WorkerID: row.WorkerID, Attempt: row.AttemptNum, At: p.config.Clock.Now(),
+					ID: row.ID, WorkerID: row.WorkerID, Attempt: row.AttemptNum, At: now,
+					LeaseExpiresAt: now.Add(p.config.StuckJobTimeout),
 				}
 				renewed, err := heartbeater.JobHeartbeat(claimCtx, params)
 				if p.config.Observer != nil {
@@ -616,9 +812,10 @@ func (p *WorkerPool[TTx]) rescueStuck(ctx context.Context) {
 	if !ok {
 		return
 	}
-	before := p.config.Clock.Now().Add(-p.config.StuckJobTimeout)
+	now := p.config.Clock.Now()
+	before := now.Add(-p.config.StuckJobTimeout)
 	for _, queue := range p.config.Queues {
-		rescued, err := rescuer.JobRescueStuck(ctx, driver.JobRescueParams{Queue: queue, Before: before})
+		rescued, err := rescuer.JobRescueStuck(ctx, driver.JobRescueParams{Queue: queue, At: now, Before: before})
 		if p.config.Observer != nil {
 			p.config.Observer.JobsRescued(ctx, RescueEvent{Queue: queue, Before: before, Rescued: rescued, Err: err})
 		}

@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"cloud.google.com/go/firestore"
+	pb "cloud.google.com/go/firestore/apiv1/firestorepb"
 	"github.com/google/uuid"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -22,25 +23,26 @@ var errJobGone = errors.New("job no longer available")
 // ---- document types ----
 
 type jobDoc struct {
-	ID          string     `firestore:"id"`
-	Queue       string     `firestore:"queue"`
-	Kind        string     `firestore:"kind"`
-	Args        string     `firestore:"args"` // JSON string
-	State       string     `firestore:"state"`
-	Priority    int        `firestore:"priority"`
-	RunAt       time.Time  `firestore:"run_at"`
-	CreatedAt   time.Time  `firestore:"created_at"`
-	AttemptedAt time.Time  `firestore:"attempted_at"` // zero if not yet attempted
-	FinalizedAt time.Time  `firestore:"finalized_at"` // zero if not finalized
-	AttemptNum  int        `firestore:"attempt_num"`
-	MaxRetry    int        `firestore:"max_retry"`
-	TimeoutMs   int64      `firestore:"timeout_ms"`
-	UniqueKey   string     `firestore:"unique_key"`
-	WorkerID    string     `firestore:"worker_id"`
-	Tags        []string   `firestore:"tags"`
-	Errors      []jobError `firestore:"errors"`
-	Version     int64      `firestore:"version"`
-	PipelineID  string     `firestore:"pipeline_id"`
+	ID             string     `firestore:"id"`
+	Queue          string     `firestore:"queue"`
+	Kind           string     `firestore:"kind"`
+	Args           string     `firestore:"args"` // JSON string
+	State          string     `firestore:"state"`
+	Priority       int        `firestore:"priority"`
+	RunAt          time.Time  `firestore:"run_at"`
+	CreatedAt      time.Time  `firestore:"created_at"`
+	AttemptedAt    time.Time  `firestore:"attempted_at"`     // zero if not yet attempted
+	LeaseExpiresAt time.Time  `firestore:"lease_expires_at"` // zero for legacy/unclaimed jobs
+	FinalizedAt    time.Time  `firestore:"finalized_at"`     // zero if not finalized
+	AttemptNum     int        `firestore:"attempt_num"`
+	MaxRetry       int        `firestore:"max_retry"`
+	TimeoutMs      int64      `firestore:"timeout_ms"`
+	UniqueKey      string     `firestore:"unique_key"`
+	WorkerID       string     `firestore:"worker_id"`
+	Tags           []string   `firestore:"tags"`
+	Errors         []jobError `firestore:"errors"`
+	Version        int64      `firestore:"version"`
+	PipelineID     string     `firestore:"pipeline_id"`
 }
 
 type jobError struct {
@@ -447,17 +449,26 @@ func jobList(ctx context.Context, client *firestore.Client, params driver.JobLis
 }
 
 func queueStats(ctx context.Context, client *firestore.Client, queue string) (driver.QueueStats, error) {
-	snaps, err := client.Collection(colJobs).Where("queue", "==", queue).Documents(ctx).GetAll()
-	if err != nil {
-		return driver.QueueStats{}, err
-	}
 	stats := driver.QueueStats{Queue: queue, States: make(map[driver.JobState]int64)}
-	for _, snap := range snaps {
-		var job jobDoc
-		if snap.DataTo(&job) == nil {
-			stats.States[driver.JobState(job.State)]++
-			stats.Total++
+	states := []driver.JobState{
+		driver.JobStateAvailable, driver.JobStateScheduled, driver.JobStateRunning,
+		driver.JobStateCompleted, driver.JobStateDiscarded, driver.JobStateCancelled,
+	}
+	for _, state := range states {
+		query := client.Collection(colJobs).
+			Where("queue", "==", queue).
+			Where("state", "==", string(state))
+		result, err := query.NewAggregationQuery().WithCount("total").Get(ctx)
+		if err != nil {
+			return driver.QueueStats{}, err
 		}
+		value, ok := result["total"].(*pb.Value)
+		if !ok {
+			return driver.QueueStats{}, fmt.Errorf("firestore count returned unexpected value for queue %q state %q", queue, state)
+		}
+		count := value.GetIntegerValue()
+		stats.States[state] = count
+		stats.Total += count
 	}
 	return stats, nil
 }
@@ -522,6 +533,10 @@ func jobFetchBatch(ctx context.Context, client *firestore.Client, clk clock.Cloc
 		}
 
 		claimTime := clk.Now()
+		var leaseExpiresAt time.Time
+		if params.LeaseDuration > 0 {
+			leaseExpiresAt = claimTime.Add(params.LeaseDuration).UTC()
+		}
 		err := client.RunTransaction(ctx, func(ctx context.Context, tx *firestore.Transaction) error {
 			snap, err := tx.Get(c.ref)
 			if err != nil {
@@ -538,6 +553,7 @@ func jobFetchBatch(ctx context.Context, client *firestore.Client, clk clock.Cloc
 				{Path: "state", Value: string(driver.JobStateRunning)},
 				{Path: "worker_id", Value: params.WorkerID},
 				{Path: "attempted_at", Value: claimTime.UTC()},
+				{Path: "lease_expires_at", Value: leaseExpiresAt},
 				{Path: "attempt_num", Value: firestore.Increment(1)},
 				{Path: "version", Value: firestore.Increment(1)},
 			})
@@ -569,6 +585,9 @@ func jobFetchBatch(ctx context.Context, client *firestore.Client, clk clock.Cloc
 			WorkerID:    params.WorkerID,
 			PipelineID:  j.PipelineID,
 		}
+		if !leaseExpiresAt.IsZero() {
+			row.LeaseExpiresAt = &leaseExpiresAt
+		}
 		claimed = append(claimed, row)
 	}
 	return claimed, nil
@@ -578,7 +597,6 @@ func jobRescueStuck(ctx context.Context, client *firestore.Client, params driver
 	snaps, err := client.Collection(colJobs).
 		Where("queue", "==", params.Queue).
 		Where("state", "==", string(driver.JobStateRunning)).
-		Where("attempted_at", "<=", params.Before).
 		Documents(ctx).GetAll()
 	if err != nil {
 		return 0, err
@@ -594,13 +612,16 @@ func jobRescueStuck(ctx context.Context, client *firestore.Client, params driver
 			if err := current.DataTo(&job); err != nil {
 				return err
 			}
-			if job.State != string(driver.JobStateRunning) || job.AttemptedAt.After(params.Before) {
+			expired := !job.LeaseExpiresAt.IsZero() && !job.LeaseExpiresAt.After(params.At)
+			legacyExpired := job.LeaseExpiresAt.IsZero() && !job.AttemptedAt.IsZero() && !job.AttemptedAt.After(params.Before)
+			if job.State != string(driver.JobStateRunning) || (!expired && !legacyExpired) {
 				return errJobGone
 			}
 			return tx.Update(snap.Ref, []firestore.Update{
 				{Path: "state", Value: string(driver.JobStateAvailable)},
 				{Path: "worker_id", Value: ""},
 				{Path: "attempted_at", Value: time.Time{}},
+				{Path: "lease_expires_at", Value: time.Time{}},
 				{Path: "version", Value: firestore.Increment(1)},
 			})
 		})
@@ -633,8 +654,12 @@ func jobHeartbeat(ctx context.Context, client *firestore.Client, params driver.J
 		if job.State != string(driver.JobStateRunning) || job.WorkerID != params.WorkerID || job.AttemptNum != params.Attempt {
 			return nil
 		}
+		leaseExpiresAt := params.LeaseExpiresAt
+		if leaseExpiresAt.IsZero() {
+			leaseExpiresAt = params.At
+		}
 		renewed = true
-		return tx.Update(jobRef, []firestore.Update{{Path: "attempted_at", Value: params.At.UTC()}})
+		return tx.Update(jobRef, []firestore.Update{{Path: "lease_expires_at", Value: leaseExpiresAt.UTC()}})
 	})
 	return renewed && err == nil, err
 }
@@ -666,6 +691,7 @@ func jobSetStateIfRunning(ctx context.Context, client *firestore.Client, clk clo
 				{Path: "state", Value: string(driver.JobStateAvailable)},
 				{Path: "worker_id", Value: ""},
 				{Path: "attempted_at", Value: time.Time{}},
+				{Path: "lease_expires_at", Value: time.Time{}},
 				{Path: "attempt_num", Value: firestore.Increment(-1)},
 				{Path: "version", Value: firestore.Increment(1)},
 			})
@@ -673,6 +699,7 @@ func jobSetStateIfRunning(ctx context.Context, client *firestore.Client, clk clo
 
 		updates := []firestore.Update{
 			{Path: "worker_id", Value: ""},
+			{Path: "lease_expires_at", Value: time.Time{}},
 			{Path: "version", Value: firestore.Increment(1)},
 		}
 
@@ -994,6 +1021,10 @@ func docToRow(j jobDoc) *driver.JobRow {
 	if !j.AttemptedAt.IsZero() {
 		t := j.AttemptedAt
 		row.AttemptedAt = &t
+	}
+	if !j.LeaseExpiresAt.IsZero() {
+		t := j.LeaseExpiresAt
+		row.LeaseExpiresAt = &t
 	}
 	if !j.FinalizedAt.IsZero() {
 		t := j.FinalizedAt

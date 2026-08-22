@@ -23,6 +23,7 @@ const (
 	jobKeyPrefix = "goncordia:job:"
 	queuesSetKey = "goncordia:queues"
 	cursorsKey   = "goncordia:schedule:cursors"
+	jobsIndexKey = "goncordia:jobs:created"
 )
 
 func availKey(q string) string      { return "goncordia:q:" + q + ":avail" }
@@ -43,24 +44,25 @@ func priorityScore(priority int, runAt time.Time) float64 {
 // ---- job document ----
 
 type redisJob struct {
-	ID            string            `json:"id"`
-	Queue         string            `json:"queue"`
-	Kind          string            `json:"kind"`
-	Args          string            `json:"args"` // raw JSON string
-	State         string            `json:"state"`
-	Priority      int               `json:"priority"`
-	RunAtMs       millis            `json:"run_at_ms"`
-	CreatedAtMs   millis            `json:"created_at_ms"`
-	AttemptedAtMs millis            `json:"attempted_at_ms,omitempty"`
-	FinalizedAtMs millis            `json:"finalized_at_ms,omitempty"`
-	AttemptNum    int               `json:"attempt_num"`
-	MaxRetry      int               `json:"max_retry"`
-	TimeoutMs     int64             `json:"timeout_ms"`
-	UniqueKey     string            `json:"unique_key,omitempty"`
-	WorkerID      string            `json:"worker_id,omitempty"`
-	Tags          []string          `json:"tags"`
-	Errors        []redisAttemptErr `json:"errors"`
-	PipelineID    string            `json:"pipeline_id,omitempty"`
+	ID               string            `json:"id"`
+	Queue            string            `json:"queue"`
+	Kind             string            `json:"kind"`
+	Args             string            `json:"args"` // raw JSON string
+	State            string            `json:"state"`
+	Priority         int               `json:"priority"`
+	RunAtMs          millis            `json:"run_at_ms"`
+	CreatedAtMs      millis            `json:"created_at_ms"`
+	AttemptedAtMs    millis            `json:"attempted_at_ms,omitempty"`
+	LeaseExpiresAtMs millis            `json:"lease_expires_at_ms,omitempty"`
+	FinalizedAtMs    millis            `json:"finalized_at_ms,omitempty"`
+	AttemptNum       int               `json:"attempt_num"`
+	MaxRetry         int               `json:"max_retry"`
+	TimeoutMs        int64             `json:"timeout_ms"`
+	UniqueKey        string            `json:"unique_key,omitempty"`
+	WorkerID         string            `json:"worker_id,omitempty"`
+	Tags             []string          `json:"tags"`
+	Errors           []redisAttemptErr `json:"errors"`
+	PipelineID       string            `json:"pipeline_id,omitempty"`
 }
 
 // millis accepts the scientific notation emitted by Redis's embedded cjson
@@ -105,6 +107,10 @@ func jobToRow(j redisJob) *driver.JobRow {
 		t := time.UnixMilli(int64(j.AttemptedAtMs)).UTC()
 		row.AttemptedAt = &t
 	}
+	if j.LeaseExpiresAtMs != 0 {
+		t := time.UnixMilli(int64(j.LeaseExpiresAtMs)).UTC()
+		row.LeaseExpiresAt = &t
+	}
 	if j.FinalizedAtMs != 0 {
 		t := time.UnixMilli(int64(j.FinalizedAtMs)).UTC()
 		row.FinalizedAt = &t
@@ -128,8 +134,9 @@ func jobToRow(j redisJob) *driver.JobRow {
 // KEYS[4] = queue names set
 // KEYS[5] = queue metadata hash
 // KEYS[6] = notification channel
+// KEYS[7] = global created-at job index
 // ARGV[1] = has_unique, ARGV[2] = job JSON, ARGV[3] = job id
-// ARGV[4] = ready score, ARGV[5] = queue name, ARGV[6] = now_ms
+// ARGV[4] = ready score, ARGV[5] = queue name, ARGV[6] = now_ms, ARGV[7] = created_at_ms
 var insertJobScript = redis.NewScript(`
 if ARGV[1] == '1' and redis.call('EXISTS', KEYS[2]) == 1 then
     return 0
@@ -139,6 +146,7 @@ if ARGV[1] == '1' then
 end
 redis.call('SET', KEYS[1], ARGV[2])
 redis.call('ZADD', KEYS[3], ARGV[4], ARGV[3])
+redis.call('ZADD', KEYS[7], ARGV[7], ARGV[3])
 redis.call('SADD', KEYS[4], ARGV[5])
 redis.call('HSETNX', KEYS[5], 'paused', '0')
 redis.call('HSETNX', KEYS[5], 'created_at_ms', ARGV[6])
@@ -152,7 +160,7 @@ return 1
 // KEYS[3] = running hash
 // ARGV[1] = now_ms
 // ARGV[2] = worker_id
-// ARGV[3] = job key prefix
+// ARGV[3] = job key prefix, ARGV[4] = lease duration in milliseconds
 //
 // Returns: updated job JSON, or empty string when the queue is empty.
 var fetchOneScript = redis.NewScript(`
@@ -191,6 +199,12 @@ local ok, job = pcall(cjson.decode, raw)
 if not ok or type(job) ~= 'table' then return '' end
 job.state = 'running'
 job.attempted_at_ms = now_ms
+local lease_ms = tonumber(ARGV[4]) or 0
+if lease_ms > 0 then
+    job.lease_expires_at_ms = now_ms + lease_ms
+else
+    job.lease_expires_at_ms = nil
+end
 job.attempt_num = tonumber(job.attempt_num or 0) + 1
 job.worker_id = ARGV[2]
 if type(job.tags) == 'table' and next(job.tags) == nil then job.tags = cjson.empty_array end
@@ -198,13 +212,11 @@ if type(job.errors) == 'table' and next(job.errors) == nil then job.errors = cjs
 cjson.encode_number_precision(14)
 local updated = cjson.encode(job)
 redis.call('SET', prefix .. id, updated)
-redis.call('HSET', run_h, id, tostring(now_ms))
+redis.call('HSET', run_h, id, tostring(job.lease_expires_at_ms or now_ms))
 return updated
 `)
 
 var rescueOneScript = redis.NewScript(`
-local attempted = redis.call('HGET', KEYS[1], ARGV[1])
-if not attempted or tonumber(attempted) > tonumber(ARGV[2]) then return 0 end
 local raw = redis.call('GET', KEYS[3])
 if not raw then
     redis.call('HDEL', KEYS[1], ARGV[1])
@@ -215,8 +227,16 @@ if not ok or job.state ~= 'running' then
     redis.call('HDEL', KEYS[1], ARGV[1])
     return 0
 end
+local deadline = tonumber(job.lease_expires_at_ms)
+if deadline then
+    if deadline > tonumber(ARGV[2]) then return 0 end
+else
+    local attempted = redis.call('HGET', KEYS[1], ARGV[1])
+    if not attempted or tonumber(attempted) > tonumber(ARGV[3]) then return 0 end
+end
 job.state = 'available'
 job.attempted_at_ms = nil
+job.lease_expires_at_ms = nil
 job.worker_id = nil
 if type(job.tags) == 'table' and next(job.tags) == nil then job.tags = cjson.empty_array end
 if type(job.errors) == 'table' and next(job.errors) == nil then job.errors = cjson.empty_array end
@@ -235,7 +255,7 @@ local ok, job = pcall(cjson.decode, raw)
 if not ok or job.state ~= 'running' then return 0 end
 if tostring(job.worker_id or '') ~= ARGV[1] then return 0 end
 if tonumber(job.attempt_num or 0) ~= tonumber(ARGV[2]) then return 0 end
-job.attempted_at_ms = tonumber(ARGV[3])
+job.lease_expires_at_ms = tonumber(ARGV[3])
 if type(job.tags) == 'table' and next(job.tags) == nil then job.tags = cjson.empty_array end
 if type(job.errors) == 'table' and next(job.errors) == nil then job.errors = cjson.empty_array end
 cjson.encode_number_precision(14)
@@ -279,7 +299,7 @@ func (e *executor) JobRescueStuck(ctx context.Context, params driver.JobRescuePa
 	for _, id := range ids {
 		n, err := rescueOneScript.Run(ctx, e.rdb,
 			[]string{runKey(params.Queue), availKey(params.Queue), jobKey(id)},
-			id, params.Before.UnixMilli(),
+			id, params.At.UnixMilli(), params.Before.UnixMilli(),
 		).Int64()
 		if err != nil {
 			return rescued, err
@@ -293,9 +313,13 @@ func (e *executor) JobHeartbeat(ctx context.Context, params driver.JobHeartbeatP
 	if err != nil || job == nil {
 		return false, err
 	}
+	leaseExpiresAt := params.LeaseExpiresAt
+	if leaseExpiresAt.IsZero() {
+		leaseExpiresAt = params.At
+	}
 	renewed, err := heartbeatScript.Run(ctx, e.rdb,
 		[]string{jobKey(params.ID), runKey(job.Queue)},
-		params.WorkerID, params.Attempt, params.At.UTC().UnixMilli(), params.ID,
+		params.WorkerID, params.Attempt, leaseExpiresAt.UTC().UnixMilli(), params.ID,
 	).Int64()
 	return renewed == 1, err
 }
@@ -447,8 +471,8 @@ func jobInsertMany(ctx context.Context, rdb *redis.Client, clk clock.Clock, para
 			hasUnique = "1"
 		}
 		inserted, err := insertJobScript.Run(ctx, rdb,
-			[]string{jobKey(id), uniqKey(p.UniqueKey), readyKey, queuesSetKey, metaKey(p.Queue), notifyChannel(p.Queue)},
-			hasUnique, raw, id, readyScore, p.Queue, now.UnixMilli(),
+			[]string{jobKey(id), uniqKey(p.UniqueKey), readyKey, queuesSetKey, metaKey(p.Queue), notifyChannel(p.Queue), jobsIndexKey},
+			hasUnique, raw, id, readyScore, p.Queue, now.UnixMilli(), int64(job.CreatedAtMs),
 		).Int64()
 		if err != nil {
 			return nil, fmt.Errorf("insert job: %w", err)
@@ -488,32 +512,30 @@ func scanJobs(ctx context.Context, rdb *redis.Client, params driver.JobListParam
 			return nil, err
 		}
 	}
-	var cursor uint64
 	var rows []driver.JobRow
-	for {
-		keys, next, err := rdb.Scan(ctx, cursor, jobKeyPrefix+"*", 500).Result()
+	ids, err := rdb.ZRangeArgs(ctx, redis.ZRangeArgs{
+		Key: jobsIndexKey, Start: 0, Stop: -1, Rev: true,
+	}).Result()
+	if err != nil {
+		return nil, err
+	}
+	for _, id := range ids {
+		raw, err := rdb.Get(ctx, jobKey(id)).Bytes()
 		if err != nil {
-			return nil, err
-		}
-		for _, key := range keys {
-			raw, err := rdb.Get(ctx, key).Bytes()
-			if err != nil {
-				continue
+			if err == redis.Nil {
+				rdb.ZRem(ctx, jobsIndexKey, id) //nolint:errcheck
 			}
-			var job redisJob
-			if err := json.Unmarshal(raw, &job); err != nil {
-				return nil, fmt.Errorf("decode %s: %w", key, err)
-			}
-			row := jobToRow(job)
-			if params.Queue != "" && job.Queue != params.Queue || params.State != "" && driver.JobState(job.State) != params.State || params.Kind != "" && job.Kind != params.Kind || params.Cursor != "" && !driver.JobFollowsCursor(*row, cursorAt, cursorID) {
-				continue
-			}
-			rows = append(rows, *row)
+			continue
 		}
-		cursor = next
-		if cursor == 0 {
-			break
+		var job redisJob
+		if err := json.Unmarshal(raw, &job); err != nil {
+			return nil, fmt.Errorf("decode job %s: %w", id, err)
 		}
+		row := jobToRow(job)
+		if params.Queue != "" && job.Queue != params.Queue || params.State != "" && driver.JobState(job.State) != params.State || params.Kind != "" && job.Kind != params.Kind || params.Cursor != "" && !driver.JobFollowsCursor(*row, cursorAt, cursorID) {
+			continue
+		}
+		rows = append(rows, *row)
 	}
 	sort.Slice(rows, func(i, j int) bool {
 		if !rows[i].CreatedAt.Equal(rows[j].CreatedAt) {
@@ -564,7 +586,7 @@ func jobFetchBatch(ctx context.Context, rdb *redis.Client, clk clock.Clock, para
 	for range params.Limit {
 		rawJSON, err := fetchOneScript.Run(ctx, rdb,
 			[]string{availKey(params.Queue), schedKey(params.Queue), runKey(params.Queue)},
-			nowMs, params.WorkerID, jobKeyPrefix,
+			nowMs, params.WorkerID, jobKeyPrefix, params.LeaseDuration.Milliseconds(),
 		).Text()
 		if err != nil {
 			return rows, fmt.Errorf("claim job: %w", err)
@@ -608,6 +630,7 @@ func jobSetStateIfRunning(ctx context.Context, rdb *redis.Client, clk clock.Cloc
 				job.State = string(driver.JobStateAvailable)
 				job.AttemptNum--
 				job.AttemptedAtMs = 0
+				job.LeaseExpiresAtMs = 0
 				job.WorkerID = ""
 			} else {
 				if params.Err != nil {
@@ -632,6 +655,7 @@ func jobSetStateIfRunning(ctx context.Context, rdb *redis.Client, clk clock.Cloc
 					job.FinalizedAtMs = millis(now.UnixMilli())
 					job.WorkerID = ""
 				}
+				job.LeaseExpiresAtMs = 0
 			}
 
 			updated, err := json.Marshal(job)
@@ -717,6 +741,7 @@ func jobDelete(ctx context.Context, rdb *redis.Client, id string) error {
 	pipe.ZRem(ctx, availKey(job.Queue), id)
 	pipe.ZRem(ctx, schedKey(job.Queue), id)
 	pipe.HDel(ctx, runKey(job.Queue), id)
+	pipe.ZRem(ctx, jobsIndexKey, id)
 	if job.UniqueKey != "" {
 		pipe.Del(ctx, uniqKey(job.UniqueKey))
 	}

@@ -156,23 +156,27 @@ type JobInsertResult struct {
 
 // FetchParams controls how many and which jobs a worker claims.
 type FetchParams struct {
-	Queue    string
-	Limit    int
-	WorkerID string
+	Queue         string
+	Limit         int
+	WorkerID      string
+	LeaseDuration time.Duration
 }
 
-// JobRescueParams selects abandoned jobs claimed before Before.
+// JobRescueParams selects claims whose explicit lease expired by At. Before is
+// retained as a fallback cutoff for legacy rows without lease metadata.
 type JobRescueParams struct {
 	Queue  string
+	At     time.Time
 	Before time.Time
 }
 
 // JobHeartbeatParams renews one fenced running claim at At.
 type JobHeartbeatParams struct {
-	ID       string
-	WorkerID string
-	Attempt  int
-	At       time.Time
+	ID             string
+	WorkerID       string
+	Attempt        int
+	At             time.Time
+	LeaseExpiresAt time.Time
 }
 
 // JobSetStateParams transitions a running job to a new state.
@@ -281,16 +285,18 @@ type JobRow struct {
 	Priority    int
 	RunAt       time.Time
 	CreatedAt   time.Time
-	AttemptedAt *time.Time // claim time, refreshed by heartbeats while running
-	FinalizedAt *time.Time
-	AttemptNum  int
-	MaxRetry    int
-	Timeout     time.Duration
-	Tags        []string
-	Errors      []AttemptError
-	UniqueKey   string
-	WorkerID    string
-	PipelineID  string // groups jobs that must not run concurrently
+	AttemptedAt *time.Time // immutable start time of the current attempt
+	// LeaseExpiresAt is the renewable deadline after which the claim may be rescued.
+	LeaseExpiresAt *time.Time
+	FinalizedAt    *time.Time
+	AttemptNum     int
+	MaxRetry       int
+	Timeout        time.Duration
+	Tags           []string
+	Errors         []AttemptError
+	UniqueKey      string
+	WorkerID       string
+	PipelineID     string // groups jobs that must not run concurrently
 }
 
 // AttemptError records a single failed attempt.

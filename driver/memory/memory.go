@@ -242,6 +242,12 @@ func (e *executor) JobFetchBatch(_ context.Context, params driver.FetchParams) (
 		t := now
 		j.State = driver.JobStateRunning
 		j.AttemptedAt = &t
+		if params.LeaseDuration > 0 {
+			expiresAt := now.Add(params.LeaseDuration)
+			j.LeaseExpiresAt = &expiresAt
+		} else {
+			j.LeaseExpiresAt = nil
+		}
 		j.AttemptNum++
 		j.WorkerID = params.WorkerID
 		cp := *j
@@ -255,11 +261,17 @@ func (e *executor) JobRescueStuck(_ context.Context, params driver.JobRescuePara
 	defer e.d.mu.Unlock()
 	var rescued int64
 	for _, row := range e.d.jobs {
-		if row.Queue != params.Queue || row.State != driver.JobStateRunning || row.AttemptedAt == nil || row.AttemptedAt.After(params.Before) {
+		if row.Queue != params.Queue || row.State != driver.JobStateRunning {
+			continue
+		}
+		expiredLease := row.LeaseExpiresAt != nil && !params.At.IsZero() && !row.LeaseExpiresAt.After(params.At)
+		expiredLegacyClaim := row.LeaseExpiresAt == nil && row.AttemptedAt != nil && !row.AttemptedAt.After(params.Before)
+		if !expiredLease && !expiredLegacyClaim {
 			continue
 		}
 		row.State = driver.JobStateAvailable
 		row.AttemptedAt = nil
+		row.LeaseExpiresAt = nil
 		row.WorkerID = ""
 		rescued++
 	}
@@ -273,8 +285,11 @@ func (e *executor) JobHeartbeat(_ context.Context, params driver.JobHeartbeatPar
 	if !ok || row.State != driver.JobStateRunning || row.WorkerID != params.WorkerID || row.AttemptNum != params.Attempt {
 		return false, nil
 	}
-	at := params.At.UTC()
-	row.AttemptedAt = &at
+	expiresAt := params.LeaseExpiresAt.UTC()
+	if expiresAt.IsZero() {
+		expiresAt = params.At.UTC()
+	}
+	row.LeaseExpiresAt = &expiresAt
 	return true, nil
 }
 
@@ -289,11 +304,13 @@ func (e *executor) JobSetStateIfRunning(_ context.Context, params driver.JobSetS
 		row.State = driver.JobStateAvailable
 		row.AttemptNum--
 		row.AttemptedAt = nil
+		row.LeaseExpiresAt = nil
 		row.WorkerID = ""
 		return nil
 	}
 	row.State = params.State
 	row.WorkerID = ""
+	row.LeaseExpiresAt = nil
 	if params.Err != nil {
 		trace := ""
 		if params.Trace != nil {

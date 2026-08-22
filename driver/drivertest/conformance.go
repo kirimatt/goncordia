@@ -130,6 +130,9 @@ func Run(t *testing.T, exec driver.Executor) {
 	if claimed.WorkerID != "conformance-worker" || claimed.AttemptNum != 1 {
 		t.Fatalf("claim metadata: %+v", claimed)
 	}
+	if claimed.AttemptedAt == nil || claimed.LeaseExpiresAt == nil || !claimed.LeaseExpiresAt.After(*claimed.AttemptedAt) {
+		t.Fatalf("claim lease metadata: %+v", claimed)
+	}
 	firstClaim := claimed
 	rescuer, ok := exec.(driver.StuckJobRescuer)
 	if !ok {
@@ -137,7 +140,9 @@ func Run(t *testing.T, exec driver.Executor) {
 	}
 	rescueDeadline := time.Now().Add(5 * time.Second)
 	for {
-		rescued, rescueErr := rescuer.JobRescueStuck(ctx, driver.JobRescueParams{Queue: queue, Before: time.Now().UTC().Add(time.Hour)})
+		rescued, rescueErr := rescuer.JobRescueStuck(ctx, driver.JobRescueParams{
+			Queue: queue, At: claimed.LeaseExpiresAt.Add(time.Second), Before: time.Now().UTC().Add(time.Hour),
+		})
 		if rescueErr == nil && rescued >= 1 {
 			break
 		}
@@ -155,18 +160,33 @@ func Run(t *testing.T, exec driver.Executor) {
 	if !ok {
 		t.Fatal("executor does not implement driver.JobHeartbeater")
 	}
-	heartbeatAt := claimed.AttemptedAt.Add(time.Hour)
+	if claimed.AttemptedAt == nil || claimed.LeaseExpiresAt == nil {
+		t.Fatalf("reclaimed job lease metadata: %+v", claimed)
+	}
+	persistedClaim, err := exec.JobGetByID(ctx, id)
+	if err != nil || persistedClaim == nil || persistedClaim.AttemptedAt == nil || persistedClaim.LeaseExpiresAt == nil {
+		t.Fatalf("read persisted reclaimed lease: row=%+v err=%v", persistedClaim, err)
+	}
+	attemptedAt := *persistedClaim.AttemptedAt
+	heartbeatAt := attemptedAt.Add(time.Hour)
+	heartbeatExpiresAt := heartbeatAt.Add(time.Hour)
 	renewed, err := heartbeater.JobHeartbeat(ctx, driver.JobHeartbeatParams{
-		ID: id, WorkerID: claimed.WorkerID, Attempt: claimed.AttemptNum, At: heartbeatAt,
+		ID: id, WorkerID: claimed.WorkerID, Attempt: claimed.AttemptNum,
+		At: heartbeatAt, LeaseExpiresAt: heartbeatExpiresAt,
 	})
 	if err != nil || !renewed {
 		t.Fatalf("heartbeat: renewed=%v err=%v", renewed, err)
 	}
 	rescued, err := rescuer.JobRescueStuck(ctx, driver.JobRescueParams{
-		Queue: queue, Before: heartbeatAt.Add(-time.Second),
+		Queue: queue, At: heartbeatExpiresAt.Add(-time.Second), Before: heartbeatAt.Add(-time.Second),
 	})
 	if err != nil || rescued != 0 {
 		t.Fatalf("heartbeat did not protect running job: rescued=%d err=%v", rescued, err)
+	}
+	current, err := exec.JobGetByID(ctx, id)
+	if err != nil || current == nil || current.AttemptedAt == nil || !current.AttemptedAt.Equal(attemptedAt) ||
+		current.LeaseExpiresAt == nil || !current.LeaseExpiresAt.Equal(heartbeatExpiresAt) {
+		t.Fatalf("heartbeat mutated claim time or failed to extend lease: row=%+v err=%v", current, err)
 	}
 	if err := exec.JobSetStateIfRunning(ctx, driver.JobSetStateParams{
 		ID: id, State: driver.JobStateCompleted,
@@ -174,7 +194,7 @@ func Run(t *testing.T, exec driver.Executor) {
 	}); !errors.Is(err, driver.ErrStaleClaim) {
 		t.Fatalf("stale completion error=%v, want ErrStaleClaim", err)
 	}
-	current, err := exec.JobGetByID(ctx, id)
+	current, err = exec.JobGetByID(ctx, id)
 	if err != nil || current == nil || current.State != driver.JobStateRunning || current.AttemptNum != claimed.AttemptNum {
 		t.Fatalf("stale worker overwrote current claim: row=%+v err=%v", current, err)
 	}
@@ -316,7 +336,7 @@ func RunScheduled(t *testing.T, exec driver.Executor, clk *clock.Manual) {
 	}
 
 	rows, err := exec.JobFetchBatch(ctx, driver.FetchParams{
-		Queue: queue, Limit: 1, WorkerID: "scheduled-conformance-worker",
+		Queue: queue, Limit: 1, WorkerID: "scheduled-conformance-worker", LeaseDuration: time.Minute,
 	})
 	if err != nil {
 		t.Fatalf("fetch future job: %v", err)
@@ -347,7 +367,9 @@ func fetchEventually(t *testing.T, ctx context.Context, exec driver.Executor, qu
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
 	for {
-		rows, err := exec.JobFetchBatch(ctx, driver.FetchParams{Queue: queue, Limit: 1, WorkerID: "conformance-worker"})
+		rows, err := exec.JobFetchBatch(ctx, driver.FetchParams{
+			Queue: queue, Limit: 1, WorkerID: "conformance-worker", LeaseDuration: time.Minute,
+		})
 		if err != nil {
 			t.Fatalf("fetch: %v", err)
 		}

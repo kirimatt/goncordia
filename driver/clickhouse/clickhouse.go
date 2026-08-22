@@ -86,6 +86,7 @@ func (d *Driver) Migrate(ctx context.Context) error {
 			run_at       DateTime64(3, 'UTC'),
 			created_at   DateTime64(3, 'UTC'),
 			attempted_at Nullable(DateTime64(3, 'UTC')),
+			lease_expires_at Nullable(DateTime64(3, 'UTC')),
 			finalized_at Nullable(DateTime64(3, 'UTC')),
 			attempt_num  Int32,
 			max_retry    Int32,
@@ -125,6 +126,9 @@ func (d *Driver) Migrate(ctx context.Context) error {
 			version   Int64
 		) ENGINE = ReplacingMergeTree(version)
 		ORDER BY id`,
+
+		`ALTER TABLE goncordia_jobs
+		 ADD COLUMN IF NOT EXISTS lease_expires_at Nullable(DateTime64(3, 'UTC')) AFTER attempted_at`,
 	}
 	for _, stmt := range stmts {
 		if err := d.conn.Exec(ctx, stmt); err != nil {

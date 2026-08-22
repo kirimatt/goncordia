@@ -238,6 +238,13 @@ func (c *Client[TTx]) buildInsertParams(args core.JobArgs, opts *core.InsertOpts
 	if err != nil {
 		return driver.JobInsertParams{}, fmt.Errorf("marshal job args: %w", err)
 	}
+	payloadVersion := 1
+	if versioned, ok := args.(core.VersionedJobArgs); ok {
+		payloadVersion = versioned.PayloadVersion()
+		if payloadVersion <= 0 {
+			return driver.JobInsertParams{}, fmt.Errorf("payload version must be positive")
+		}
+	}
 
 	queue := c.config.DefaultQueue
 	var priority int
@@ -249,6 +256,12 @@ func (c *Client[TTx]) buildInsertParams(args core.JobArgs, opts *core.InsertOpts
 	var pipelineID string
 
 	if opts != nil {
+		if opts.PayloadVersion < 0 {
+			return driver.JobInsertParams{}, fmt.Errorf("payload version must not be negative")
+		}
+		if opts.PayloadVersion > 0 {
+			payloadVersion = opts.PayloadVersion
+		}
 		if opts.MaxRetry != nil && *opts.MaxRetry < 0 {
 			return driver.JobInsertParams{}, fmt.Errorf("max retry must not be negative")
 		}
@@ -290,6 +303,10 @@ func (c *Client[TTx]) buildInsertParams(args core.JobArgs, opts *core.InsertOpts
 				return driver.JobInsertParams{}, err
 			}
 		}
+	}
+	argsJSON, err = core.EncodePayload(argsJSON, payloadVersion)
+	if err != nil {
+		return driver.JobInsertParams{}, fmt.Errorf("encode job payload: %w", err)
 	}
 
 	return driver.JobInsertParams{

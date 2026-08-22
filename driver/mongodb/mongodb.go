@@ -103,6 +103,14 @@ func (d *Driver) Migrate(ctx context.Context) error {
 					"unique_key": bson.M{"$exists": true},
 				}),
 		},
+		{
+			Keys: bson.D{
+				{Key: "queue", Value: 1},
+				{Key: "state", Value: 1},
+				{Key: "lease_expires_at", Value: 1},
+			},
+			Options: options.Index().SetName("goncordia_jobs_running_lease"),
+		},
 	}
 	if _, err := jobs.Indexes().CreateMany(ctx, jobIndexes); err != nil {
 		return fmt.Errorf("create jobs indexes: %w", err)

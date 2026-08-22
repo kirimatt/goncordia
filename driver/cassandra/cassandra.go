@@ -31,6 +31,7 @@ package cassandradriver
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/gocql/gocql"
@@ -157,7 +158,34 @@ func (d *Driver) Migrate(ctx context.Context) error {
 			return fmt.Errorf("cassandra migrate: %w", err)
 		}
 	}
+	if err := d.ensureLeaseColumn(ctx); err != nil {
+		return err
+	}
 	return d.backfillScheduledLookup(ctx)
+}
+
+const leaseColumnMigration = "20260823_job_lease_column"
+
+func (d *Driver) ensureLeaseColumn(ctx context.Context) error {
+	var appliedAt time.Time
+	if err := d.session.Query(
+		`SELECT applied_at FROM goncordia_schema_migrations WHERE version=?`, leaseColumnMigration,
+	).WithContext(ctx).Scan(&appliedAt); err == nil {
+		return nil
+	} else if err != gocql.ErrNotFound {
+		return fmt.Errorf("cassandra migrate: check lease column: %w", err)
+	}
+	if err := d.session.Query(`ALTER TABLE goncordia_jobs ADD lease_expires_at timestamp`).WithContext(ctx).Exec(); err != nil &&
+		!strings.Contains(strings.ToLower(err.Error()), "already exists") {
+		return fmt.Errorf("cassandra migrate: add lease column: %w", err)
+	}
+	if err := d.session.Query(
+		`INSERT INTO goncordia_schema_migrations (version, applied_at) VALUES (?, ?)`,
+		leaseColumnMigration, d.clk.Now(),
+	).WithContext(ctx).Exec(); err != nil {
+		return fmt.Errorf("cassandra migrate: record lease column: %w", err)
+	}
+	return nil
 }
 
 const scheduledLookupMigration = "20260816_scheduled_lookup"

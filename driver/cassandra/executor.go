@@ -141,25 +141,26 @@ func (t *txExecutor) ScheduleCursorAdvance(ctx context.Context, params driver.Sc
 // ---- job row ----
 
 type cassandraJob struct {
-	ID          string
-	Queue       string
-	Kind        string
-	Args        []byte
-	State       string
-	Priority    int
-	RunAt       time.Time
-	CreatedAt   time.Time
-	AttemptedAt time.Time
-	FinalizedAt time.Time
-	AttemptNum  int
-	MaxRetry    int
-	TimeoutMs   int64
-	UniqueKey   string
-	WorkerID    string
-	Tags        []string
-	ErrorsJSON  string
-	Version     int64
-	PipelineID  string
+	ID             string
+	Queue          string
+	Kind           string
+	Args           []byte
+	State          string
+	Priority       int
+	RunAt          time.Time
+	CreatedAt      time.Time
+	AttemptedAt    time.Time
+	LeaseExpiresAt time.Time
+	FinalizedAt    time.Time
+	AttemptNum     int
+	MaxRetry       int
+	TimeoutMs      int64
+	UniqueKey      string
+	WorkerID       string
+	Tags           []string
+	ErrorsJSON     string
+	Version        int64
+	PipelineID     string
 }
 
 type storedError struct {
@@ -219,6 +220,10 @@ func jobToRow(j cassandraJob) *driver.JobRow {
 		t := j.AttemptedAt.UTC()
 		row.AttemptedAt = &t
 	}
+	if !j.LeaseExpiresAt.IsZero() {
+		t := j.LeaseExpiresAt.UTC()
+		row.LeaseExpiresAt = &t
+	}
 	if !j.FinalizedAt.IsZero() {
 		t := j.FinalizedAt.UTC()
 		row.FinalizedAt = &t
@@ -229,12 +234,12 @@ func jobToRow(j cassandraJob) *driver.JobRow {
 func selectJob(ctx context.Context, session *gocql.Session, id string) (cassandraJob, error) {
 	var j cassandraJob
 	err := session.Query(`SELECT id,queue,kind,args,state,priority,run_at,created_at,
-		attempted_at,finalized_at,attempt_num,max_retry,timeout_ms,
+		attempted_at,lease_expires_at,finalized_at,attempt_num,max_retry,timeout_ms,
 		unique_key,worker_id,tags,errors_json,version,pipeline_id
 		FROM goncordia_jobs WHERE id = ?`, id).
 		WithContext(ctx).
 		Scan(&j.ID, &j.Queue, &j.Kind, &j.Args, &j.State, &j.Priority,
-			&j.RunAt, &j.CreatedAt, &j.AttemptedAt, &j.FinalizedAt,
+			&j.RunAt, &j.CreatedAt, &j.AttemptedAt, &j.LeaseExpiresAt, &j.FinalizedAt,
 			&j.AttemptNum, &j.MaxRetry, &j.TimeoutMs,
 			&j.UniqueKey, &j.WorkerID, &j.Tags, &j.ErrorsJSON, &j.Version, &j.PipelineID)
 	return j, err
@@ -251,13 +256,13 @@ func jobList(ctx context.Context, session *gocql.Session, params driver.JobListP
 		}
 	}
 	iter := session.Query(`SELECT id,queue,kind,args,state,priority,run_at,created_at,
-		attempted_at,finalized_at,attempt_num,max_retry,timeout_ms,
+		attempted_at,lease_expires_at,finalized_at,attempt_num,max_retry,timeout_ms,
 		unique_key,worker_id,tags,errors_json,version,pipeline_id FROM goncordia_jobs`).WithContext(ctx).Iter()
 	var rows []driver.JobRow
 	for {
 		var j cassandraJob
 		if !iter.Scan(&j.ID, &j.Queue, &j.Kind, &j.Args, &j.State, &j.Priority,
-			&j.RunAt, &j.CreatedAt, &j.AttemptedAt, &j.FinalizedAt,
+			&j.RunAt, &j.CreatedAt, &j.AttemptedAt, &j.LeaseExpiresAt, &j.FinalizedAt,
 			&j.AttemptNum, &j.MaxRetry, &j.TimeoutMs,
 			&j.UniqueKey, &j.WorkerID, &j.Tags, &j.ErrorsJSON, &j.Version, &j.PipelineID) {
 			break
@@ -426,6 +431,10 @@ func jobFetchBatch(ctx context.Context, session *gocql.Session, clk clock.Clock,
 	}
 
 	now := clk.Now()
+	var leaseExpiresAt time.Time
+	if params.LeaseDuration > 0 {
+		leaseExpiresAt = now.Add(params.LeaseDuration)
+	}
 
 	// Query the avail lookup table for candidate jobs.
 	iter := session.Query(
@@ -485,9 +494,9 @@ func jobFetchBatch(ctx context.Context, session *gocql.Session, clk clock.Clock,
 		// Atomically claim with LWT.
 		newVersion := j.Version + 1
 		applied, lwtErr := session.Query(
-			`UPDATE goncordia_jobs SET state=?, worker_id=?, attempted_at=?, attempt_num=?, version=?
+			`UPDATE goncordia_jobs SET state=?, worker_id=?, attempted_at=?, lease_expires_at=?, attempt_num=?, version=?
 			 WHERE id=? IF state IN (?,?) AND version=?`,
-			string(driver.JobStateRunning), params.WorkerID, now, j.AttemptNum+1, newVersion,
+			string(driver.JobStateRunning), params.WorkerID, now, leaseExpiresAt, j.AttemptNum+1, newVersion,
 			c.id, string(driver.JobStateAvailable), string(driver.JobStateScheduled), j.Version,
 		).WithContext(ctx).MapScanCAS(map[string]interface{}{})
 		if lwtErr != nil {
@@ -498,7 +507,7 @@ func jobFetchBatch(ctx context.Context, session *gocql.Session, clk clock.Clock,
 		}
 		if err := session.Query(
 			`INSERT INTO goncordia_jobs_running (queue, attempted_at, id) VALUES (?, ?, ?)`,
-			params.Queue, now, c.id,
+			params.Queue, runningLookupAt(now, leaseExpiresAt), c.id,
 		).WithContext(ctx).Exec(); err != nil {
 			return nil, fmt.Errorf("track running job: %w", err)
 		}
@@ -510,6 +519,7 @@ func jobFetchBatch(ctx context.Context, session *gocql.Session, clk clock.Clock,
 		j.State = string(driver.JobStateRunning)
 		j.WorkerID = params.WorkerID
 		j.AttemptedAt = now
+		j.LeaseExpiresAt = leaseExpiresAt
 		j.AttemptNum++
 		j.Version = newVersion
 		claimed = append(claimed, *jobToRow(j))
@@ -518,9 +528,13 @@ func jobFetchBatch(ctx context.Context, session *gocql.Session, clk clock.Clock,
 }
 
 func jobRescueStuck(ctx context.Context, session *gocql.Session, params driver.JobRescueParams) (int64, error) {
+	lookupBefore := params.At
+	if params.Before.After(lookupBefore) {
+		lookupBefore = params.Before
+	}
 	iter := session.Query(
 		`SELECT attempted_at, id FROM goncordia_jobs_running WHERE queue=? AND attempted_at<=?`,
-		params.Queue, params.Before,
+		params.Queue, lookupBefore,
 	).WithContext(ctx).Iter()
 	type candidate struct {
 		attemptedAt time.Time
@@ -545,9 +559,14 @@ func jobRescueStuck(ctx context.Context, session *gocql.Session, params driver.J
 		if err != nil {
 			return rescued, err
 		}
+		expired := !job.LeaseExpiresAt.IsZero() && !job.LeaseExpiresAt.After(params.At)
+		legacyExpired := job.LeaseExpiresAt.IsZero() && !job.AttemptedAt.IsZero() && !job.AttemptedAt.After(params.Before)
+		if !expired && !legacyExpired {
+			continue
+		}
 		applied, err := session.Query(
-			`UPDATE goncordia_jobs SET state=?, worker_id='', attempted_at=?, version=version+1 WHERE id=? IF state=? AND attempted_at=?`,
-			string(driver.JobStateAvailable), time.Time{}, candidate.id, string(driver.JobStateRunning), candidate.attemptedAt,
+			`UPDATE goncordia_jobs SET state=?, worker_id='', attempted_at=?, lease_expires_at=?, version=version+1 WHERE id=? IF state=? AND version=?`,
+			string(driver.JobStateAvailable), time.Time{}, time.Time{}, candidate.id, string(driver.JobStateRunning), job.Version,
 		).WithContext(ctx).MapScanCAS(map[string]interface{}{})
 		if err != nil {
 			return rescued, err
@@ -576,28 +595,32 @@ func jobHeartbeat(ctx context.Context, session *gocql.Session, params driver.Job
 	if job.State != string(driver.JobStateRunning) || job.WorkerID != params.WorkerID || job.AttemptNum != params.Attempt {
 		return false, nil
 	}
-	at := params.At.UTC()
+	leaseExpiresAt := params.LeaseExpiresAt
+	if leaseExpiresAt.IsZero() {
+		leaseExpiresAt = params.At
+	}
+	leaseExpiresAt = leaseExpiresAt.UTC()
 	if err := session.Query(
 		`INSERT INTO goncordia_jobs_running (queue, attempted_at, id) VALUES (?, ?, ?)`,
-		job.Queue, at, job.ID,
+		job.Queue, leaseExpiresAt, job.ID,
 	).WithContext(ctx).Exec(); err != nil {
 		return false, err
 	}
 	applied, err := session.Query(
-		`UPDATE goncordia_jobs SET attempted_at=?, version=version+1 WHERE id=?
+		`UPDATE goncordia_jobs SET lease_expires_at=?, version=version+1 WHERE id=?
 		 IF state=? AND worker_id=? AND attempt_num=? AND version=?`,
-		at, job.ID, string(driver.JobStateRunning), params.WorkerID, params.Attempt, job.Version,
+		leaseExpiresAt, job.ID, string(driver.JobStateRunning), params.WorkerID, params.Attempt, job.Version,
 	).WithContext(ctx).MapScanCAS(map[string]interface{}{})
 	if err != nil || !applied {
 		_ = session.Query(
 			`DELETE FROM goncordia_jobs_running WHERE queue=? AND attempted_at=? AND id=?`,
-			job.Queue, at, job.ID,
+			job.Queue, leaseExpiresAt, job.ID,
 		).WithContext(ctx).Exec()
 		return false, err
 	}
 	if err := session.Query(
 		`DELETE FROM goncordia_jobs_running WHERE queue=? AND attempted_at=? AND id=?`,
-		job.Queue, job.AttemptedAt, job.ID,
+		job.Queue, runningLookupAt(job.AttemptedAt, job.LeaseExpiresAt), job.ID,
 	).WithContext(ctx).Exec(); err != nil {
 		return false, err
 	}
@@ -620,9 +643,9 @@ func jobSetStateIfRunning(ctx context.Context, session *gocql.Session, clk clock
 
 	if params.Yield {
 		applied, err := session.Query(
-			`UPDATE goncordia_jobs SET state=?, worker_id='', attempted_at=?, attempt_num=attempt_num-1, version=version+1
+			`UPDATE goncordia_jobs SET state=?, worker_id='', attempted_at=?, lease_expires_at=?, attempt_num=attempt_num-1, version=version+1
 			 WHERE id=? IF state=? AND version=?`,
-			string(driver.JobStateAvailable), time.Time{}, params.ID, string(driver.JobStateRunning), j.Version,
+			string(driver.JobStateAvailable), time.Time{}, time.Time{}, params.ID, string(driver.JobStateRunning), j.Version,
 		).WithContext(ctx).MapScanCAS(map[string]interface{}{})
 		if err != nil {
 			return err
@@ -660,9 +683,9 @@ func jobSetStateIfRunning(ctx context.Context, session *gocql.Session, clk clock
 			retryAt = now
 		}
 		applied, err := session.Query(
-			`UPDATE goncordia_jobs SET state=?, run_at=?, worker_id='', errors_json=?, version=version+1
+			`UPDATE goncordia_jobs SET state=?, run_at=?, worker_id='', lease_expires_at=?, errors_json=?, version=version+1
 			 WHERE id=? IF state=? AND version=?`,
-			string(driver.JobStateAvailable), retryAt, errJSON, params.ID, string(driver.JobStateRunning), j.Version,
+			string(driver.JobStateAvailable), retryAt, time.Time{}, errJSON, params.ID, string(driver.JobStateRunning), j.Version,
 		).WithContext(ctx).MapScanCAS(map[string]interface{}{})
 		if err != nil {
 			return err
@@ -682,9 +705,9 @@ func jobSetStateIfRunning(ctx context.Context, session *gocql.Session, clk clock
 
 	// Terminal state.
 	applied, stateErr := session.Query(
-		`UPDATE goncordia_jobs SET state=?, finalized_at=?, worker_id='', errors_json=?, version=version+1
+		`UPDATE goncordia_jobs SET state=?, finalized_at=?, worker_id='', lease_expires_at=?, errors_json=?, version=version+1
 		 WHERE id=? IF state=? AND version=?`,
-		string(params.State), now, errJSON, params.ID, string(driver.JobStateRunning), j.Version,
+		string(params.State), now, time.Time{}, errJSON, params.ID, string(driver.JobStateRunning), j.Version,
 	).WithContext(ctx).MapScanCAS(map[string]interface{}{})
 	if stateErr != nil {
 		return stateErr
@@ -705,8 +728,15 @@ func jobSetStateIfRunning(ctx context.Context, session *gocql.Session, clk clock
 func deleteRunningLookup(ctx context.Context, session *gocql.Session, job cassandraJob) error {
 	return session.Query(
 		`DELETE FROM goncordia_jobs_running WHERE queue=? AND attempted_at=? AND id=?`,
-		job.Queue, job.AttemptedAt, job.ID,
+		job.Queue, runningLookupAt(job.AttemptedAt, job.LeaseExpiresAt), job.ID,
 	).WithContext(ctx).Exec()
+}
+
+func runningLookupAt(attemptedAt, leaseExpiresAt time.Time) time.Time {
+	if !leaseExpiresAt.IsZero() {
+		return leaseExpiresAt
+	}
+	return attemptedAt
 }
 
 // ---- JobCancel ----

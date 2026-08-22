@@ -17,24 +17,25 @@ import (
 // ---- BSON document types ----
 
 type jobDoc struct {
-	ID          primitive.ObjectID `bson:"_id,omitempty"`
-	Queue       string             `bson:"queue"`
-	Kind        string             `bson:"kind"`
-	Args        string             `bson:"args"` // JSON string
-	State       string             `bson:"state"`
-	Priority    int                `bson:"priority"`
-	RunAt       time.Time          `bson:"run_at"`
-	CreatedAt   time.Time          `bson:"created_at"`
-	AttemptedAt *time.Time         `bson:"attempted_at,omitempty"`
-	FinalizedAt *time.Time         `bson:"finalized_at,omitempty"`
-	AttemptNum  int                `bson:"attempt_num"`
-	MaxRetry    int                `bson:"max_retry"`
-	TimeoutMs   int64              `bson:"timeout_ms"`
-	UniqueKey   string             `bson:"unique_key,omitempty"`
-	WorkerID    string             `bson:"worker_id,omitempty"`
-	Tags        []string           `bson:"tags"`
-	Errors      []attemptError     `bson:"errors"`
-	PipelineID  string             `bson:"pipeline_id,omitempty"`
+	ID             primitive.ObjectID `bson:"_id,omitempty"`
+	Queue          string             `bson:"queue"`
+	Kind           string             `bson:"kind"`
+	Args           string             `bson:"args"` // JSON string
+	State          string             `bson:"state"`
+	Priority       int                `bson:"priority"`
+	RunAt          time.Time          `bson:"run_at"`
+	CreatedAt      time.Time          `bson:"created_at"`
+	AttemptedAt    *time.Time         `bson:"attempted_at,omitempty"`
+	LeaseExpiresAt *time.Time         `bson:"lease_expires_at,omitempty"`
+	FinalizedAt    *time.Time         `bson:"finalized_at,omitempty"`
+	AttemptNum     int                `bson:"attempt_num"`
+	MaxRetry       int                `bson:"max_retry"`
+	TimeoutMs      int64              `bson:"timeout_ms"`
+	UniqueKey      string             `bson:"unique_key,omitempty"`
+	WorkerID       string             `bson:"worker_id,omitempty"`
+	Tags           []string           `bson:"tags"`
+	Errors         []attemptError     `bson:"errors"`
+	PipelineID     string             `bson:"pipeline_id,omitempty"`
 }
 
 type attemptError struct {
@@ -382,13 +383,20 @@ func jobFetchBatch(ctx context.Context, db *mongo.Database, clk clock.Clock, par
 		"state":  bson.M{"$in": bson.A{string(driver.JobStateAvailable), string(driver.JobStateScheduled)}},
 		"run_at": bson.M{"$lte": now},
 	}
+	set := bson.M{
+		"state":        string(driver.JobStateRunning),
+		"attempted_at": now,
+		"worker_id":    params.WorkerID,
+	}
+	if params.LeaseDuration > 0 {
+		set["lease_expires_at"] = now.Add(params.LeaseDuration)
+	}
 	update := bson.M{
-		"$set": bson.M{
-			"state":        string(driver.JobStateRunning),
-			"attempted_at": now,
-			"worker_id":    params.WorkerID,
-		},
+		"$set": set,
 		"$inc": bson.M{"attempt_num": 1},
+	}
+	if params.LeaseDuration <= 0 {
+		update["$unset"] = bson.M{"lease_expires_at": ""}
 	}
 	findOpts := options.FindOneAndUpdate().
 		SetSort(bson.D{{Key: "priority", Value: -1}, {Key: "run_at", Value: 1}, {Key: "created_at", Value: 1}, {Key: "_id", Value: 1}}).
@@ -411,13 +419,16 @@ func jobFetchBatch(ctx context.Context, db *mongo.Database, clk clock.Clock, par
 func jobRescueStuck(ctx context.Context, db *mongo.Database, params driver.JobRescueParams) (int64, error) {
 	result, err := db.Collection(jobsCollection).UpdateMany(ctx,
 		bson.M{
-			"queue":        params.Queue,
-			"state":        string(driver.JobStateRunning),
-			"attempted_at": bson.M{"$lte": params.Before},
+			"queue": params.Queue,
+			"state": string(driver.JobStateRunning),
+			"$or": bson.A{
+				bson.M{"lease_expires_at": bson.M{"$lte": params.At}},
+				bson.M{"lease_expires_at": nil, "attempted_at": bson.M{"$lte": params.Before}},
+			},
 		},
 		bson.M{
 			"$set":   bson.M{"state": string(driver.JobStateAvailable), "attempted_at": nil},
-			"$unset": bson.M{"worker_id": ""},
+			"$unset": bson.M{"worker_id": "", "lease_expires_at": ""},
 		},
 	)
 	if err != nil {
@@ -431,10 +442,14 @@ func jobHeartbeat(ctx context.Context, db *mongo.Database, params driver.JobHear
 	if err != nil {
 		return false, fmt.Errorf("invalid job id %q: %w", params.ID, err)
 	}
+	leaseExpiresAt := params.LeaseExpiresAt
+	if leaseExpiresAt.IsZero() {
+		leaseExpiresAt = params.At
+	}
 	result, err := db.Collection(jobsCollection).UpdateOne(ctx, bson.M{
 		"_id": oid, "state": string(driver.JobStateRunning),
 		"worker_id": params.WorkerID, "attempt_num": params.Attempt,
-	}, bson.M{"$set": bson.M{"attempted_at": params.At.UTC()}})
+	}, bson.M{"$set": bson.M{"lease_expires_at": leaseExpiresAt.UTC()}})
 	if err != nil {
 		return false, err
 	}
@@ -460,7 +475,7 @@ func jobSetStateIfRunning(ctx context.Context, db *mongo.Database, clk clock.Clo
 			bson.M{
 				"$set":   bson.M{"state": string(driver.JobStateAvailable), "attempted_at": nil},
 				"$inc":   bson.M{"attempt_num": -1},
-				"$unset": bson.M{"worker_id": ""},
+				"$unset": bson.M{"worker_id": "", "lease_expires_at": ""},
 			},
 		)
 		if updateErr == nil && result.ModifiedCount == 0 {
@@ -471,7 +486,7 @@ func jobSetStateIfRunning(ctx context.Context, db *mongo.Database, clk clock.Clo
 
 	now := clk.Now()
 	set := bson.M{"state": string(params.State)}
-	unset := bson.M{"worker_id": ""}
+	unset := bson.M{"worker_id": "", "lease_expires_at": ""}
 	push := bson.M{}
 
 	switch params.State {
@@ -758,23 +773,24 @@ func docToRow(doc jobDoc) *driver.JobRow {
 	}
 
 	return &driver.JobRow{
-		ID:          doc.ID.Hex(),
-		Queue:       doc.Queue,
-		Kind:        doc.Kind,
-		Args:        args,
-		State:       state,
-		Priority:    doc.Priority,
-		RunAt:       doc.RunAt,
-		CreatedAt:   doc.CreatedAt,
-		AttemptedAt: doc.AttemptedAt,
-		FinalizedAt: doc.FinalizedAt,
-		AttemptNum:  doc.AttemptNum,
-		MaxRetry:    doc.MaxRetry,
-		Timeout:     timeout,
-		UniqueKey:   doc.UniqueKey,
-		WorkerID:    doc.WorkerID,
-		Tags:        tags,
-		Errors:      errs,
-		PipelineID:  doc.PipelineID,
+		ID:             doc.ID.Hex(),
+		Queue:          doc.Queue,
+		Kind:           doc.Kind,
+		Args:           args,
+		State:          state,
+		Priority:       doc.Priority,
+		RunAt:          doc.RunAt,
+		CreatedAt:      doc.CreatedAt,
+		AttemptedAt:    doc.AttemptedAt,
+		LeaseExpiresAt: doc.LeaseExpiresAt,
+		FinalizedAt:    doc.FinalizedAt,
+		AttemptNum:     doc.AttemptNum,
+		MaxRetry:       doc.MaxRetry,
+		Timeout:        timeout,
+		UniqueKey:      doc.UniqueKey,
+		WorkerID:       doc.WorkerID,
+		Tags:           tags,
+		Errors:         errs,
+		PipelineID:     doc.PipelineID,
 	}
 }

@@ -177,7 +177,7 @@ type querier interface {
 // --- static SQL ---
 
 const selectJobCols = `id, queue, kind, args, state, priority, run_at, created_at,
-    attempted_at, finalized_at, attempt_num, max_retry, timeout_ms,
+    attempted_at, lease_expires_at, finalized_at, attempt_num, max_retry, timeout_ms,
     unique_key, worker_id, tags, errors, pipeline_id`
 
 const insertJobCols = `queue, kind, args, state, priority, run_at, created_at,
@@ -186,7 +186,7 @@ const insertJobCols = `queue, kind, args, state, priority, run_at, created_at,
 const insertJobVals = `?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?`
 
 const sqlYield = `UPDATE goncordia_jobs
-SET state = 'available', attempted_at = NULL, worker_id = NULL, attempt_num = attempt_num - 1
+SET state = 'available', attempted_at = NULL, lease_expires_at = NULL, worker_id = NULL, attempt_num = attempt_num - 1
 WHERE id = ? AND state = 'running'
   AND (? = '' OR worker_id = ?)
   AND (? = 0 OR attempt_num = ?)`
@@ -195,6 +195,7 @@ WHERE id = ? AND state = 'running'
 const sqlSetStatePostgres = `UPDATE goncordia_jobs
 SET state        = $2,
     worker_id    = NULL,
+    lease_expires_at = NULL,
     finalized_at = COALESCE($3, finalized_at),
     run_at       = COALESCE($4, run_at),
     unique_key   = CASE WHEN $8 AND unique_key NOT LIKE 'uf2_%' THEN NULL ELSE unique_key END,
@@ -207,6 +208,7 @@ WHERE id = $1 AND state = 'running'
 const sqlSetStateMain = `UPDATE goncordia_jobs
 SET state        = ?,
     worker_id    = NULL,
+    lease_expires_at = NULL,
     finalized_at = COALESCE(?, finalized_at),
     run_at       = COALESCE(?, run_at),
     unique_key   = CASE WHEN ? AND unique_key NOT LIKE 'uf2_%' THEN NULL ELSE unique_key END
@@ -454,9 +456,11 @@ func jobFetchBatch(ctx context.Context, q querier, d Dialect, clk clock.Clock, p
 
 func jobRescueStuck(ctx context.Context, q querier, d Dialect, params driver.JobRescueParams) (int64, error) {
 	query := `UPDATE goncordia_jobs
-SET state = 'available', attempted_at = NULL, worker_id = NULL
-WHERE queue = ? AND state = 'running' AND attempted_at <= ?`
-	result, err := q.ExecContext(ctx, d.q(query), params.Queue, params.Before)
+SET state = 'available', attempted_at = NULL, lease_expires_at = NULL, worker_id = NULL
+WHERE queue = ? AND state = 'running'
+  AND ((lease_expires_at IS NOT NULL AND lease_expires_at <= ?)
+       OR (lease_expires_at IS NULL AND attempted_at <= ?))`
+	result, err := q.ExecContext(ctx, d.q(query), params.Queue, params.At, params.Before)
 	if err != nil {
 		return 0, fmt.Errorf("rescue stuck jobs: %w", err)
 	}
@@ -464,9 +468,13 @@ WHERE queue = ? AND state = 'running' AND attempted_at <= ?`
 }
 
 func jobHeartbeat(ctx context.Context, q querier, d Dialect, params driver.JobHeartbeatParams) (bool, error) {
-	result, err := q.ExecContext(ctx, d.q(`UPDATE goncordia_jobs SET attempted_at = ?
+	leaseExpiresAt := params.LeaseExpiresAt
+	if leaseExpiresAt.IsZero() {
+		leaseExpiresAt = params.At
+	}
+	result, err := q.ExecContext(ctx, d.q(`UPDATE goncordia_jobs SET lease_expires_at = ?
 WHERE id = ? AND state = 'running' AND worker_id = ? AND attempt_num = ?`),
-		params.At.UTC(), params.ID, params.WorkerID, params.Attempt)
+		leaseExpiresAt.UTC(), params.ID, params.WorkerID, params.Attempt)
 	if err != nil {
 		return false, err
 	}
@@ -493,7 +501,7 @@ FOR UPDATE SKIP LOCKED`)
 	if len(ids) == 0 {
 		return nil, nil
 	}
-	return claimJobs(ctx, q, d, now, ids, params.WorkerID)
+	return claimJobs(ctx, q, d, now, ids, params.WorkerID, params.LeaseDuration)
 }
 
 func jobFetchSQLite(ctx context.Context, q querier, d Dialect, now time.Time, params driver.FetchParams) ([]driver.JobRow, error) {
@@ -515,7 +523,7 @@ LIMIT ?`,
 	if len(ids) == 0 {
 		return nil, nil
 	}
-	return claimJobs(ctx, q, d, now, ids, params.WorkerID)
+	return claimJobs(ctx, q, d, now, ids, params.WorkerID, params.LeaseDuration)
 }
 
 func scanIDs(rows *sql.Rows) ([]int64, error) {
@@ -531,17 +539,22 @@ func scanIDs(rows *sql.Rows) ([]int64, error) {
 	return ids, rows.Err()
 }
 
-func claimJobs(ctx context.Context, q querier, d Dialect, now time.Time, ids []int64, workerID string) ([]driver.JobRow, error) {
+func claimJobs(ctx context.Context, q querier, d Dialect, now time.Time, ids []int64, workerID string, leaseDuration time.Duration) ([]driver.JobRow, error) {
 	inList := repeatIN(len(ids))
+	var leaseExpiresAt *time.Time
+	if leaseDuration > 0 {
+		expires := now.Add(leaseDuration)
+		leaseExpiresAt = &expires
+	}
 
-	updateArgs := make([]any, 0, 3+len(ids))
-	updateArgs = append(updateArgs, "running", now, workerID)
+	updateArgs := make([]any, 0, 4+len(ids))
+	updateArgs = append(updateArgs, "running", now, leaseExpiresAt, workerID)
 	for _, id := range ids {
 		updateArgs = append(updateArgs, id)
 	}
 	if _, err := q.ExecContext(ctx,
 		d.q(`UPDATE goncordia_jobs
-SET state = ?, attempted_at = ?, attempt_num = attempt_num + 1, worker_id = ?
+SET state = ?, attempted_at = ?, lease_expires_at = ?, attempt_num = attempt_num + 1, worker_id = ?
 WHERE id IN (`+inList+`)`),
 		updateArgs...,
 	); err != nil {
@@ -809,7 +822,7 @@ func scanJobRow(d Dialect, s rowScanner) (*driver.JobRow, error) {
 	)
 	err := s.Scan(
 		&idStr, &r.Queue, &r.Kind, &r.Args, &state, &r.Priority, &r.RunAt,
-		&r.CreatedAt, &r.AttemptedAt, &r.FinalizedAt, &r.AttemptNum,
+		&r.CreatedAt, &r.AttemptedAt, &r.LeaseExpiresAt, &r.FinalizedAt, &r.AttemptNum,
 		&r.MaxRetry, &timeoutMS, &uniqueKey, &workerID, &tagsRaw, &errorsRaw, &r.PipelineID,
 	)
 	if err != nil {
