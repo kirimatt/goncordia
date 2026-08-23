@@ -86,6 +86,7 @@ func (d *Driver) Migrate(ctx context.Context) error {
 			run_at       DateTime64(3, 'UTC'),
 			created_at   DateTime64(3, 'UTC'),
 			attempted_at Nullable(DateTime64(3, 'UTC')),
+			started_at   Nullable(DateTime64(3, 'UTC')),
 			lease_expires_at Nullable(DateTime64(3, 'UTC')),
 			finalized_at Nullable(DateTime64(3, 'UTC')),
 			attempt_num  Int32,
@@ -129,6 +130,8 @@ func (d *Driver) Migrate(ctx context.Context) error {
 
 		`ALTER TABLE goncordia_jobs
 		 ADD COLUMN IF NOT EXISTS lease_expires_at Nullable(DateTime64(3, 'UTC')) AFTER attempted_at`,
+		`ALTER TABLE goncordia_jobs
+		 ADD COLUMN IF NOT EXISTS started_at Nullable(DateTime64(3, 'UTC')) AFTER attempted_at`,
 	}
 	for _, stmt := range stmts {
 		if err := d.conn.Exec(ctx, stmt); err != nil {
@@ -142,12 +145,17 @@ func (d *Driver) Name() string { return "clickhouse" }
 
 func (d *Driver) Capabilities() gdriver.Capabilities {
 	return gdriver.Capabilities{
-		NativeTx:      false,
-		ListenNotify:  false,
-		ChangeStreams: false,
-		SkipLocked:    false,
-		UniqueJobs:    true, // soft deduplication via ReplacingMergeTree
-		AdvisoryLocks: false,
+		NativeTx:            false,
+		ListenNotify:        false,
+		ChangeStreams:       false,
+		SkipLocked:          false,
+		UniqueJobs:          true, // soft deduplication via ReplacingMergeTree
+		AdvisoryLocks:       false,
+		LinearizableLeases:  false,
+		LinearizableCAS:     false,
+		LifecycleTimestamps: false,
+		BoundedFetch:        true,
+		StrictFetchOrdering: true,
 	}
 }
 

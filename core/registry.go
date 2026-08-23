@@ -50,7 +50,9 @@ func EncodePayload(payload json.RawMessage, version int) (json.RawMessage, error
 	}{Version: version, Payload: payload})
 }
 
-func decodePayload(payload json.RawMessage) (int, json.RawMessage, error) {
+// DecodePayload unwraps the persisted payload envelope. Legacy version-1
+// payloads are returned unchanged.
+func DecodePayload(payload json.RawMessage) (int, json.RawMessage, error) {
 	var envelope payloadEnvelope
 	if err := json.Unmarshal(payload, &envelope); err != nil {
 		return 0, nil, err
@@ -83,7 +85,7 @@ func RegisterWorker[T JobArgs](r *Registry, w Worker[T], opts WorkerOpts) {
 	r.workers[kind] = workerEntry{
 		opts: opts,
 		process: func(ctx context.Context, rawJob *RawJob) error {
-			version, payload, err := decodePayload(rawJob.Args)
+			version, payload, err := DecodePayload(rawJob.Args)
 			if err != nil {
 				return Discard(fmt.Errorf("decode job payload for kind %q: %w", kind, err))
 			}

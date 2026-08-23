@@ -2,6 +2,7 @@ package gontest_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"sync/atomic"
 	"testing"
@@ -9,6 +10,7 @@ import (
 
 	goncordia "github.com/kirimatt/goncordia"
 	"github.com/kirimatt/goncordia/core"
+	"github.com/kirimatt/goncordia/driver"
 	"github.com/kirimatt/goncordia/gontest"
 )
 
@@ -76,6 +78,46 @@ func TestJobs_returnsTypedArgs(t *testing.T) {
 	}
 	if jobs[0].Args.Subject != "Hi" {
 		t.Errorf("unexpected subject: %s", jobs[0].Args.Subject)
+	}
+}
+
+func TestJobsE_reportsCorruptPayload(t *testing.T) {
+	ctx := context.Background()
+	_, tracker := gontest.NewClient(t)
+	_, err := tracker.Driver().Executor().JobInsertMany(ctx, []driver.JobInsertParams{{
+		Queue: "default", Kind: "email", Args: []byte(`{"to":`),
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := gontest.JobsE[EmailJob](tracker); err == nil {
+		t.Fatal("JobsE accepted corrupt payload")
+	}
+}
+
+func TestJobsE_unwrapsVersionedPayload(t *testing.T) {
+	ctx := context.Background()
+	_, tracker := gontest.NewClient(t)
+	payload, err := json.Marshal(EmailJob{To: "versioned@test.com", Subject: "v2"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, err = core.EncodePayload(payload, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = tracker.Driver().Executor().JobInsertMany(ctx, []driver.JobInsertParams{{
+		Queue: "default", Kind: "email", Args: payload,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	jobs, err := gontest.JobsE[EmailJob](tracker)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs) != 1 || jobs[0].Args.To != "versioned@test.com" || jobs[0].PayloadVersion != 2 {
+		t.Fatalf("unexpected jobs: %s", gontest.FormatJobList(jobs))
 	}
 }
 

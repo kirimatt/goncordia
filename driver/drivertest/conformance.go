@@ -84,6 +84,25 @@ func Run(t *testing.T, exec driver.Executor) {
 	if err != nil || !cursorAgain.At.Equal(nextCursor) {
 		t.Fatalf("read advanced schedule cursor: cursor=%+v err=%v", cursorAgain, err)
 	}
+	rateKey := "rate-" + queue
+	firstPermit, err := driver.AcquireRateLimit(ctx, exec, driver.RateLimitAcquireParams{
+		Key: rateKey, Now: initialCursor, Limit: 2, Period: time.Minute, Burst: 1,
+	})
+	if err != nil || !firstPermit.Acquired {
+		t.Fatalf("acquire first rate permit: result=%+v err=%v", firstPermit, err)
+	}
+	blockedPermit, err := driver.AcquireRateLimit(ctx, exec, driver.RateLimitAcquireParams{
+		Key: rateKey, Now: initialCursor, Limit: 2, Period: time.Minute, Burst: 1,
+	})
+	if err != nil || blockedPermit.Acquired || !blockedPermit.RetryAt.Equal(initialCursor.Add(30*time.Second)) {
+		t.Fatalf("block second rate permit: result=%+v err=%v", blockedPermit, err)
+	}
+	secondPermit, err := driver.AcquireRateLimit(ctx, exec, driver.RateLimitAcquireParams{
+		Key: rateKey, Now: blockedPermit.RetryAt, Limit: 2, Period: time.Minute, Burst: 1,
+	})
+	if err != nil || !secondPermit.Acquired {
+		t.Fatalf("acquire rate permit after retry: result=%+v err=%v", secondPermit, err)
+	}
 
 	insert := driver.JobInsertParams{
 		Queue: queue, Kind: "conformance", Args: []byte(`{"value":1}`),
@@ -162,6 +181,25 @@ func Run(t *testing.T, exec driver.Executor) {
 	}
 	if claimed.AttemptedAt == nil || claimed.LeaseExpiresAt == nil {
 		t.Fatalf("reclaimed job lease metadata: %+v", claimed)
+	}
+	if marker, ok := exec.(driver.JobStartMarker); ok {
+		startedAt := claimed.AttemptedAt.UTC().Truncate(time.Millisecond).Add(time.Millisecond)
+		marked, markErr := marker.JobMarkStarted(ctx, driver.JobMarkStartedParams{
+			ID: id, WorkerID: claimed.WorkerID, Attempt: claimed.AttemptNum, At: startedAt,
+		})
+		if markErr != nil || !marked {
+			t.Fatalf("mark handler start: marked=%v err=%v", marked, markErr)
+		}
+		persisted, getErr := exec.JobGetByID(ctx, id)
+		if getErr != nil || persisted.StartedAt == nil || absDuration(persisted.StartedAt.Sub(startedAt)) > time.Second {
+			t.Fatalf("persist handler start: row=%+v err=%v", persisted, getErr)
+		}
+		stale, staleErr := marker.JobMarkStarted(ctx, driver.JobMarkStartedParams{
+			ID: id, WorkerID: "stale-worker", Attempt: claimed.AttemptNum, At: startedAt.Add(time.Second),
+		})
+		if staleErr != nil || stale {
+			t.Fatalf("stale handler start: marked=%v err=%v", stale, staleErr)
+		}
 	}
 	persistedClaim, err := exec.JobGetByID(ctx, id)
 	if err != nil || persistedClaim == nil || persistedClaim.AttemptedAt == nil || persistedClaim.LeaseExpiresAt == nil {
@@ -310,6 +348,13 @@ func Run(t *testing.T, exec driver.Executor) {
 	if orderedClaim.Kind != "ordering-high" || orderedClaim.Priority != 100 {
 		t.Fatalf("priority contract selected %+v", orderedClaim)
 	}
+}
+
+func absDuration(value time.Duration) time.Duration {
+	if value < 0 {
+		return -value
+	}
+	return value
 }
 
 // RunScheduled verifies that an executor does not claim a future job and does

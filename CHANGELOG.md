@@ -11,6 +11,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [v0.19.0] — 2026-08-23
+
+### Added
+- `NewWorkerPoolChecked`, `ValidateWorkerConfig`, `NewCronSchedulerChecked`, and
+  `ValidateCronConfig` for fail-fast startup validation.
+- Explicit driver capabilities for linearizable leases/CAS, persisted lifecycle
+  timestamps, bounded fetches, and strict backend ordering.
+- Keyed rate limits and keyed local concurrency by job kind, pipeline, or tag,
+  plus UTC-aligned `RateLimitModeFixedWindow` limits.
+- `WorkerPool.UpdateQueuePolicy` for atomic runtime policy reload; blocked
+  rate-limit waiters wake immediately and re-evaluate the new policy.
+- Portable enqueue admission control, typed `QueueFullError`, and
+  `NewQueueDepthAdmission` for queue-depth backpressure.
+- Persisted fenced `started_at` timestamps in every strict built-in driver and
+  opt-in `RequireLifecyclePersistence` / `RequireStrictOrdering` checks.
+- Worker lifecycle observer events and OTel claim-wait, rate-wait, started, and
+  finished metrics.
+- Error-returning `gontest.JobsE`, public `core.DecodePayload`, payload fuzzing,
+  concurrent fixed-window properties, and a GCRA acquisition benchmark.
+
+### Changed
+- Strict global limits now use an O(1) storage-backed GCRA compare-and-swap
+  cursor and return the exact next permit time; polling is only an error fallback.
+- Local smooth limits use the same GCRA semantics. The legacy `RateLimit` field
+  retains its burst-equals-limit behavior.
+- Execution fetches are backend-bounded. DynamoDB, Firestore, Cassandra, and
+  Redis examine at most 64–1024 due candidates per claim pass instead of loading
+  the complete due backlog.
+- SQL and MongoDB ready-order indexes now include the full priority, run time,
+  creation time, and ID tie-break sequence.
+- `attempted_at` remains claim time; `started_at` is handler-entry time, making
+  claimed/waiting/executing latency observable without changing job states.
+
+### Compatibility and guarantees
+- Existing constructors remain source-compatible and return validation errors
+  from `Start`; checked constructors report them immediately.
+- ClickHouse is rejected for strict global limits and distributed pipelines
+  because it cannot provide the required linearizable primitives.
+- DynamoDB, Firestore, Cassandra, and Redis expose bounded candidate ordering,
+  not strict global priority over an arbitrarily large due backlog. Enable
+  `RequireStrictOrdering` to reject those drivers at startup.
+- `QueueDepthAdmission` is advisory: its portable statistics read and later
+  insert are not one atomic storage operation.
+
+### Upgrade notes
+- Run `Migrate` before starting v0.19 workers. SQL drivers apply migration 007;
+  Cassandra and ClickHouse add `started_at`; MongoDB creates the v2 fetch index.
+- Smooth rules with `Burst > 1` now use standard GCRA burst semantics rather
+  than the v0.18 lease-lane approximation.
+
+### Testing
+- Expanded driver conformance with fenced lifecycle persistence and CAS rate
+  primitives; added deterministic injected-clock tests for keyed quotas,
+  fixed windows, runtime reload, admission rejection, and lifecycle metrics.
+
+---
+
 ## [v0.18.0] — 2026-08-23
 
 ### Added

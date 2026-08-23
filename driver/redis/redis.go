@@ -94,12 +94,17 @@ func (d *Driver) Name() string { return "redis" }
 
 func (d *Driver) Capabilities() driver.Capabilities {
 	return driver.Capabilities{
-		NativeTx:      false,
-		ListenNotify:  true,
-		ChangeStreams: false,
-		SkipLocked:    false,
-		UniqueJobs:    true,
-		AdvisoryLocks: false,
+		NativeTx:            false,
+		ListenNotify:        true,
+		ChangeStreams:       false,
+		SkipLocked:          false,
+		UniqueJobs:          true,
+		AdvisoryLocks:       false,
+		LinearizableLeases:  true,
+		LinearizableCAS:     true,
+		LifecycleTimestamps: true,
+		BoundedFetch:        true,
+		StrictFetchOrdering: false,
 	}
 }
 

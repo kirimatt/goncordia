@@ -79,8 +79,10 @@ func (d *Driver) Migrate(ctx context.Context) error {
 				{Key: "state", Value: 1},
 				{Key: "priority", Value: -1},
 				{Key: "run_at", Value: 1},
+				{Key: "created_at", Value: 1},
+				{Key: "_id", Value: 1},
 			},
-			Options: options.Index().SetName("goncordia_jobs_fetch"),
+			Options: options.Index().SetName("goncordia_jobs_fetch_v2"),
 		},
 		{
 			Keys: bson.D{
@@ -138,12 +140,17 @@ func (d *Driver) Name() string { return "mongodb" }
 
 func (d *Driver) Capabilities() driver.Capabilities {
 	return driver.Capabilities{
-		NativeTx:      true,
-		ChangeStreams: true,
-		UniqueJobs:    true,
-		SkipLocked:    false, // uses findOneAndUpdate instead
-		ListenNotify:  false,
-		AdvisoryLocks: false,
+		NativeTx:            true,
+		ChangeStreams:       true,
+		UniqueJobs:          true,
+		SkipLocked:          false, // uses findOneAndUpdate instead
+		ListenNotify:        false,
+		AdvisoryLocks:       false,
+		LinearizableLeases:  true,
+		LinearizableCAS:     true,
+		LifecycleTimestamps: true,
+		BoundedFetch:        true,
+		StrictFetchOrdering: true,
 	}
 }
 

@@ -11,6 +11,7 @@ import (
 	"runtime/debug"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -37,6 +38,36 @@ const (
 	RateLimitScopeGlobal
 )
 
+func (s RateLimitScope) String() string {
+	if s == RateLimitScopeGlobal {
+		return "global"
+	}
+	return "local"
+}
+
+// RateLimitKey selects the job attribute that owns an independent rate or
+// concurrency budget.
+type RateLimitKey uint8
+
+const (
+	// RateLimitKeyQueue shares one budget across the whole queue.
+	RateLimitKeyQueue RateLimitKey = iota
+	// RateLimitKeyKind creates one budget per job kind.
+	RateLimitKeyKind
+	// RateLimitKeyPipeline creates one budget per PipelineID.
+	RateLimitKeyPipeline
+	// RateLimitKeyTag creates one budget per matching tag.
+	RateLimitKeyTag
+)
+
+// RateLimitMode selects smooth or fixed-window start accounting.
+type RateLimitMode = driver.RateLimitMode
+
+const (
+	RateLimitModeGCRA        = driver.RateLimitModeGCRA
+	RateLimitModeFixedWindow = driver.RateLimitModeFixedWindow
+)
+
 // QueueRateLimit bounds handler starts over time. Multiple limits may be
 // combined on one queue (for example, per-second and per-day limits).
 type QueueRateLimit struct {
@@ -50,6 +81,23 @@ type QueueRateLimit struct {
 	Burst int
 	// Scope defaults to RateLimitScopeLocal.
 	Scope RateLimitScope
+	// Key gives each kind, pipeline, or matching tag an independent budget.
+	// Default: RateLimitKeyQueue.
+	Key RateLimitKey
+	// TagPrefix restricts RateLimitKeyTag to tags with this prefix. The first
+	// lexical match is used; jobs without one share an explicit empty bucket.
+	TagPrefix string
+	// Mode defaults to smooth GCRA. FixedWindow resets on UTC boundaries of
+	// Period and ignores Burst.
+	Mode RateLimitMode
+}
+
+// KeyConcurrencyLimit bounds concurrent jobs for each selected key inside one
+// WorkerPool. For cross-process serialization use DistributedPipelines.
+type KeyConcurrencyLimit struct {
+	Key       RateLimitKey
+	TagPrefix string
+	Limit     int
 }
 
 // QueuePolicy controls how a queue shares capacity with other queues in a pool.
@@ -58,6 +106,9 @@ type QueuePolicy struct {
 	Weight int
 	// Concurrency bounds jobs from this queue claimed by this pool. Zero is unlimited.
 	Concurrency int
+	// KeyConcurrency adds independent local concurrency ceilings per kind,
+	// pipeline, or matching tag.
+	KeyConcurrency []KeyConcurrencyLimit
 	// RateLimits bounds handler starts. Every configured rule must allow a start.
 	RateLimits []QueueRateLimit
 	// RateLimit bounds starts per RatePeriod using a local burst equal to the
@@ -119,6 +170,12 @@ type WorkerConfig struct {
 	Middleware []JobMiddleware
 	// Observer receives claim, heartbeat, and rescue lifecycle events.
 	Observer WorkerObserver
+	// RequireLifecyclePersistence fails validation unless the driver persists
+	// fenced handler-start timestamps.
+	RequireLifecyclePersistence bool
+	// RequireStrictOrdering rejects drivers that can only prioritize within a
+	// bounded due-candidate page because of native index constraints.
+	RequireStrictOrdering bool
 	// ErrorHandler receives asynchronous fetch, rescue, and state-transition errors.
 	// Default: slog.Error.
 	ErrorHandler func(error)
@@ -128,9 +185,10 @@ type WorkerConfig struct {
 // TTx is the driver's transaction type (needed only for type parameter inference;
 // the pool itself does not open user-visible transactions).
 type WorkerPool[TTx any] struct {
-	driver   driver.Driver[TTx]
-	registry *core.Registry
-	config   WorkerConfig
+	driver    driver.Driver[TTx]
+	registry  *core.Registry
+	config    WorkerConfig
+	configErr error
 
 	wg             sync.WaitGroup
 	sem            chan struct{}
@@ -141,17 +199,31 @@ type WorkerPool[TTx any] struct {
 	isShuttingDown atomic.Bool
 	started        atomic.Bool
 	queueCursor    atomic.Uint64
+	policyMu       sync.RWMutex
+	policyChanged  chan struct{}
 	queueSchedule  []string
 	queueStateMu   sync.Mutex
 	queueStates    map[string]*queueRuntimeState
 	rateLimits     map[string][]normalizedRateLimit
-	rateGates      map[string]chan struct{}
-	rateCursor     atomic.Uint64
+	rateGateMu     sync.Mutex
+	rateGates      map[string]*rateGate
 	fetchMu        sync.Mutex
 	pipelineMu     sync.Mutex
 	pipelineTails  map[string]chan struct{}
 	kindSemMu      sync.Mutex
 	kindSemaphores map[string]chan struct{}
+	keySemMu       sync.Mutex
+	keySemaphores  map[string]*keySemaphore
+}
+
+type keySemaphore struct {
+	ch   chan struct{}
+	refs int
+}
+
+type rateGate struct {
+	ch   chan struct{}
+	refs int
 }
 
 type queueRuntimeState struct {
@@ -160,21 +232,128 @@ type queueRuntimeState struct {
 }
 
 type localRateState struct {
-	readyAt []time.Time
+	tat         time.Time
+	windowStart time.Time
+	count       int
 }
 
 type normalizedRateLimit struct {
-	key      string
-	limit    int
-	burst    int
-	period   time.Duration
-	cooldown time.Duration
-	scope    RateLimitScope
+	key       string
+	limit     int
+	burst     int
+	period    time.Duration
+	interval  time.Duration
+	tolerance time.Duration
+	scope     RateLimitScope
+	keyBy     RateLimitKey
+	tagPrefix string
+	mode      RateLimitMode
 }
 
-// NewWorkerPool creates a WorkerPool.
-// Register workers using core.RegisterWorker before calling Start.
+// ValidateWorkerConfig checks values that cannot be safely normalized. Zero
+// values documented as defaults remain valid.
+func ValidateWorkerConfig[TTx any](d driver.Driver[TTx], cfg WorkerConfig) error {
+	var problems []string
+	if cfg.Concurrency < 0 {
+		problems = append(problems, "Concurrency must not be negative")
+	}
+	if cfg.MaxPending < 0 {
+		problems = append(problems, "MaxPending must not be negative")
+	}
+	if cfg.Concurrency > 0 && cfg.MaxPending > 0 && cfg.MaxPending < cfg.Concurrency {
+		problems = append(problems, "MaxPending must be at least Concurrency")
+	}
+	queues := make(map[string]struct{}, len(cfg.Queues)+1)
+	if len(cfg.Queues) == 0 {
+		queues["default"] = struct{}{}
+	} else {
+		for _, queue := range cfg.Queues {
+			if queue == "" {
+				queue = "default"
+			}
+			queues[queue] = struct{}{}
+		}
+	}
+	for queue, policy := range cfg.QueuePolicies {
+		if _, configured := queues[queue]; !configured {
+			problems = append(problems, fmt.Sprintf("QueuePolicies[%q] is not listed in Queues", queue))
+		}
+		if policy.Weight < 0 || policy.Concurrency < 0 || policy.RateLimit < 0 {
+			problems = append(problems, fmt.Sprintf("QueuePolicies[%q] contains a negative limit", queue))
+		}
+		for i, rule := range policy.RateLimits {
+			prefix := fmt.Sprintf("QueuePolicies[%q].RateLimits[%d]", queue, i)
+			if rule.Limit < 0 {
+				problems = append(problems, prefix+" Limit must not be negative")
+			}
+			if rule.Limit > 0 && rule.Burst > rule.Limit {
+				problems = append(problems, prefix+" Burst must not exceed Limit")
+			}
+			if rule.Scope != RateLimitScopeLocal && rule.Scope != RateLimitScopeGlobal {
+				problems = append(problems, prefix+" has an unknown Scope")
+			}
+			if rule.Key > RateLimitKeyTag {
+				problems = append(problems, prefix+" has an unknown Key")
+			}
+			if rule.Mode != RateLimitModeGCRA && rule.Mode != RateLimitModeFixedWindow {
+				problems = append(problems, prefix+" has an unknown Mode")
+			}
+			period := rule.Period
+			if period <= 0 {
+				period = time.Second
+			}
+			if rule.Mode == RateLimitModeFixedWindow && rule.Limit > 0 && int64(rule.Limit) >= int64(period/time.Millisecond) {
+				problems = append(problems, prefix+" fixed-window Limit must be smaller than Period milliseconds")
+			}
+			if rule.Scope == RateLimitScopeGlobal && rule.Limit > 0 && !d.Capabilities().LinearizableCAS {
+				problems = append(problems, fmt.Sprintf("%s requires linearizable CAS, unsupported by driver %q", prefix, d.Name()))
+			}
+		}
+		for i, rule := range policy.KeyConcurrency {
+			prefix := fmt.Sprintf("QueuePolicies[%q].KeyConcurrency[%d]", queue, i)
+			if rule.Limit <= 0 {
+				problems = append(problems, prefix+" Limit must be positive")
+			}
+			if rule.Key == RateLimitKeyQueue || rule.Key > RateLimitKeyTag {
+				problems = append(problems, prefix+" Key must be kind, pipeline, or tag")
+			}
+		}
+	}
+	if cfg.DistributedPipelines && !d.Capabilities().LinearizableLeases {
+		problems = append(problems, fmt.Sprintf("DistributedPipelines requires linearizable leases, unsupported by driver %q", d.Name()))
+	}
+	if cfg.RequireLifecyclePersistence && !d.Capabilities().LifecycleTimestamps {
+		problems = append(problems, fmt.Sprintf("RequireLifecyclePersistence is unsupported by driver %q", d.Name()))
+	}
+	if cfg.RequireStrictOrdering && !d.Capabilities().StrictFetchOrdering {
+		problems = append(problems, fmt.Sprintf("RequireStrictOrdering is unsupported by driver %q", d.Name()))
+	}
+	if len(problems) > 0 {
+		return fmt.Errorf("invalid worker config: %s", strings.Join(problems, "; "))
+	}
+	return nil
+}
+
+// NewWorkerPool creates a WorkerPool. Invalid configuration is reported by
+// Start. Use NewWorkerPoolChecked to fail before retaining the pool.
 func NewWorkerPool[TTx any](d driver.Driver[TTx], registry *core.Registry, cfg WorkerConfig) *WorkerPool[TTx] {
+	return newWorkerPool(d, registry, cfg)
+}
+
+// NewWorkerPoolChecked validates cfg and returns an error immediately.
+func NewWorkerPoolChecked[TTx any](
+	d driver.Driver[TTx], registry *core.Registry, cfg WorkerConfig,
+) (*WorkerPool[TTx], error) {
+	pool := newWorkerPool(d, registry, cfg)
+	if pool.configErr != nil {
+		return nil, pool.configErr
+	}
+	return pool, nil
+}
+
+func newWorkerPool[TTx any](d driver.Driver[TTx], registry *core.Registry, cfg WorkerConfig) *WorkerPool[TTx] {
+	configErr := ValidateWorkerConfig(d, cfg)
+	cfg.QueuePolicies = cloneQueuePolicies(cfg.QueuePolicies)
 	if cfg.Concurrency <= 0 {
 		cfg.Concurrency = 10
 	}
@@ -242,7 +421,7 @@ func NewWorkerPool[TTx any](d driver.Driver[TTx], registry *core.Registry, cfg W
 	}
 	queueSchedule := make([]string, 0, len(cfg.Queues))
 	rateLimits := make(map[string][]normalizedRateLimit, len(cfg.Queues))
-	rateGates := make(map[string]chan struct{}, len(cfg.Queues))
+	rateGates := make(map[string]*rateGate)
 	for _, queue := range cfg.Queues {
 		policy := cfg.QueuePolicies[queue]
 		weight := policy.Weight
@@ -250,9 +429,6 @@ func NewWorkerPool[TTx any](d driver.Driver[TTx], registry *core.Registry, cfg W
 			weight = 1
 		}
 		rateLimits[queue] = normalizeRateLimits(queue, policy)
-		if len(rateLimits[queue]) > 0 {
-			rateGates[queue] = make(chan struct{}, 1)
-		}
 		for range weight {
 			queueSchedule = append(queueSchedule, queue)
 		}
@@ -262,17 +438,98 @@ func NewWorkerPool[TTx any](d driver.Driver[TTx], registry *core.Registry, cfg W
 		driver:         d,
 		registry:       registry,
 		config:         cfg,
+		configErr:      configErr,
 		sem:            make(chan struct{}, cfg.Concurrency),
 		pending:        make(chan struct{}, cfg.MaxPending),
 		shutdownCh:     make(chan struct{}),
 		shutdownDone:   make(chan struct{}),
+		policyChanged:  make(chan struct{}),
 		queueSchedule:  queueSchedule,
 		rateLimits:     rateLimits,
 		rateGates:      rateGates,
 		queueStates:    make(map[string]*queueRuntimeState),
 		pipelineTails:  make(map[string]chan struct{}),
 		kindSemaphores: make(map[string]chan struct{}),
+		keySemaphores:  make(map[string]*keySemaphore),
 	}
+}
+
+func cloneQueuePolicies(source map[string]QueuePolicy) map[string]QueuePolicy {
+	if source == nil {
+		return nil
+	}
+	cloned := make(map[string]QueuePolicy, len(source))
+	for queue, policy := range source {
+		policy.RateLimits = append([]QueueRateLimit(nil), policy.RateLimits...)
+		policy.KeyConcurrency = append([]KeyConcurrencyLimit(nil), policy.KeyConcurrency...)
+		cloned[queue] = policy
+	}
+	return cloned
+}
+
+// UpdateQueuePolicy atomically replaces one queue policy for future claims and
+// starts. Already acquired permits and running jobs keep their original policy.
+func (p *WorkerPool[TTx]) UpdateQueuePolicy(queue string, policy QueuePolicy) error {
+	if queue == "" {
+		queue = "default"
+	}
+	p.fetchMu.Lock()
+	defer p.fetchMu.Unlock()
+	p.policyMu.Lock()
+	defer p.policyMu.Unlock()
+	found := false
+	for _, configured := range p.config.Queues {
+		if configured == queue {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return fmt.Errorf("queue %q is not configured", queue)
+	}
+	next := cloneQueuePolicies(p.config.QueuePolicies)
+	if next == nil {
+		next = make(map[string]QueuePolicy)
+	}
+	next[queue] = policy
+	candidate := p.config
+	candidate.QueuePolicies = next
+	if err := ValidateWorkerConfig(p.driver, candidate); err != nil {
+		return err
+	}
+	p.config.QueuePolicies = next
+	p.rateLimits[queue] = normalizeRateLimits(queue, policy)
+	p.queueSchedule = p.queueSchedule[:0]
+	for _, configured := range p.config.Queues {
+		weight := p.config.QueuePolicies[configured].Weight
+		if weight <= 0 {
+			weight = 1
+		}
+		for range weight {
+			p.queueSchedule = append(p.queueSchedule, configured)
+		}
+	}
+	close(p.policyChanged)
+	p.policyChanged = make(chan struct{})
+	return nil
+}
+
+func (p *WorkerPool[TTx]) queuePolicy(queue string) QueuePolicy {
+	p.policyMu.RLock()
+	defer p.policyMu.RUnlock()
+	return p.config.QueuePolicies[queue]
+}
+
+func (p *WorkerPool[TTx]) queueRateLimits(queue string) []normalizedRateLimit {
+	p.policyMu.RLock()
+	defer p.policyMu.RUnlock()
+	return append([]normalizedRateLimit(nil), p.rateLimits[queue]...)
+}
+
+func (p *WorkerPool[TTx]) currentPolicyChange() <-chan struct{} {
+	p.policyMu.RLock()
+	defer p.policyMu.RUnlock()
+	return p.policyChanged
 }
 
 func normalizeRateLimits(queue string, policy QueuePolicy) []normalizedRateLimit {
@@ -300,29 +557,31 @@ func normalizeRateLimits(queue string, policy QueuePolicy) []normalizedRateLimit
 		if configuredRule.Scope != RateLimitScopeGlobal {
 			configuredRule.Scope = RateLimitScopeLocal
 		}
-		cooldown := time.Duration(float64(configuredRule.Period) *
-			float64(configuredRule.Burst) / float64(configuredRule.Limit))
-		if cooldown < time.Nanosecond {
-			cooldown = time.Nanosecond
+		interval := time.Duration(float64(configuredRule.Period) / float64(configuredRule.Limit))
+		if interval < time.Nanosecond {
+			interval = time.Nanosecond
 		}
-		if cooldown > configuredRule.Period {
-			cooldown = configuredRule.Period
-		}
+		tolerance := interval * time.Duration(configuredRule.Burst-1)
 		signature := strconv.Itoa(configuredRule.Limit) + ":" +
 			strconv.FormatInt(int64(configuredRule.Period), 10) + ":" +
-			strconv.Itoa(configuredRule.Burst) + ":" + strconv.Itoa(int(configuredRule.Scope))
+			strconv.Itoa(configuredRule.Burst) + ":" + strconv.Itoa(int(configuredRule.Scope)) + ":" +
+			strconv.Itoa(int(configuredRule.Key)) + ":" + configuredRule.TagPrefix + ":" + strconv.Itoa(int(configuredRule.Mode))
 		if _, duplicate := seen[signature]; duplicate {
 			continue
 		}
 		seen[signature] = struct{}{}
 		digest := sha256.Sum256([]byte(queue + "\x00" + signature))
 		result = append(result, normalizedRateLimit{
-			key:      "goncordia:rate:" + hex.EncodeToString(digest[:16]),
-			limit:    configuredRule.Limit,
-			burst:    configuredRule.Burst,
-			period:   configuredRule.Period,
-			cooldown: cooldown,
-			scope:    configuredRule.Scope,
+			key:       "goncordia:rate:" + hex.EncodeToString(digest[:16]),
+			limit:     configuredRule.Limit,
+			burst:     configuredRule.Burst,
+			period:    configuredRule.Period,
+			interval:  interval,
+			tolerance: tolerance,
+			scope:     configuredRule.Scope,
+			keyBy:     configuredRule.Key,
+			tagPrefix: configuredRule.TagPrefix,
+			mode:      configuredRule.Mode,
 		})
 	}
 	return result
@@ -340,6 +599,9 @@ var workerSequence atomic.Uint64
 
 // Start launches the fetch-and-process loops. Blocks until ctx is cancelled or Stop is called.
 func (p *WorkerPool[TTx]) Start(ctx context.Context) error {
+	if p.configErr != nil {
+		return p.configErr
+	}
 	if !p.started.CompareAndSwap(false, true) {
 		return fmt.Errorf("worker pool already started")
 	}
@@ -554,7 +816,13 @@ func (p *WorkerPool[TTx]) fetchAndDispatch(ctx context.Context) {
 				}
 				defer releaseDistributed()
 				claimCtx = distributedCtx
-				releaseRateGate, rateGateAcquired := p.acquireRateGate(claimCtx, row.Queue)
+				releaseKeys, keysAcquired := p.acquireKeyConcurrency(claimCtx, row)
+				if !keysAcquired {
+					p.setState(context.Background(), exec, fencedStateParams(row, driver.JobSetStateParams{Yield: true}))
+					return
+				}
+				defer releaseKeys()
+				releaseRateGate, rateGateAcquired := p.acquireRateGate(claimCtx, row)
 				if !rateGateAcquired {
 					p.setState(context.Background(), exec, fencedStateParams(row, driver.JobSetStateParams{Yield: true}))
 					return
@@ -587,7 +855,30 @@ func (p *WorkerPool[TTx]) fetchAndDispatch(ctx context.Context) {
 				// Let the next job approach execution capacity only after this job has
 				// reserved every configured rate permit.
 				releaseRateGate()
-				p.processRow(claimCtx, exec, row)
+				startedAt := p.config.Clock.Now()
+				if marker, ok := exec.(driver.JobStartMarker); ok {
+					marked, err := marker.JobMarkStarted(claimCtx, driver.JobMarkStartedParams{
+						ID: row.ID, WorkerID: row.WorkerID, Attempt: row.AttemptNum, At: startedAt,
+					})
+					if err != nil {
+						p.reportError(fmt.Errorf("persist handler start for job %s: %w", row.ID, err))
+					} else if marked {
+						row.StartedAt = &startedAt
+					}
+				}
+				if observer, ok := p.config.Observer.(WorkerLifecycleObserver); ok {
+					claimWait := time.Duration(0)
+					if row.AttemptedAt != nil {
+						claimWait = startedAt.Sub(*row.AttemptedAt)
+					}
+					observer.JobStarted(claimCtx, JobStartedEvent{Job: row, StartedAt: startedAt, ClaimWait: claimWait})
+				}
+				state, jobErr := p.processRow(claimCtx, exec, row)
+				if observer, ok := p.config.Observer.(WorkerLifecycleObserver); ok {
+					observer.JobFinished(claimCtx, JobFinishedEvent{
+						Job: row, State: state, Err: jobErr, StartedAt: startedAt, FinishedAt: p.config.Clock.Now(),
+					})
+				}
 			}()
 		}
 	}
@@ -596,7 +887,7 @@ func (p *WorkerPool[TTx]) fetchAndDispatch(ctx context.Context) {
 func (p *WorkerPool[TTx]) queueCanClaim(queue string) bool {
 	p.queueStateMu.Lock()
 	defer p.queueStateMu.Unlock()
-	policy := p.config.QueuePolicies[queue]
+	policy := p.queuePolicy(queue)
 	state := p.queueStates[queue]
 	if state == nil {
 		state = &queueRuntimeState{}
@@ -627,98 +918,165 @@ func (p *WorkerPool[TTx]) queueDone(queue string) {
 	}
 }
 
-func (p *WorkerPool[TTx]) acquireRateGate(ctx context.Context, queue string) (func(), bool) {
-	gate := p.rateGates[queue]
-	if gate == nil {
+func (p *WorkerPool[TTx]) acquireRateGate(ctx context.Context, row driver.JobRow) (func(), bool) {
+	rules := p.queueRateLimits(row.Queue)
+	if len(rules) == 0 {
 		return func() {}, true
 	}
+	var signature strings.Builder
+	for _, rule := range rules {
+		signature.WriteString(rateRuleKey(rule, row))
+		signature.WriteByte(0)
+	}
+	digest := sha256.Sum256([]byte(signature.String()))
+	key := hex.EncodeToString(digest[:16])
+	p.rateGateMu.Lock()
+	gate := p.rateGates[key]
+	if gate == nil {
+		gate = &rateGate{ch: make(chan struct{}, 1)}
+		p.rateGates[key] = gate
+	}
+	gate.refs++
+	p.rateGateMu.Unlock()
+	dropRef := func() {
+		p.rateGateMu.Lock()
+		gate.refs--
+		if gate.refs == 0 {
+			delete(p.rateGates, key)
+		}
+		p.rateGateMu.Unlock()
+	}
 	select {
-	case gate <- struct{}{}:
+	case gate.ch <- struct{}{}:
 		var once sync.Once
-		return func() { once.Do(func() { <-gate }) }, true
+		return func() { once.Do(func() { <-gate.ch; dropRef() }) }, true
 	case <-ctx.Done():
+		dropRef()
 		return nil, false
 	case <-p.shutdownCh:
+		dropRef()
 		return nil, false
 	}
 }
 
 type localRateReservation struct {
-	state    *localRateState
-	lane     int
-	previous time.Time
-	reserved time.Time
+	state          *localRateState
+	previous       time.Time
+	reserved       time.Time
+	previousWindow time.Time
+	previousCount  int
+	fixedWindow    bool
 }
 
-func (p *WorkerPool[TTx]) localRateDelay(queue string, now time.Time) time.Duration {
+func (p *WorkerPool[TTx]) localRateDelay(row driver.JobRow, now time.Time) time.Duration {
 	p.queueStateMu.Lock()
 	defer p.queueStateMu.Unlock()
-	state := p.queueStates[queue]
+	state := p.queueStates[row.Queue]
 	if state == nil {
 		state = &queueRuntimeState{}
-		p.queueStates[queue] = state
+		p.queueStates[row.Queue] = state
 	}
 	if state.rates == nil {
 		state.rates = make(map[string]*localRateState)
 	}
 	var delay time.Duration
-	for _, rule := range p.rateLimits[queue] {
+	for _, rule := range p.queueRateLimits(row.Queue) {
 		if rule.scope != RateLimitScopeLocal {
 			continue
 		}
-		rateState := state.rates[rule.key]
+		key := rateRuleKey(rule, row)
+		rateState := state.rates[key]
 		if rateState == nil {
-			rateState = &localRateState{readyAt: make([]time.Time, rule.burst)}
-			state.rates[rule.key] = rateState
+			rateState = &localRateState{}
+			state.rates[key] = rateState
 		}
-		earliest := rateState.readyAt[0]
-		for _, readyAt := range rateState.readyAt[1:] {
-			if readyAt.Before(earliest) {
-				earliest = readyAt
+		if rule.mode == RateLimitModeFixedWindow {
+			window := now.UTC().Truncate(rule.period)
+			if rateState.windowStart.Equal(window) && rateState.count >= rule.limit {
+				if candidate := window.Add(rule.period).Sub(now); candidate > delay {
+					delay = candidate
+				}
 			}
+			continue
 		}
-		if earliest.After(now) && earliest.Sub(now) > delay {
-			delay = earliest.Sub(now)
+		retryAt := rateState.tat.Add(-rule.tolerance)
+		if retryAt.After(now) && retryAt.Sub(now) > delay {
+			delay = retryAt.Sub(now)
 		}
 	}
 	return delay
 }
 
-func (p *WorkerPool[TTx]) reserveLocalRateLimits(queue string, now time.Time) (func(), bool) {
+func (p *WorkerPool[TTx]) reserveLocalRateLimits(row driver.JobRow, now time.Time) (func(), bool) {
 	p.queueStateMu.Lock()
-	state := p.queueStates[queue]
+	state := p.queueStates[row.Queue]
 	if state == nil {
 		state = &queueRuntimeState{}
-		p.queueStates[queue] = state
+		p.queueStates[row.Queue] = state
 	}
 	if state.rates == nil {
 		state.rates = make(map[string]*localRateState)
 	}
-	reservations := make([]localRateReservation, 0, len(p.rateLimits[queue]))
-	for _, rule := range p.rateLimits[queue] {
+	rules := p.queueRateLimits(row.Queue)
+	reservations := make([]localRateReservation, 0, len(rules))
+	rollbackLocked := func() {
+		for i := len(reservations) - 1; i >= 0; i-- {
+			reservation := reservations[i]
+			if reservation.fixedWindow {
+				reservation.state.windowStart = reservation.previousWindow
+				reservation.state.count = reservation.previousCount
+			} else if reservation.state.tat.Equal(reservation.reserved) {
+				reservation.state.tat = reservation.previous
+			}
+		}
+	}
+	for _, rule := range rules {
 		if rule.scope != RateLimitScopeLocal {
 			continue
 		}
-		rateState := state.rates[rule.key]
+		key := rateRuleKey(rule, row)
+		rateState := state.rates[key]
 		if rateState == nil {
-			rateState = &localRateState{readyAt: make([]time.Time, rule.burst)}
-			state.rates[rule.key] = rateState
+			rateState = &localRateState{}
+			state.rates[key] = rateState
 		}
-		lane := 0
-		for i := 1; i < len(rateState.readyAt); i++ {
-			if rateState.readyAt[i].Before(rateState.readyAt[lane]) {
-				lane = i
+		if rule.mode == RateLimitModeFixedWindow {
+			window := now.UTC().Truncate(rule.period)
+			if !rateState.windowStart.Equal(window) {
+				reservations = append(reservations, localRateReservation{
+					state: rateState, previousWindow: rateState.windowStart,
+					previousCount: rateState.count, fixedWindow: true,
+				})
+				rateState.windowStart = window
+				rateState.count = 1
+				continue
 			}
+			if rateState.count >= rule.limit {
+				rollbackLocked()
+				p.queueStateMu.Unlock()
+				return nil, false
+			}
+			reservations = append(reservations, localRateReservation{
+				state: rateState, previousWindow: rateState.windowStart,
+				previousCount: rateState.count, fixedWindow: true,
+			})
+			rateState.count++
+			continue
 		}
-		if rateState.readyAt[lane].After(now) {
+		if rateState.tat.Add(-rule.tolerance).After(now) {
+			rollbackLocked()
 			p.queueStateMu.Unlock()
 			return nil, false
 		}
-		reserved := now.Add(rule.cooldown)
+		base := rateState.tat
+		if base.Before(now) {
+			base = now
+		}
+		reserved := base.Add(rule.interval)
 		reservations = append(reservations, localRateReservation{
-			state: rateState, lane: lane, previous: rateState.readyAt[lane], reserved: reserved,
+			state: rateState, previous: rateState.tat, reserved: reserved,
 		})
-		rateState.readyAt[lane] = reserved
+		rateState.tat = reserved
 	}
 	p.queueStateMu.Unlock()
 
@@ -727,115 +1085,75 @@ func (p *WorkerPool[TTx]) reserveLocalRateLimits(queue string, now time.Time) (f
 		once.Do(func() {
 			p.queueStateMu.Lock()
 			defer p.queueStateMu.Unlock()
-			for _, reservation := range reservations {
-				if reservation.state.readyAt[reservation.lane].Equal(reservation.reserved) {
-					reservation.state.readyAt[reservation.lane] = reservation.previous
-				}
-			}
+			rollbackLocked()
 		})
 	}, true
 }
 
-type globalRateLease struct {
-	name  string
-	owner string
-}
-
 func (p *WorkerPool[TTx]) tryGlobalRateLimits(
 	ctx context.Context, exec driver.Executor, row driver.JobRow,
-) ([]globalRateLease, bool, error) {
-	leases := make([]globalRateLease, 0, len(p.rateLimits[row.Queue]))
-	for _, rule := range p.rateLimits[row.Queue] {
+) (bool, time.Time, error) {
+	for _, rule := range p.queueRateLimits(row.Queue) {
 		if rule.scope != RateLimitScopeGlobal {
 			continue
 		}
-		ownerDigest := sha256.Sum256([]byte(p.config.WorkerID + "\x00" + row.ID + "\x00" +
-			strconv.Itoa(row.AttemptNum) + "\x00" + rule.key))
-		owner := "rate:" + hex.EncodeToString(ownerDigest[:16])
-		start := int(p.rateCursor.Add(1)-1) % rule.burst
-		acquired := false
-		for offset := range rule.burst {
-			lane := (start + offset) % rule.burst
-			name := rule.key + ":" + strconv.Itoa(lane)
-			elected, err := exec.LeaderAttemptElect(ctx, driver.LeaderElectParams{
-				Name: name, WorkerID: owner, TTL: rule.cooldown,
-			})
-			if err != nil {
-				p.releaseGlobalRateLeases(exec, leases)
-				return nil, false, err
-			}
-			if elected {
-				leases = append(leases, globalRateLease{name: name, owner: owner})
-				acquired = true
-				break
-			}
+		result, err := driver.AcquireRateLimit(ctx, exec, driver.RateLimitAcquireParams{
+			Key: rateRuleKey(rule, row), Now: p.config.Clock.Now(), Limit: rule.limit,
+			Period: rule.period, Burst: rule.burst, Mode: rule.mode,
+		})
+		if err != nil {
+			return false, time.Time{}, err
 		}
-		if !acquired {
-			p.releaseGlobalRateLeases(exec, leases)
-			return nil, false, nil
+		if !result.Acquired {
+			// A permit acquired for an earlier AND-combined rule is deliberately
+			// not rolled back: doing so after a CAS could erase a concurrent start.
+			// This may underutilize capacity under contention but never exceeds it.
+			return false, result.RetryAt, nil
 		}
 	}
-	return leases, true, nil
-}
-
-func (p *WorkerPool[TTx]) releaseGlobalRateLeases(exec driver.Executor, leases []globalRateLease) {
-	for i := len(leases) - 1; i >= 0; i-- {
-		lease := leases[i]
-		if err := exec.LeaderResign(context.Background(), driver.LeaderResignParams{
-			Name: lease.name, WorkerID: lease.owner,
-		}); err != nil {
-			p.reportError(fmt.Errorf("release global rate permit %q: %w", lease.name, err))
-		}
-	}
-}
-
-func (p *WorkerPool[TTx]) globalRateRetryDelay(queue string) time.Duration {
-	delay := p.config.RateLimitPollInterval
-	for _, rule := range p.rateLimits[queue] {
-		if rule.scope != RateLimitScopeGlobal {
-			continue
-		}
-		candidate := rule.cooldown / 4
-		if candidate < 10*time.Millisecond {
-			candidate = 10 * time.Millisecond
-		}
-		if candidate < delay {
-			delay = candidate
-		}
-	}
-	return delay
+	return true, time.Time{}, nil
 }
 
 func (p *WorkerPool[TTx]) waitForRatePermit(ctx context.Context, exec driver.Executor, row driver.JobRow) bool {
-	if len(p.rateLimits[row.Queue]) == 0 {
+	if len(p.queueRateLimits(row.Queue)) == 0 {
 		return true
 	}
 	for {
 		now := p.config.Clock.Now()
-		if delay := p.localRateDelay(row.Queue, now); delay > 0 {
+		if delay := p.localRateDelay(row, now); delay > 0 {
+			if observer, ok := p.config.Observer.(WorkerLifecycleObserver); ok {
+				observer.JobRateLimited(ctx, RateLimitWaitEvent{
+					Job: row, Scope: RateLimitScopeLocal, RetryAt: now.Add(delay),
+				})
+			}
 			if !p.waitForRateDelay(ctx, delay) {
 				return false
 			}
 			continue
 		}
-		rollbackLocal, reserved := p.reserveLocalRateLimits(row.Queue, now)
+		rollbackLocal, reserved := p.reserveLocalRateLimits(row, now)
 		if !reserved {
 			continue
 		}
-		leases, acquired, err := p.tryGlobalRateLimits(ctx, exec, row)
+		acquired, retryAt, err := p.tryGlobalRateLimits(ctx, exec, row)
 		if acquired && err == nil {
-			// Successful local reservations and global leases intentionally remain
-			// until their cooldown expires: they account for this handler start.
+			// Successful local reservations and global cursors intentionally remain:
+			// they account for this handler start.
 			return true
 		}
 		rollbackLocal()
-		if len(leases) > 0 {
-			p.releaseGlobalRateLeases(exec, leases)
-		}
+		delay := p.config.RateLimitPollInterval
 		if err != nil {
 			p.reportError(fmt.Errorf("acquire global rate permit for queue %q: %w", row.Queue, err))
+		} else if retryAt.After(p.config.Clock.Now()) {
+			delay = retryAt.Sub(p.config.Clock.Now())
 		}
-		if !p.waitForRateDelay(ctx, p.globalRateRetryDelay(row.Queue)) {
+		if observer, ok := p.config.Observer.(WorkerLifecycleObserver); ok {
+			observer.JobRateLimited(ctx, RateLimitWaitEvent{
+				Job: row, Scope: RateLimitScopeGlobal, RetryAt: p.config.Clock.Now().Add(delay), Err: err,
+			})
+		}
+		if !p.waitForRateDelay(ctx, delay) {
 			return false
 		}
 	}
@@ -856,6 +1174,8 @@ func (p *WorkerPool[TTx]) waitForRateDelay(ctx context.Context, delay time.Durat
 	defer stop()
 	select {
 	case <-timerC:
+		return true
+	case <-p.currentPolicyChange():
 		return true
 	case <-ctx.Done():
 		return false
@@ -947,6 +1267,96 @@ func (p *WorkerPool[TTx]) pipelineGate(id string) (<-chan struct{}, func()) {
 	}
 }
 
+func rateLimitKeyValue(keyBy RateLimitKey, tagPrefix string, row driver.JobRow) string {
+	switch keyBy {
+	case RateLimitKeyKind:
+		return row.Kind
+	case RateLimitKeyPipeline:
+		return row.PipelineID
+	case RateLimitKeyTag:
+		matches := make([]string, 0, len(row.Tags))
+		for _, tag := range row.Tags {
+			if strings.HasPrefix(tag, tagPrefix) {
+				matches = append(matches, tag)
+			}
+		}
+		sort.Strings(matches)
+		if len(matches) > 0 {
+			return matches[0]
+		}
+		return "<missing>"
+	default:
+		return row.Queue
+	}
+}
+
+func rateRuleKey(rule normalizedRateLimit, row driver.JobRow) string {
+	if rule.keyBy == RateLimitKeyQueue {
+		return rule.key
+	}
+	digest := sha256.Sum256([]byte(rule.key + "\x00" + rateLimitKeyValue(rule.keyBy, rule.tagPrefix, row)))
+	return rule.key + ":" + hex.EncodeToString(digest[:16])
+}
+
+func (p *WorkerPool[TTx]) acquireKeyConcurrency(ctx context.Context, row driver.JobRow) (func(), bool) {
+	policy := p.queuePolicy(row.Queue)
+	acquired := make([]struct {
+		key   string
+		entry *keySemaphore
+	}, 0, len(policy.KeyConcurrency))
+	release := func() {
+		for i := len(acquired) - 1; i >= 0; i-- {
+			item := acquired[i]
+			<-item.entry.ch
+			p.keySemMu.Lock()
+			item.entry.refs--
+			if item.entry.refs == 0 {
+				delete(p.keySemaphores, item.key)
+			}
+			p.keySemMu.Unlock()
+		}
+	}
+	for index, rule := range policy.KeyConcurrency {
+		value := rateLimitKeyValue(rule.Key, rule.TagPrefix, row)
+		key := row.Queue + "\x00" + strconv.Itoa(index) + "\x00" + value
+		p.keySemMu.Lock()
+		entry := p.keySemaphores[key]
+		if entry == nil {
+			entry = &keySemaphore{ch: make(chan struct{}, rule.Limit)}
+			p.keySemaphores[key] = entry
+		}
+		entry.refs++
+		p.keySemMu.Unlock()
+		select {
+		case entry.ch <- struct{}{}:
+			acquired = append(acquired, struct {
+				key   string
+				entry *keySemaphore
+			}{key: key, entry: entry})
+		case <-ctx.Done():
+			p.keySemMu.Lock()
+			entry.refs--
+			if entry.refs == 0 {
+				delete(p.keySemaphores, key)
+			}
+			p.keySemMu.Unlock()
+			release()
+			return nil, false
+		case <-p.shutdownCh:
+			p.keySemMu.Lock()
+			entry.refs--
+			if entry.refs == 0 {
+				delete(p.keySemaphores, key)
+			}
+			p.keySemMu.Unlock()
+			release()
+			return nil, false
+		}
+	}
+	var once sync.Once
+	return func() { once.Do(release) }, true
+}
+
 func (p *WorkerPool[TTx]) kindSemaphore(kind string) chan struct{} {
 	opts, ok := p.registry.Opts(kind)
 	if !ok || opts.Concurrency <= 0 {
@@ -963,7 +1373,9 @@ func (p *WorkerPool[TTx]) kindSemaphore(kind string) chan struct{} {
 }
 
 // processRow executes a single job, applies middleware, then updates its state.
-func (p *WorkerPool[TTx]) processRow(ctx context.Context, exec driver.Executor, row driver.JobRow) {
+func (p *WorkerPool[TTx]) processRow(
+	ctx context.Context, exec driver.Executor, row driver.JobRow,
+) (driver.JobState, error) {
 	// Resolve effective MaxRetry: job-level overrides worker default; 0 means "use worker default".
 	maxRetry := row.MaxRetry
 	if maxRetry <= 0 {
@@ -1029,14 +1441,14 @@ func (p *WorkerPool[TTx]) processRow(ctx context.Context, exec driver.Executor, 
 	// A job-specific timeout only cancels jobCtx, so it still follows retry rules.
 	if ctx.Err() != nil {
 		p.setState(ctx, exec, fencedStateParams(row, driver.JobSetStateParams{Yield: true}))
-		return
+		return driver.JobStateAvailable, ctx.Err()
 	}
 
 	if jobErr == nil {
 		p.setState(ctx, exec, fencedStateParams(row, driver.JobSetStateParams{
 			State: driver.JobStateCompleted,
 		}))
-		return
+		return driver.JobStateCompleted, nil
 	}
 
 	errStr := jobErr.Error()
@@ -1045,7 +1457,7 @@ func (p *WorkerPool[TTx]) processRow(ctx context.Context, exec driver.Executor, 
 		p.setState(ctx, exec, fencedStateParams(row, driver.JobSetStateParams{
 			State: driver.JobStateDiscarded, Err: &errStr, Trace: trace, Attempt: row.AttemptNum,
 		}))
-		return
+		return driver.JobStateDiscarded, jobErr
 	}
 
 	if row.AttemptNum >= maxRetry {
@@ -1055,7 +1467,7 @@ func (p *WorkerPool[TTx]) processRow(ctx context.Context, exec driver.Executor, 
 			Trace:   trace,
 			Attempt: row.AttemptNum,
 		}))
-		return
+		return driver.JobStateDiscarded, jobErr
 	}
 
 	var retryAt time.Time
@@ -1074,7 +1486,7 @@ func (p *WorkerPool[TTx]) processRow(ctx context.Context, exec driver.Executor, 
 			Trace:   trace,
 			Attempt: row.AttemptNum,
 		}))
-		return
+		return driver.JobStateDiscarded, jobErr
 	}
 	p.setState(ctx, exec, fencedStateParams(row, driver.JobSetStateParams{
 		State:   driver.JobStateRetryable,
@@ -1083,6 +1495,7 @@ func (p *WorkerPool[TTx]) processRow(ctx context.Context, exec driver.Executor, 
 		Attempt: row.AttemptNum,
 		RetryAt: retryAt,
 	}))
+	return driver.JobStateRetryable, jobErr
 }
 
 func fencedStateParams(row driver.JobRow, params driver.JobSetStateParams) driver.JobSetStateParams {

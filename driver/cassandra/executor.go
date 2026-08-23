@@ -46,6 +46,9 @@ func (e *executor) JobRescueStuck(ctx context.Context, params driver.JobRescuePa
 func (e *executor) JobHeartbeat(ctx context.Context, params driver.JobHeartbeatParams) (bool, error) {
 	return jobHeartbeat(ctx, e.session, params)
 }
+func (e *executor) JobMarkStarted(ctx context.Context, params driver.JobMarkStartedParams) (bool, error) {
+	return jobMarkStarted(ctx, e.session, params)
+}
 func (e *executor) JobSetStateIfRunning(ctx context.Context, params driver.JobSetStateParams) error {
 	return jobSetStateIfRunning(ctx, e.session, e.clk, params)
 }
@@ -150,6 +153,7 @@ type cassandraJob struct {
 	RunAt          time.Time
 	CreatedAt      time.Time
 	AttemptedAt    time.Time
+	StartedAt      time.Time
 	LeaseExpiresAt time.Time
 	FinalizedAt    time.Time
 	AttemptNum     int
@@ -220,6 +224,10 @@ func jobToRow(j cassandraJob) *driver.JobRow {
 		t := j.AttemptedAt.UTC()
 		row.AttemptedAt = &t
 	}
+	if !j.StartedAt.IsZero() {
+		t := j.StartedAt.UTC()
+		row.StartedAt = &t
+	}
 	if !j.LeaseExpiresAt.IsZero() {
 		t := j.LeaseExpiresAt.UTC()
 		row.LeaseExpiresAt = &t
@@ -234,12 +242,12 @@ func jobToRow(j cassandraJob) *driver.JobRow {
 func selectJob(ctx context.Context, session *gocql.Session, id string) (cassandraJob, error) {
 	var j cassandraJob
 	err := session.Query(`SELECT id,queue,kind,args,state,priority,run_at,created_at,
-		attempted_at,lease_expires_at,finalized_at,attempt_num,max_retry,timeout_ms,
+		attempted_at,started_at,lease_expires_at,finalized_at,attempt_num,max_retry,timeout_ms,
 		unique_key,worker_id,tags,errors_json,version,pipeline_id
 		FROM goncordia_jobs WHERE id = ?`, id).
 		WithContext(ctx).
 		Scan(&j.ID, &j.Queue, &j.Kind, &j.Args, &j.State, &j.Priority,
-			&j.RunAt, &j.CreatedAt, &j.AttemptedAt, &j.LeaseExpiresAt, &j.FinalizedAt,
+			&j.RunAt, &j.CreatedAt, &j.AttemptedAt, &j.StartedAt, &j.LeaseExpiresAt, &j.FinalizedAt,
 			&j.AttemptNum, &j.MaxRetry, &j.TimeoutMs,
 			&j.UniqueKey, &j.WorkerID, &j.Tags, &j.ErrorsJSON, &j.Version, &j.PipelineID)
 	return j, err
@@ -256,13 +264,13 @@ func jobList(ctx context.Context, session *gocql.Session, params driver.JobListP
 		}
 	}
 	iter := session.Query(`SELECT id,queue,kind,args,state,priority,run_at,created_at,
-		attempted_at,lease_expires_at,finalized_at,attempt_num,max_retry,timeout_ms,
+		attempted_at,started_at,lease_expires_at,finalized_at,attempt_num,max_retry,timeout_ms,
 		unique_key,worker_id,tags,errors_json,version,pipeline_id FROM goncordia_jobs`).WithContext(ctx).Iter()
 	var rows []driver.JobRow
 	for {
 		var j cassandraJob
 		if !iter.Scan(&j.ID, &j.Queue, &j.Kind, &j.Args, &j.State, &j.Priority,
-			&j.RunAt, &j.CreatedAt, &j.AttemptedAt, &j.LeaseExpiresAt, &j.FinalizedAt,
+			&j.RunAt, &j.CreatedAt, &j.AttemptedAt, &j.StartedAt, &j.LeaseExpiresAt, &j.FinalizedAt,
 			&j.AttemptNum, &j.MaxRetry, &j.TimeoutMs,
 			&j.UniqueKey, &j.WorkerID, &j.Tags, &j.ErrorsJSON, &j.Version, &j.PipelineID) {
 			break
@@ -439,8 +447,8 @@ func jobFetchBatch(ctx context.Context, session *gocql.Session, clk clock.Clock,
 	// Query the avail lookup table for candidate jobs.
 	iter := session.Query(
 		`SELECT id, run_at, priority FROM goncordia_jobs_avail
-		 WHERE queue = ? AND run_at <= ?`,
-		params.Queue, now,
+		 WHERE queue = ? AND run_at <= ? LIMIT ?`,
+		params.Queue, now, min(max(params.Limit*16, 64), 1024),
 	).WithContext(ctx).Iter()
 
 	type candidate struct {
@@ -494,9 +502,9 @@ func jobFetchBatch(ctx context.Context, session *gocql.Session, clk clock.Clock,
 		// Atomically claim with LWT.
 		newVersion := j.Version + 1
 		applied, lwtErr := session.Query(
-			`UPDATE goncordia_jobs SET state=?, worker_id=?, attempted_at=?, lease_expires_at=?, attempt_num=?, version=?
+			`UPDATE goncordia_jobs SET state=?, worker_id=?, attempted_at=?, started_at=?, lease_expires_at=?, attempt_num=?, version=?
 			 WHERE id=? IF state IN (?,?) AND version=?`,
-			string(driver.JobStateRunning), params.WorkerID, now, leaseExpiresAt, j.AttemptNum+1, newVersion,
+			string(driver.JobStateRunning), params.WorkerID, now, nil, leaseExpiresAt, j.AttemptNum+1, newVersion,
 			c.id, string(driver.JobStateAvailable), string(driver.JobStateScheduled), j.Version,
 		).WithContext(ctx).MapScanCAS(map[string]interface{}{})
 		if lwtErr != nil {
@@ -519,6 +527,7 @@ func jobFetchBatch(ctx context.Context, session *gocql.Session, clk clock.Clock,
 		j.State = string(driver.JobStateRunning)
 		j.WorkerID = params.WorkerID
 		j.AttemptedAt = now
+		j.StartedAt = time.Time{}
 		j.LeaseExpiresAt = leaseExpiresAt
 		j.AttemptNum++
 		j.Version = newVersion
@@ -627,6 +636,14 @@ func jobHeartbeat(ctx context.Context, session *gocql.Session, params driver.Job
 	return true, nil
 }
 
+func jobMarkStarted(ctx context.Context, session *gocql.Session, params driver.JobMarkStartedParams) (bool, error) {
+	applied, err := session.Query(
+		`UPDATE goncordia_jobs SET started_at=? WHERE id=? IF state=? AND worker_id=? AND attempt_num=?`,
+		params.At.UTC(), params.ID, string(driver.JobStateRunning), params.WorkerID, params.Attempt,
+	).WithContext(ctx).MapScanCAS(map[string]interface{}{})
+	return applied, err
+}
+
 // ---- JobSetStateIfRunning ----
 
 func jobSetStateIfRunning(ctx context.Context, session *gocql.Session, clk clock.Clock, params driver.JobSetStateParams) error {
@@ -643,9 +660,9 @@ func jobSetStateIfRunning(ctx context.Context, session *gocql.Session, clk clock
 
 	if params.Yield {
 		applied, err := session.Query(
-			`UPDATE goncordia_jobs SET state=?, worker_id='', attempted_at=?, lease_expires_at=?, attempt_num=attempt_num-1, version=version+1
+			`UPDATE goncordia_jobs SET state=?, worker_id='', attempted_at=?, started_at=?, lease_expires_at=?, attempt_num=attempt_num-1, version=version+1
 			 WHERE id=? IF state=? AND version=?`,
-			string(driver.JobStateAvailable), time.Time{}, time.Time{}, params.ID, string(driver.JobStateRunning), j.Version,
+			string(driver.JobStateAvailable), time.Time{}, time.Time{}, time.Time{}, params.ID, string(driver.JobStateRunning), j.Version,
 		).WithContext(ctx).MapScanCAS(map[string]interface{}{})
 		if err != nil {
 			return err

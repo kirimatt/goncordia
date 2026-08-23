@@ -46,6 +46,10 @@ type ClientConfig struct {
 	Now func() time.Time
 	// Observer instruments enqueue storage operations.
 	Observer ClientObserver
+	// Admission optionally rejects new work before storage access. Portable
+	// queue-depth admission is advisory because the check and insert are not one
+	// atomic backend operation.
+	Admission AdmissionController
 }
 
 // InsertRequest allows each item in a batch to have independent options.
@@ -70,6 +74,9 @@ func NewClient[TTx any](d driver.Driver[TTx], cfg ClientConfig) *Client[TTx] {
 func (c *Client[TTx]) Enqueue(ctx context.Context, args core.JobArgs, opts *core.InsertOpts) (*driver.JobInsertResult, error) {
 	params, err := c.buildInsertParams(args, opts)
 	if err != nil {
+		return nil, err
+	}
+	if err := c.admit(ctx, []driver.JobInsertParams{params}, false); err != nil {
 		return nil, err
 	}
 	ctx, finish := c.startEnqueue(ctx, []driver.JobInsertParams{params}, false)
@@ -98,6 +105,9 @@ func (c *Client[TTx]) EnqueueTx(ctx context.Context, tx TTx, args core.JobArgs, 
 	if err != nil {
 		return nil, err
 	}
+	if err := c.admit(ctx, []driver.JobInsertParams{params}, true); err != nil {
+		return nil, err
+	}
 	etx := c.driver.UnwrapTx(tx)
 	ctx, finish := c.startEnqueue(ctx, []driver.JobInsertParams{params}, true)
 	results, err := etx.JobInsertMany(ctx, []driver.JobInsertParams{params})
@@ -124,6 +134,9 @@ func (c *Client[TTx]) EnqueueBatch(ctx context.Context, requests []InsertRequest
 		}
 		params = append(params, p)
 	}
+	if err := c.admit(ctx, params, false); err != nil {
+		return nil, err
+	}
 	ctx, finish := c.startEnqueue(ctx, params, false)
 	results, err := c.driver.Executor().JobInsertMany(ctx, params)
 	finish(results, err)
@@ -143,6 +156,9 @@ func (c *Client[TTx]) EnqueueBatchTx(ctx context.Context, tx TTx, requests []Ins
 		}
 		params = append(params, p)
 	}
+	if err := c.admit(ctx, params, true); err != nil {
+		return nil, err
+	}
 	ctx, finish := c.startEnqueue(ctx, params, true)
 	results, err := c.driver.UnwrapTx(tx).JobInsertMany(ctx, params)
 	finish(results, err)
@@ -158,6 +174,9 @@ func (c *Client[TTx]) EnqueueMany(ctx context.Context, args []core.JobArgs, opts
 			return nil, err
 		}
 		params = append(params, p)
+	}
+	if err := c.admit(ctx, params, false); err != nil {
+		return nil, err
 	}
 	ctx, finish := c.startEnqueue(ctx, params, false)
 	results, err := c.driver.Executor().JobInsertMany(ctx, params)
@@ -178,11 +197,24 @@ func (c *Client[TTx]) EnqueueManyTx(ctx context.Context, tx TTx, args []core.Job
 		}
 		params = append(params, p)
 	}
+	if err := c.admit(ctx, params, true); err != nil {
+		return nil, err
+	}
 	etx := c.driver.UnwrapTx(tx)
 	ctx, finish := c.startEnqueue(ctx, params, true)
 	results, err := etx.JobInsertMany(ctx, params)
 	finish(results, err)
 	return results, err
+}
+
+func (c *Client[TTx]) admit(ctx context.Context, params []driver.JobInsertParams, transactional bool) error {
+	if c.config.Admission == nil || len(params) == 0 {
+		return nil
+	}
+	if err := c.config.Admission.Admit(ctx, AdmissionRequest{Jobs: params, Transactional: transactional}); err != nil {
+		return fmt.Errorf("enqueue admission: %w", err)
+	}
+	return nil
 }
 
 func (c *Client[TTx]) startEnqueue(ctx context.Context, params []driver.JobInsertParams, transactional bool) (context.Context, func([]driver.JobInsertResult, error)) {

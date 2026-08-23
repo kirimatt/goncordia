@@ -90,7 +90,7 @@ tx.Commit(ctx)  // job and order appear atomically
 Requires Go 1.25 or newer.
 
 ```bash
-go get github.com/kirimatt/goncordia@v0.18.0
+go get github.com/kirimatt/goncordia@v0.19.0
 ```
 
 Pick a driver:
@@ -453,10 +453,14 @@ goncordia.WorkerConfig{
 		"critical": {Weight: 4, Concurrency: 12},
 		"default": {
 			Weight: 1,
+			KeyConcurrency: []goncordia.KeyConcurrencyLimit{
+				{Key: goncordia.RateLimitKeyTag, TagPrefix: "tenant:", Limit: 2},
+			},
 			RateLimits: []goncordia.QueueRateLimit{
 				{Limit: 10, Period: time.Second, Burst: 2},
-				{Limit: 300, Period: time.Minute, Burst: 10},
+				{Limit: 300, Period: time.Minute, Burst: 10, Key: goncordia.RateLimitKeyKind},
 				{Limit: 5_000, Period: 24 * time.Hour, Scope: goncordia.RateLimitScopeGlobal},
+				{Limit: 10_000, Period: 24 * time.Hour, Mode: goncordia.RateLimitModeFixedWindow},
 			},
 		},
 	},
@@ -472,6 +476,8 @@ goncordia.WorkerConfig{
 	DistributedPipelines: true,                        // optional cross-process PipelineID lock
 	PipelineLeaseDuration: 30 * time.Second,
 	RateLimitPollInterval: time.Second,                 // maximum global-permit retry interval
+	RequireLifecyclePersistence: true,
+	RequireStrictOrdering: true,
     Clock:           clock.NewManual(time.Now()),     // omit in production; inject for tests
     ErrorHandler:    func(err error) { logger.Error("worker", "err", err) },
 }
@@ -483,11 +489,15 @@ core.RegisterWorker(registry, worker, core.WorkerOpts{
 ```
 
 Running claims are fenced by worker ID and attempt number. `attempted_at` remains
-the immutable attempt start; active and waiting claims renew `lease_expires_at`,
+the immutable claim time and `started_at` records handler entry; active and waiting claims renew `lease_expires_at`,
 so rescue does not duplicate healthy long-running work. `Shutdown(ctx)` stops
 new claims, keeps active heartbeats alive, and returns `ctx.Err()` if the drain
 does not finish. Cancelling the pool context yields an interrupted claim without
 consuming an attempt.
+
+Create the pool with `NewWorkerPoolChecked` when configuration errors must be
+reported before startup. The source-compatible `NewWorkerPool` reports the same
+error from `Start`.
 
 `QueuePolicy.RateLimits` are combined: a handler starts only after every rule
 has granted a permit. `Limit` and `Period` express the sustained rate, while
@@ -495,20 +505,53 @@ has granted a permit. `Limit` and `Period` express the sustained rate, while
 are ordinary Go durations, so second, minute, hour, and day limits use
 `time.Second`, `time.Minute`, `time.Hour`, and `24*time.Hour` respectively.
 
+Set `Key` to `RateLimitKeyKind`, `RateLimitKeyPipeline`, or `RateLimitKeyTag`
+for independent budgets. Tag policies select the first lexical tag matching
+`TagPrefix`; missing tags share an explicit bucket. `KeyConcurrency` applies
+the same dimensions to local execution concurrency.
+
+Smooth rules use GCRA. Set `Mode: RateLimitModeFixedWindow` for counters that
+reset on UTC-aligned `Period` boundaries; fixed windows ignore `Burst`.
+
 Local rules coordinate one `WorkerPool`. Set `Scope: RateLimitScopeGlobal` to
 coordinate all pools that share the same backend, queue name, and rule. Global
-permits use bounded ownership-safe leader leases and require no extra migration.
+permits use an O(1) compare-and-swap cursor and return an exact retry time.
 Waiting jobs retain and heartbeat their claims, consume at most one execution
 slot per rate-limited queue, and yield without entering the handler during
 shutdown. The deprecated `RateLimit`/`RatePeriod` fields remain compatible and
 behave as a local rule whose burst equals its limit.
 
-ClickHouse leader election is best-effort under concurrent inserts, so global
-rate limits on ClickHouse inherit that limitation. Use a local rule or a backend
-with atomic leader leases when exceeding the global limit is unacceptable.
+ClickHouse is rejected for global rate limits and distributed pipelines because
+it cannot provide the required linearizable CAS/lease guarantees.
 
-Across all built-in drivers, due jobs are selected by `priority DESC`, then
-`run_at ASC`, `created_at ASC`, and `id ASC`.
+Policies can be replaced while a pool is running:
+
+```go
+err := pool.UpdateQueuePolicy("default", goncordia.QueuePolicy{
+    RateLimits: []goncordia.QueueRateLimit{{Limit: 20, Period: time.Second}},
+})
+```
+
+The update is atomic for future starts and wakes existing rate-limit waiters.
+
+SQL, MongoDB, memory, and ClickHouse apply `priority DESC`, `run_at ASC`,
+`created_at ASC`, and `id ASC` before limiting. DynamoDB, Firestore, Cassandra,
+and Redis use a bounded due-candidate page because their native ready/due index
+cannot express the full two-dimensional order. Set `RequireStrictOrdering` to
+reject a non-strict driver instead of accepting that tradeoff.
+
+### Enqueue admission
+
+```go
+admission, err := goncordia.NewQueueDepthAdmission(d, map[string]int64{
+    "default": 50_000,
+})
+client := goncordia.NewClient(d, goncordia.ClientConfig{Admission: admission})
+```
+
+Rejected writes wrap `ErrAdmissionRejected` and expose a typed
+`*QueueFullError`. Queue-depth admission is portable backpressure, not an exact
+quota: the statistics read and subsequent insert are not atomic.
 
 ---
 
@@ -900,6 +943,10 @@ func TestPlaceOrder_EnqueuesConfirmationEmail(t *testing.T) {
 }
 ```
 
+Use `gontest.JobsE[T]` when payload corruption must fail the test explicitly.
+The legacy `Jobs[T]` helper remains available but intentionally discards its
+decode error for source compatibility.
+
 **Unit-test a worker function without a database or pool:**
 
 ```go
@@ -995,6 +1042,10 @@ The instrumentation produces:
 - **Histogram** `goncordia.job.queue_time` (seconds) — time from eligibility
   (`max(created_at, run_at)`) to handler start; scheduled waiting is excluded
 - **Histogram** `goncordia.job.schedule_lag` (seconds) — scheduled `run_at` to claim
+- **Histogram** `goncordia.job.claim_wait` (seconds) — claim to handler start
+- **Histogram** `goncordia.job.rate_limit_wait` (seconds) — local/global policy delay
+- **Counter** `goncordia.job.started` — handler starts by kind and queue
+- **Counter** `goncordia.job.finished` — selected durable outcomes
 - **Counter** `goncordia.job.heartbeat.count` — heartbeat outcomes (`ok`/`stale`/`error`)
 - **Counter** `goncordia.job.lease_rescued` — expired claims returned to queues
 - **Counter** `goncordia.job.count` — labelled by kind, queue, status (`ok` / `error`)

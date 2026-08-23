@@ -82,6 +82,10 @@ type Instrumentation struct {
 	clock        gonclock.Clock
 	enqueueTime  metric.Float64Histogram
 	scheduleLag  metric.Float64Histogram
+	claimWait    metric.Float64Histogram
+	rateWait     metric.Float64Histogram
+	jobStarted   metric.Int64Counter
+	jobFinished  metric.Int64Counter
 	heartbeats   metric.Int64Counter
 	leaseRescues metric.Int64Counter
 }
@@ -110,13 +114,23 @@ func NewInstrumentation(opts ...Option) *Instrumentation {
 		metric.WithDescription("Job enqueue storage duration in seconds"), metric.WithUnit("s"))
 	scheduleLag, _ := meter.Float64Histogram("goncordia.job.schedule_lag",
 		metric.WithDescription("Delay from run_at eligibility to worker claim in seconds"), metric.WithUnit("s"))
+	claimWait, _ := meter.Float64Histogram("goncordia.job.claim_wait",
+		metric.WithDescription("Delay from storage claim to handler start in seconds"), metric.WithUnit("s"))
+	rateWait, _ := meter.Float64Histogram("goncordia.job.rate_limit_wait",
+		metric.WithDescription("Delay imposed by an execution rate limit in seconds"), metric.WithUnit("s"))
+	jobStarted, _ := meter.Int64Counter("goncordia.job.started",
+		metric.WithDescription("Number of job handler executions started"))
+	jobFinished, _ := meter.Int64Counter("goncordia.job.finished",
+		metric.WithDescription("Number of job handler executions finished"))
 	heartbeats, _ := meter.Int64Counter("goncordia.job.heartbeat.count",
 		metric.WithDescription("Number of claim heartbeat attempts"))
 	leaseRescues, _ := meter.Int64Counter("goncordia.job.lease_rescued",
 		metric.WithDescription("Number of expired claims returned to the queue"))
 	return &Instrumentation{
 		tracer: tp.Tracer(instrName), clock: clk, enqueueTime: enqueueTime,
-		scheduleLag: scheduleLag, heartbeats: heartbeats, leaseRescues: leaseRescues,
+		scheduleLag: scheduleLag, claimWait: claimWait, rateWait: rateWait,
+		jobStarted: jobStarted, jobFinished: jobFinished,
+		heartbeats: heartbeats, leaseRescues: leaseRescues,
 	}
 }
 
@@ -191,6 +205,47 @@ func (i *Instrumentation) JobsRescued(ctx context.Context, event goncordia.Rescu
 	))
 }
 
+// JobStarted records the time a claimed job spent waiting for execution
+// capacity and execution rate permits.
+func (i *Instrumentation) JobStarted(ctx context.Context, event goncordia.JobStartedEvent) {
+	attrs := metric.WithAttributes(
+		attribute.String(attrKind, event.Job.Kind),
+		attribute.String(attrQueue, event.Job.Queue),
+	)
+	i.claimWait.Record(ctx, nonNegativeSeconds(event.ClaimWait), attrs)
+	i.jobStarted.Add(ctx, 1, attrs)
+}
+
+// JobFinished records the durable outcome selected by the worker. The storage
+// mutation may still reject a stale claim, which is exposed through Err.
+func (i *Instrumentation) JobFinished(ctx context.Context, event goncordia.JobFinishedEvent) {
+	status := string(event.State)
+	if event.Err != nil {
+		status = statusError
+	}
+	i.jobFinished.Add(ctx, 1, metric.WithAttributes(
+		attribute.String(attrKind, event.Job.Kind),
+		attribute.String(attrQueue, event.Job.Queue),
+		attribute.String(attrStatus, status),
+	))
+}
+
+// JobRateLimited records the exact delay returned by a local or distributed
+// rate limiter.
+func (i *Instrumentation) JobRateLimited(ctx context.Context, event goncordia.RateLimitWaitEvent) {
+	wait := event.RetryAt.Sub(i.clock.Now())
+	status := statusOK
+	if event.Err != nil {
+		status = statusError
+	}
+	i.rateWait.Record(ctx, nonNegativeSeconds(wait), metric.WithAttributes(
+		attribute.String(attrKind, event.Job.Kind),
+		attribute.String(attrQueue, event.Job.Queue),
+		attribute.String("goncordia.rate_limit.scope", event.Scope.String()),
+		attribute.String(attrStatus, status),
+	))
+}
+
 func nonNegativeSeconds(duration time.Duration) float64 {
 	if duration < 0 {
 		return 0
@@ -200,6 +255,7 @@ func nonNegativeSeconds(duration time.Duration) float64 {
 
 var _ goncordia.ClientObserver = (*Instrumentation)(nil)
 var _ goncordia.WorkerObserver = (*Instrumentation)(nil)
+var _ goncordia.WorkerLifecycleObserver = (*Instrumentation)(nil)
 
 // NewMiddleware returns a JobMiddleware that:
 //   - creates a span for each job execution named "goncordia.process"

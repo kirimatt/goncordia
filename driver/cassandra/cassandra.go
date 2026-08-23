@@ -161,6 +161,9 @@ func (d *Driver) Migrate(ctx context.Context) error {
 	if err := d.ensureLeaseColumn(ctx); err != nil {
 		return err
 	}
+	if err := d.ensureStartedColumn(ctx); err != nil {
+		return err
+	}
 	return d.backfillScheduledLookup(ctx)
 }
 
@@ -184,6 +187,30 @@ func (d *Driver) ensureLeaseColumn(ctx context.Context) error {
 		leaseColumnMigration, d.clk.Now(),
 	).WithContext(ctx).Exec(); err != nil {
 		return fmt.Errorf("cassandra migrate: record lease column: %w", err)
+	}
+	return nil
+}
+
+const startedColumnMigration = "20260823_job_started_column"
+
+func (d *Driver) ensureStartedColumn(ctx context.Context) error {
+	var appliedAt time.Time
+	if err := d.session.Query(
+		`SELECT applied_at FROM goncordia_schema_migrations WHERE version=?`, startedColumnMigration,
+	).WithContext(ctx).Scan(&appliedAt); err == nil {
+		return nil
+	} else if err != gocql.ErrNotFound {
+		return fmt.Errorf("cassandra migrate: check started column: %w", err)
+	}
+	if err := d.session.Query(`ALTER TABLE goncordia_jobs ADD started_at timestamp`).WithContext(ctx).Exec(); err != nil &&
+		!strings.Contains(strings.ToLower(err.Error()), "already exists") {
+		return fmt.Errorf("cassandra migrate: add started column: %w", err)
+	}
+	if err := d.session.Query(
+		`INSERT INTO goncordia_schema_migrations (version, applied_at) VALUES (?, ?)`,
+		startedColumnMigration, d.clk.Now(),
+	).WithContext(ctx).Exec(); err != nil {
+		return fmt.Errorf("cassandra migrate: record started column: %w", err)
 	}
 	return nil
 }
@@ -246,12 +273,17 @@ func (d *Driver) Name() string { return "cassandra" }
 
 func (d *Driver) Capabilities() driver.Capabilities {
 	return driver.Capabilities{
-		NativeTx:      false,
-		ListenNotify:  false,
-		ChangeStreams: false,
-		SkipLocked:    false,
-		UniqueJobs:    true, // via LWT INSERT IF NOT EXISTS
-		AdvisoryLocks: false,
+		NativeTx:            false,
+		ListenNotify:        false,
+		ChangeStreams:       false,
+		SkipLocked:          false,
+		UniqueJobs:          true, // via LWT INSERT IF NOT EXISTS
+		AdvisoryLocks:       false,
+		LinearizableLeases:  true,
+		LinearizableCAS:     true,
+		LifecycleTimestamps: true,
+		BoundedFetch:        true,
+		StrictFetchOrdering: false,
 	}
 }
 

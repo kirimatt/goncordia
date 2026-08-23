@@ -57,8 +57,8 @@ func TestStdlibSQLite_ConcurrentMigrateAndOwnership(t *testing.T) {
 	if err := db1.QueryRow(`SELECT COUNT(*) FROM goncordia_schema_migrations`).Scan(&migrations); err != nil {
 		t.Fatal(err)
 	}
-	if migrations != 6 {
-		t.Fatalf("migration count=%d, want 6", migrations)
+	if migrations != 7 {
+		t.Fatalf("migration count=%d, want 7", migrations)
 	}
 	if err := drivers[0].Close(); err != nil {
 		t.Fatal(err)
@@ -125,7 +125,7 @@ func TestStdlibSQLite_MigratesExistingSchema(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer rows.Close()
-	var found bool
+	found := make(map[string]bool)
 	for rows.Next() {
 		var cid int
 		var name, typ string
@@ -134,10 +134,13 @@ func TestStdlibSQLite_MigratesExistingSchema(t *testing.T) {
 		if err := rows.Scan(&cid, &name, &typ, &notNull, &defaultValue, &primaryKey); err != nil {
 			t.Fatal(err)
 		}
-		found = found || name == "pipeline_id"
+		found[name] = true
 	}
-	if !found {
+	if !found["pipeline_id"] {
 		t.Fatal("pipeline_id was not added to existing schema")
+	}
+	if !found["started_at"] {
+		t.Fatal("started_at was not added to existing schema")
 	}
 }
 

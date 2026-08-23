@@ -49,6 +49,9 @@ func (e *executor) JobRescueStuck(ctx context.Context, params driver.JobRescuePa
 func (e *executor) JobHeartbeat(ctx context.Context, params driver.JobHeartbeatParams) (bool, error) {
 	return jobHeartbeat(ctx, e.db, e.dialect, params)
 }
+func (e *executor) JobMarkStarted(ctx context.Context, params driver.JobMarkStartedParams) (bool, error) {
+	return jobMarkStarted(ctx, e.db, e.dialect, params)
+}
 func (e *executor) JobSetStateIfRunning(ctx context.Context, params driver.JobSetStateParams) error {
 	return jobSetStateIfRunning(ctx, e.db, e.dialect, e.clk, params)
 }
@@ -115,6 +118,9 @@ func (t *txExecutor) JobGetByID(ctx context.Context, id string) (*driver.JobRow,
 func (t *txExecutor) JobFetchBatch(ctx context.Context, params driver.FetchParams) ([]driver.JobRow, error) {
 	return jobFetchBatch(ctx, t.tx, t.dialect, t.clk, params)
 }
+func (t *txExecutor) JobMarkStarted(ctx context.Context, params driver.JobMarkStartedParams) (bool, error) {
+	return jobMarkStarted(ctx, t.tx, t.dialect, params)
+}
 func (t *txExecutor) JobSetStateIfRunning(ctx context.Context, params driver.JobSetStateParams) error {
 	return jobSetStateIfRunning(ctx, t.tx, t.dialect, t.clk, params)
 }
@@ -177,7 +183,7 @@ type querier interface {
 // --- static SQL ---
 
 const selectJobCols = `id, queue, kind, args, state, priority, run_at, created_at,
-    attempted_at, lease_expires_at, finalized_at, attempt_num, max_retry, timeout_ms,
+    attempted_at, started_at, lease_expires_at, finalized_at, attempt_num, max_retry, timeout_ms,
     unique_key, worker_id, tags, errors, pipeline_id`
 
 const insertJobCols = `queue, kind, args, state, priority, run_at, created_at,
@@ -186,7 +192,7 @@ const insertJobCols = `queue, kind, args, state, priority, run_at, created_at,
 const insertJobVals = `?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?`
 
 const sqlYield = `UPDATE goncordia_jobs
-SET state = 'available', attempted_at = NULL, lease_expires_at = NULL, worker_id = NULL, attempt_num = attempt_num - 1
+SET state = 'available', attempted_at = NULL, started_at = NULL, lease_expires_at = NULL, worker_id = NULL, attempt_num = attempt_num - 1
 WHERE id = ? AND state = 'running'
   AND (? = '' OR worker_id = ?)
   AND (? = 0 OR attempt_num = ?)`
@@ -456,7 +462,7 @@ func jobFetchBatch(ctx context.Context, q querier, d Dialect, clk clock.Clock, p
 
 func jobRescueStuck(ctx context.Context, q querier, d Dialect, params driver.JobRescueParams) (int64, error) {
 	query := `UPDATE goncordia_jobs
-SET state = 'available', attempted_at = NULL, lease_expires_at = NULL, worker_id = NULL
+SET state = 'available', attempted_at = NULL, started_at = NULL, lease_expires_at = NULL, worker_id = NULL
 WHERE queue = ? AND state = 'running'
   AND ((lease_expires_at IS NOT NULL AND lease_expires_at <= ?)
        OR (lease_expires_at IS NULL AND attempted_at <= ?))`
@@ -480,6 +486,17 @@ WHERE id = ? AND state = 'running' AND worker_id = ? AND attempt_num = ?`),
 	}
 	rows, err := result.RowsAffected()
 	return rows > 0, err
+}
+
+func jobMarkStarted(ctx context.Context, q querier, d Dialect, params driver.JobMarkStartedParams) (bool, error) {
+	result, err := q.ExecContext(ctx, d.q(`UPDATE goncordia_jobs SET started_at = ?
+WHERE id = ? AND state = 'running' AND worker_id = ? AND attempt_num = ?`),
+		params.At.UTC(), params.ID, params.WorkerID, params.Attempt)
+	if err != nil {
+		return false, err
+	}
+	rows, err := result.RowsAffected()
+	return rows == 1, err
 }
 
 func jobFetchSkipLocked(ctx context.Context, q querier, d Dialect, now time.Time, params driver.FetchParams) ([]driver.JobRow, error) {
@@ -554,7 +571,7 @@ func claimJobs(ctx context.Context, q querier, d Dialect, now time.Time, ids []i
 	}
 	if _, err := q.ExecContext(ctx,
 		d.q(`UPDATE goncordia_jobs
-SET state = ?, attempted_at = ?, lease_expires_at = ?, attempt_num = attempt_num + 1, worker_id = ?
+SET state = ?, attempted_at = ?, started_at = NULL, lease_expires_at = ?, attempt_num = attempt_num + 1, worker_id = ?
 WHERE id IN (`+inList+`)`),
 		updateArgs...,
 	); err != nil {
@@ -822,7 +839,7 @@ func scanJobRow(d Dialect, s rowScanner) (*driver.JobRow, error) {
 	)
 	err := s.Scan(
 		&idStr, &r.Queue, &r.Kind, &r.Args, &state, &r.Priority, &r.RunAt,
-		&r.CreatedAt, &r.AttemptedAt, &r.LeaseExpiresAt, &r.FinalizedAt, &r.AttemptNum,
+		&r.CreatedAt, &r.AttemptedAt, &r.StartedAt, &r.LeaseExpiresAt, &r.FinalizedAt, &r.AttemptNum,
 		&r.MaxRetry, &timeoutMS, &uniqueKey, &workerID, &tagsRaw, &errorsRaw, &r.PipelineID,
 	)
 	if err != nil {
