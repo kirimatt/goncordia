@@ -79,6 +79,6 @@ jobs:
           for module in "${modules[@]}"; do
             tag="$module/$MODULE_VERSION"
             if ! gh release view "$tag" >/dev/null 2>&1; then
-              gh release create "$tag" --verify-tag --title "$tag" --notes "Goncordia $module module $MODULE_VERSION. See the root v1.0.0 changelog and migration guide."
+              gh release create "$tag" --verify-tag --latest=false --title "$tag" --notes "Goncordia $module module $MODULE_VERSION. See the root v1.0.0 changelog and migration guide."
             fi
           done

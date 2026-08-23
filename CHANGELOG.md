@@ -16,7 +16,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Release engineering
 - Added an idempotent grouped release workflow for nested modules. A rerun may
-  reuse only tags that already point to the selected release commit.
+  reuse only tags that already point to the selected release commit, and nested
+  releases do not replace the root release as the repository `Latest` release.
 - Added committed dependency manifests for every independently versioned
   driver, integration, OpenTelemetry, `gontest`, and benchmark module release.
 
