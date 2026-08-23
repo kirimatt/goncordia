@@ -138,12 +138,14 @@ func (d *Driver) Name() string { return "mongodb" }
 
 func (d *Driver) Capabilities() driver.Capabilities {
 	return driver.Capabilities{
-		NativeTx:      true,
-		ChangeStreams: true,
-		UniqueJobs:    true,
-		SkipLocked:    false, // uses findOneAndUpdate instead
-		ListenNotify:  false,
-		AdvisoryLocks: false,
+		NativeTx:           true,
+		ChangeStreams:      true,
+		UniqueJobs:         true,
+		SkipLocked:         false, // uses findOneAndUpdate instead
+		ListenNotify:       false,
+		AdvisoryLocks:      false,
+		LinearizableLeases: true,
+		LinearizableCAS:    true,
 	}
 }
 

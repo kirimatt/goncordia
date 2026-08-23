@@ -2,6 +2,7 @@ package goncordia_test
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -153,5 +154,33 @@ func TestEnqueueRejectsTypedNilArgs(t *testing.T) {
 	var args *EmailArgs
 	if _, err := client.Enqueue(context.Background(), args, nil); err == nil {
 		t.Fatal("expected typed nil args to be rejected")
+	}
+}
+
+func TestQueueDepthAdmissionRejectsSingleAndBatch(t *testing.T) {
+	d := memory.New()
+	admission, err := goncordia.NewQueueDepthAdmission(d, map[string]int64{"default": 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := goncordia.NewClient(d, goncordia.ClientConfig{Admission: admission})
+	ctx := context.Background()
+	if _, err := client.Enqueue(ctx, EmailArgs{To: "first"}, nil); err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.EnqueueMany(ctx, []core.JobArgs{EmailArgs{To: "second"}, EmailArgs{To: "third"}}, nil)
+	if !errors.Is(err, goncordia.ErrAdmissionRejected) {
+		t.Fatalf("expected admission error, got %v", err)
+	}
+	var full *goncordia.QueueFullError
+	if !errors.As(err, &full) || full.Queue != "default" || full.Active != 1 || full.Incoming != 2 {
+		t.Fatalf("unexpected queue-full error: %+v", full)
+	}
+	stats, err := d.Executor().(driver.AdminExecutor).QueueStats(ctx, "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Total != 1 {
+		t.Fatalf("rejected batch partially inserted: %+v", stats)
 	}
 }

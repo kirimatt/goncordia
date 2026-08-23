@@ -64,11 +64,13 @@ func (d *Driver) Name() string { return "memory" }
 
 func (d *Driver) Capabilities() driver.Capabilities {
 	return driver.Capabilities{
-		NativeTx:      false,
-		SkipLocked:    true,
-		UniqueJobs:    true,
-		ListenNotify:  true,
-		AdvisoryLocks: false,
+		NativeTx:           false,
+		SkipLocked:         true,
+		UniqueJobs:         true,
+		ListenNotify:       true,
+		AdvisoryLocks:      false,
+		LinearizableLeases: true,
+		LinearizableCAS:    true,
 	}
 }
 

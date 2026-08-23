@@ -107,9 +107,16 @@ func (tr *Tracker) NewWorkerPool(registry *core.Registry, cfg goncordia.WorkerCo
 // (e.g. checking job state, errors, or worker ID).
 func (tr *Tracker) Driver() *memory.Driver { return tr.d }
 
-// Jobs returns all jobs of kind T currently in the store, regardless of state.
-// Args are deserialized into T; rows that fail to deserialize are silently skipped.
+// Jobs returns all decodable jobs of kind T currently in the store.
+// Deprecated: use JobsE to observe corrupt or incompatible payloads.
 func Jobs[T core.JobArgs](tr *Tracker) []*core.Job[T] {
+	jobs, _ := JobsE[T](tr)
+	return jobs
+}
+
+// JobsE returns all jobs of kind T and fails on the first payload that cannot
+// be decoded. Versioned envelopes are unwrapped before T is deserialized.
+func JobsE[T core.JobArgs](tr *Tracker) ([]*core.Job[T], error) {
 	var zero T
 	kind := zero.Kind()
 	var result []*core.Job[T]
@@ -117,22 +124,27 @@ func Jobs[T core.JobArgs](tr *Tracker) []*core.Job[T] {
 		if row.Kind != kind {
 			continue
 		}
+		version, payload, err := core.DecodePayload(row.Args)
+		if err != nil {
+			return nil, fmt.Errorf("gontest: decode payload for job %s: %w", row.ID, err)
+		}
 		var args T
-		if err := json.Unmarshal(row.Args, &args); err != nil {
-			continue
+		if err := json.Unmarshal(payload, &args); err != nil {
+			return nil, fmt.Errorf("gontest: unmarshal args for job %s: %w", row.ID, err)
 		}
 		result = append(result, &core.Job[T]{
-			ID:         row.ID,
-			Queue:      row.Queue,
-			Args:       args,
-			AttemptNum: row.AttemptNum,
-			MaxRetry:   row.MaxRetry,
-			CreatedAt:  row.CreatedAt,
-			WorkerID:   row.WorkerID,
-			Tags:       row.Tags,
+			ID:             row.ID,
+			Queue:          row.Queue,
+			Args:           args,
+			AttemptNum:     row.AttemptNum,
+			MaxRetry:       row.MaxRetry,
+			CreatedAt:      row.CreatedAt,
+			WorkerID:       row.WorkerID,
+			Tags:           row.Tags,
+			PayloadVersion: version,
 		})
 	}
-	return result
+	return result, nil
 }
 
 // RequireEnqueued asserts that exactly n jobs of kind T are in the store.
@@ -140,7 +152,10 @@ func Jobs[T core.JobArgs](tr *Tracker) []*core.Job[T] {
 // Calls t.Fatal if the count does not match.
 func RequireEnqueued[T core.JobArgs](t testing.TB, tr *Tracker, n int) []*core.Job[T] {
 	t.Helper()
-	jobs := Jobs[T](tr)
+	jobs, err := JobsE[T](tr)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(jobs) != n {
 		var zero T
 		t.Fatalf("gontest: expected %d enqueued %q job(s), got %d", n, zero.Kind(), len(jobs))

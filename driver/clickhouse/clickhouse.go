@@ -142,12 +142,14 @@ func (d *Driver) Name() string { return "clickhouse" }
 
 func (d *Driver) Capabilities() gdriver.Capabilities {
 	return gdriver.Capabilities{
-		NativeTx:      false,
-		ListenNotify:  false,
-		ChangeStreams: false,
-		SkipLocked:    false,
-		UniqueJobs:    true, // soft deduplication via ReplacingMergeTree
-		AdvisoryLocks: false,
+		NativeTx:           false,
+		ListenNotify:       false,
+		ChangeStreams:      false,
+		SkipLocked:         false,
+		UniqueJobs:         true, // soft deduplication via ReplacingMergeTree
+		AdvisoryLocks:      false,
+		LinearizableLeases: false,
+		LinearizableCAS:    false,
 	}
 }
 

@@ -77,10 +77,11 @@ type CronConfig struct {
 //	}, goncordia.CronConfig{})
 //	go cs.Start(ctx)
 type CronScheduler[TTx any] struct {
-	client  *Client[TTx]
-	entries []cronEntry
-	config  CronConfig
-	started atomic.Bool
+	client    *Client[TTx]
+	entries   []cronEntry
+	config    CronConfig
+	configErr error
+	started   atomic.Bool
 }
 
 type cronEntry struct {
@@ -88,9 +89,59 @@ type cronEntry struct {
 	lastRun time.Time
 }
 
-// NewCronScheduler creates a CronScheduler backed by d.
-// jobs is the list of periodic jobs to manage.
+// ValidateCronConfig checks durable job definitions and distributed lease
+// guarantees before the scheduler starts.
+func ValidateCronConfig[TTx any](d driver.Driver[TTx], jobs []PeriodicJob, cfg CronConfig) error {
+	if !d.Capabilities().LinearizableLeases {
+		return fmt.Errorf("cron scheduling requires linearizable leases, unsupported by driver %q", d.Name())
+	}
+	seenIDs := make(map[string]struct{})
+	for _, job := range jobs {
+		if job.Schedule == nil {
+			return fmt.Errorf("periodic job %q has no schedule", job.ID)
+		}
+		if job.ID == "" {
+			continue
+		}
+		if job.StartAt.IsZero() {
+			return fmt.Errorf("periodic job %q requires StartAt for durable scheduling", job.ID)
+		}
+		if job.CatchUp > CronSkipMissed {
+			return fmt.Errorf("periodic job %q has invalid catch-up policy %d", job.ID, job.CatchUp)
+		}
+		if job.MaxCatchUp < 0 {
+			return fmt.Errorf("periodic job %q has negative MaxCatchUp", job.ID)
+		}
+		if _, exists := seenIDs[job.ID]; exists {
+			return fmt.Errorf("duplicate periodic job ID %q", job.ID)
+		}
+		seenIDs[job.ID] = struct{}{}
+	}
+	if cfg.TickInterval < 0 || cfg.LeaderTTL < 0 || cfg.MaxCatchUp < 0 {
+		return fmt.Errorf("cron durations and MaxCatchUp must not be negative")
+	}
+	return nil
+}
+
+// NewCronScheduler creates a CronScheduler backed by d. Invalid configuration
+// is reported by Start; use NewCronSchedulerChecked for an immediate error.
 func NewCronScheduler[TTx any](d driver.Driver[TTx], jobs []PeriodicJob, cfg CronConfig) *CronScheduler[TTx] {
+	return newCronScheduler(d, jobs, cfg)
+}
+
+// NewCronSchedulerChecked validates the scheduler before returning it.
+func NewCronSchedulerChecked[TTx any](
+	d driver.Driver[TTx], jobs []PeriodicJob, cfg CronConfig,
+) (*CronScheduler[TTx], error) {
+	scheduler := newCronScheduler(d, jobs, cfg)
+	if scheduler.configErr != nil {
+		return nil, scheduler.configErr
+	}
+	return scheduler, nil
+}
+
+func newCronScheduler[TTx any](d driver.Driver[TTx], jobs []PeriodicJob, cfg CronConfig) *CronScheduler[TTx] {
+	configErr := ValidateCronConfig(d, jobs, cfg)
 	if cfg.TickInterval <= 0 {
 		cfg.TickInterval = time.Second
 	}
@@ -119,35 +170,17 @@ func NewCronScheduler[TTx any](d driver.Driver[TTx], jobs []PeriodicJob, cfg Cro
 	}
 
 	return &CronScheduler[TTx]{
-		client:  NewClient[TTx](d, ClientConfig{Clock: cfg.Clock}),
-		entries: entries,
-		config:  cfg,
+		client:    NewClient[TTx](d, ClientConfig{Clock: cfg.Clock}),
+		entries:   entries,
+		config:    cfg,
+		configErr: configErr,
 	}
 }
 
 // Start begins the scheduling loop. It blocks until ctx is cancelled.
 func (s *CronScheduler[TTx]) Start(ctx context.Context) error {
-	seenIDs := make(map[string]struct{})
-	for _, entry := range s.entries {
-		if entry.job.Schedule == nil {
-			return fmt.Errorf("periodic job %q has no schedule", entry.job.ID)
-		}
-		if entry.job.ID == "" {
-			continue
-		}
-		if entry.job.StartAt.IsZero() {
-			return fmt.Errorf("periodic job %q requires StartAt for durable scheduling", entry.job.ID)
-		}
-		if entry.job.CatchUp > CronSkipMissed {
-			return fmt.Errorf("periodic job %q has invalid catch-up policy %d", entry.job.ID, entry.job.CatchUp)
-		}
-		if entry.job.MaxCatchUp < 0 {
-			return fmt.Errorf("periodic job %q has negative MaxCatchUp", entry.job.ID)
-		}
-		if _, exists := seenIDs[entry.job.ID]; exists {
-			return fmt.Errorf("duplicate periodic job ID %q", entry.job.ID)
-		}
-		seenIDs[entry.job.ID] = struct{}{}
+	if s.configErr != nil {
+		return s.configErr
 	}
 	if !s.started.CompareAndSwap(false, true) {
 		return fmt.Errorf("cron scheduler already started")

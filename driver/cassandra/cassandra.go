@@ -246,12 +246,14 @@ func (d *Driver) Name() string { return "cassandra" }
 
 func (d *Driver) Capabilities() driver.Capabilities {
 	return driver.Capabilities{
-		NativeTx:      false,
-		ListenNotify:  false,
-		ChangeStreams: false,
-		SkipLocked:    false,
-		UniqueJobs:    true, // via LWT INSERT IF NOT EXISTS
-		AdvisoryLocks: false,
+		NativeTx:           false,
+		ListenNotify:       false,
+		ChangeStreams:      false,
+		SkipLocked:         false,
+		UniqueJobs:         true, // via LWT INSERT IF NOT EXISTS
+		AdvisoryLocks:      false,
+		LinearizableLeases: true,
+		LinearizableCAS:    true,
 	}
 }
 

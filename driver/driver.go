@@ -60,6 +60,12 @@ type Capabilities struct {
 	UniqueJobs bool
 	// AdvisoryLocks means the backend supports advisory locks for leader election.
 	AdvisoryLocks bool
+	// LinearizableLeases means concurrent lease acquisition has exactly one
+	// winner. Distributed pipelines require this guarantee.
+	LinearizableLeases bool
+	// LinearizableCAS means schedule-cursor compare-and-swap has exactly one
+	// winner. Strict global rate limits require this guarantee.
+	LinearizableCAS bool
 }
 
 // Executor executes job queue operations outside of a transaction.

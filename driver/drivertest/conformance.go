@@ -84,6 +84,25 @@ func Run(t *testing.T, exec driver.Executor) {
 	if err != nil || !cursorAgain.At.Equal(nextCursor) {
 		t.Fatalf("read advanced schedule cursor: cursor=%+v err=%v", cursorAgain, err)
 	}
+	rateKey := "rate-" + queue
+	firstPermit, err := driver.AcquireRateLimit(ctx, exec, driver.RateLimitAcquireParams{
+		Key: rateKey, Now: initialCursor, Limit: 2, Period: time.Minute, Burst: 1,
+	})
+	if err != nil || !firstPermit.Acquired {
+		t.Fatalf("acquire first rate permit: result=%+v err=%v", firstPermit, err)
+	}
+	blockedPermit, err := driver.AcquireRateLimit(ctx, exec, driver.RateLimitAcquireParams{
+		Key: rateKey, Now: initialCursor, Limit: 2, Period: time.Minute, Burst: 1,
+	})
+	if err != nil || blockedPermit.Acquired || !blockedPermit.RetryAt.Equal(initialCursor.Add(30*time.Second)) {
+		t.Fatalf("block second rate permit: result=%+v err=%v", blockedPermit, err)
+	}
+	secondPermit, err := driver.AcquireRateLimit(ctx, exec, driver.RateLimitAcquireParams{
+		Key: rateKey, Now: blockedPermit.RetryAt, Limit: 2, Period: time.Minute, Burst: 1,
+	})
+	if err != nil || !secondPermit.Acquired {
+		t.Fatalf("acquire rate permit after retry: result=%+v err=%v", secondPermit, err)
+	}
 
 	insert := driver.JobInsertParams{
 		Queue: queue, Kind: "conformance", Args: []byte(`{"value":1}`),
