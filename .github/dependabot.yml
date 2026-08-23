@@ -74,3 +74,18 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 3
+  - package-ecosystem: gomod
+    directory: /driver/gorm
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 3
+  - package-ecosystem: gomod
+    directory: /driver/bun
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 3
+  - package-ecosystem: gomod
+    directory: /bench
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 3
