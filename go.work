@@ -1,0 +1,18 @@
+go 1.25.0
+
+use (
+	.
+	./bench
+	./driver/bun
+	./driver/cassandra
+	./driver/clickhouse
+	./driver/dynamodb
+	./driver/firestore
+	./driver/gorm
+	./driver/mongodb
+	./driver/pgxv5
+	./driver/redis
+	./driver/stdlib
+	./gontest
+	./otel
+)

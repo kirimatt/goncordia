@@ -11,6 +11,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [v1.0.0] — 2026-08-23
+
+### Changed
+- The root engine is now a lightweight module with only `robfig/cron` as a
+  direct dependency. Production drivers, OpenTelemetry, `gontest`, and bench
+  tooling are independent nested Go modules.
+- Driver and integration import paths are unchanged, but consumers must pin the
+  selected submodule explicitly (for example,
+  `github.com/kirimatt/goncordia/driver/pgxv5@v1.0.0`).
+- Repository development uses `go.work`; CI and release validation enumerate
+  every module independently rather than relying on root `./...` to cross
+  module boundaries.
+
+### Compatibility
+- The runtime API is the stabilized v0.19 API; v1 does not rename job, client,
+  worker, clock, admission, or rate-limit types.
+- Existing v0 imports continue to compile. Applications upgrading to v1 must
+  update both the root requirement and every selected driver/integration module.
+- Database schema compatibility is unchanged from v0.19. Run each selected
+  driver's `Migrate` before starting workers.
+
+### Documentation
+- Added `MIGRATING_TO_V1.md` with module mapping, upgrade commands, rollout
+  order, and verification steps.
+
+---
+
 ## [v0.19.0] — 2026-08-23
 
 ### Added

@@ -90,42 +90,46 @@ tx.Commit(ctx)  // job and order appear atomically
 Requires Go 1.25 or newer.
 
 ```bash
-go get github.com/kirimatt/goncordia@v0.19.0
+go get github.com/kirimatt/goncordia@v1.0.0
 ```
 
 Pick a driver:
 
 ```bash
 # PostgreSQL via pgx v5
-go get github.com/kirimatt/goncordia/driver/pgxv5 github.com/jackc/pgx/v5
+go get github.com/kirimatt/goncordia/driver/pgxv5@v1.0.0
 
 # PostgreSQL / MySQL / SQLite via database/sql
-go get github.com/kirimatt/goncordia/driver/stdlib
+go get github.com/kirimatt/goncordia/driver/stdlib@v1.0.0
 
 # gorm adapter
-go get github.com/kirimatt/goncordia/driver/gorm gorm.io/gorm
+go get github.com/kirimatt/goncordia/driver/gorm@v1.0.0
 
 # bun adapter
-go get github.com/kirimatt/goncordia/driver/bun github.com/uptrace/bun
+go get github.com/kirimatt/goncordia/driver/bun@v1.0.0
 
 # MongoDB (replica set required)
-go get github.com/kirimatt/goncordia/driver/mongodb go.mongodb.org/mongo-driver/mongo
+go get github.com/kirimatt/goncordia/driver/mongodb@v1.0.0
 
 # Redis
-go get github.com/kirimatt/goncordia/driver/redis github.com/redis/go-redis/v9
+go get github.com/kirimatt/goncordia/driver/redis@v1.0.0
 
 # Cassandra / ScyllaDB
-go get github.com/kirimatt/goncordia/driver/cassandra github.com/gocql/gocql
+go get github.com/kirimatt/goncordia/driver/cassandra@v1.0.0
 
 # ClickHouse
-go get github.com/kirimatt/goncordia/driver/clickhouse github.com/ClickHouse/clickhouse-go/v2
+go get github.com/kirimatt/goncordia/driver/clickhouse@v1.0.0
 
 # Amazon DynamoDB
-go get github.com/kirimatt/goncordia/driver/dynamodb github.com/aws/aws-sdk-go-v2/service/dynamodb
+go get github.com/kirimatt/goncordia/driver/dynamodb@v1.0.0
 
 # Cloud Firestore
-go get github.com/kirimatt/goncordia/driver/firestore cloud.google.com/go/firestore
+go get github.com/kirimatt/goncordia/driver/firestore@v1.0.0
 ```
+
+The root v1 module intentionally does not download every database SDK. Driver,
+OpenTelemetry, and testing dependencies arrive only when their submodule is
+selected. See [Migrating to v1](MIGRATING_TO_V1.md) for upgrade commands.
 
 ---
 
@@ -924,7 +928,7 @@ Cassandra's high per-operation latency comes from Lightweight Transaction consen
 `gontest` makes it easy to test workers and enqueue assertions without a real database.
 
 ```bash
-go get github.com/kirimatt/goncordia/gontest
+go get github.com/kirimatt/goncordia/gontest@v1.0.0
 ```
 
 **Assert that business logic enqueues the right jobs:**
@@ -1002,7 +1006,7 @@ pool.Stop()
 ## Observability (OpenTelemetry)
 
 ```bash
-go get github.com/kirimatt/goncordia/otel
+go get github.com/kirimatt/goncordia/otel@v1.0.0
 ```
 
 ```go
