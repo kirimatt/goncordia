@@ -63,3 +63,27 @@ func TestRegistryTreatsMalformedPayloadAsPermanent(t *testing.T) {
 		t.Fatalf("malformed payload error=%v, want discard directive", err)
 	}
 }
+
+func FuzzDecodePayload(f *testing.F) {
+	f.Add([]byte(`{"name":"legacy"}`))
+	f.Add([]byte(`{"_goncordia_payload_version":2,"payload":{"full_name":"Ada"}}`))
+	f.Add([]byte(`{"_goncordia_payload_version":0,"payload":{}}`))
+	f.Add([]byte(`{`))
+	f.Fuzz(func(t *testing.T, input []byte) {
+		version, payload, err := core.DecodePayload(input)
+		if err != nil {
+			return
+		}
+		if version <= 0 || len(payload) == 0 || !json.Valid(payload) {
+			t.Fatalf("invalid successful decode: version=%d payload=%q", version, payload)
+		}
+		encoded, err := core.EncodePayload(payload, version)
+		if err != nil {
+			t.Fatal(err)
+		}
+		roundTripVersion, roundTripPayload, err := core.DecodePayload(encoded)
+		if err != nil || roundTripVersion != version || string(roundTripPayload) != string(payload) {
+			t.Fatalf("round trip: version=%d payload=%q err=%v", roundTripVersion, roundTripPayload, err)
+		}
+	})
+}

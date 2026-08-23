@@ -163,14 +163,17 @@ func (d *Driver) Name() string { return "dynamodb" }
 
 func (d *Driver) Capabilities() driver.Capabilities {
 	return driver.Capabilities{
-		NativeTx:           false,
-		ListenNotify:       false,
-		ChangeStreams:      false,
-		SkipLocked:         false,
-		UniqueJobs:         true, // via PutItem ConditionExpression attribute_not_exists
-		AdvisoryLocks:      false,
-		LinearizableLeases: true,
-		LinearizableCAS:    true,
+		NativeTx:            false,
+		ListenNotify:        false,
+		ChangeStreams:       false,
+		SkipLocked:          false,
+		UniqueJobs:          true, // via PutItem ConditionExpression attribute_not_exists
+		AdvisoryLocks:       false,
+		LinearizableLeases:  true,
+		LinearizableCAS:     true,
+		LifecycleTimestamps: true,
+		BoundedFetch:        true,
+		StrictFetchOrdering: false,
 	}
 }
 

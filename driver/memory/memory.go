@@ -64,13 +64,16 @@ func (d *Driver) Name() string { return "memory" }
 
 func (d *Driver) Capabilities() driver.Capabilities {
 	return driver.Capabilities{
-		NativeTx:           false,
-		SkipLocked:         true,
-		UniqueJobs:         true,
-		ListenNotify:       true,
-		AdvisoryLocks:      false,
-		LinearizableLeases: true,
-		LinearizableCAS:    true,
+		NativeTx:            false,
+		SkipLocked:          true,
+		UniqueJobs:          true,
+		ListenNotify:        true,
+		AdvisoryLocks:       false,
+		LinearizableLeases:  true,
+		LinearizableCAS:     true,
+		LifecycleTimestamps: true,
+		BoundedFetch:        true,
+		StrictFetchOrdering: true,
 	}
 }
 
@@ -244,6 +247,7 @@ func (e *executor) JobFetchBatch(_ context.Context, params driver.FetchParams) (
 		t := now
 		j.State = driver.JobStateRunning
 		j.AttemptedAt = &t
+		j.StartedAt = nil
 		if params.LeaseDuration > 0 {
 			expiresAt := now.Add(params.LeaseDuration)
 			j.LeaseExpiresAt = &expiresAt
@@ -256,6 +260,18 @@ func (e *executor) JobFetchBatch(_ context.Context, params driver.FetchParams) (
 		rows = append(rows, cp)
 	}
 	return rows, nil
+}
+
+func (e *executor) JobMarkStarted(_ context.Context, params driver.JobMarkStartedParams) (bool, error) {
+	e.d.mu.Lock()
+	defer e.d.mu.Unlock()
+	row := e.d.jobs[params.ID]
+	if row == nil || row.State != driver.JobStateRunning || row.WorkerID != params.WorkerID || row.AttemptNum != params.Attempt {
+		return false, nil
+	}
+	at := params.At.UTC()
+	row.StartedAt = &at
+	return true, nil
 }
 
 func (e *executor) JobRescueStuck(_ context.Context, params driver.JobRescueParams) (int64, error) {

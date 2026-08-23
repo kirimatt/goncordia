@@ -32,6 +32,7 @@ type jobDoc struct {
 	RunAt          time.Time  `firestore:"run_at"`
 	CreatedAt      time.Time  `firestore:"created_at"`
 	AttemptedAt    time.Time  `firestore:"attempted_at"`     // zero if not yet attempted
+	StartedAt      time.Time  `firestore:"started_at"`       // zero until handler start
 	LeaseExpiresAt time.Time  `firestore:"lease_expires_at"` // zero for legacy/unclaimed jobs
 	FinalizedAt    time.Time  `firestore:"finalized_at"`     // zero if not finalized
 	AttemptNum     int        `firestore:"attempt_num"`
@@ -98,6 +99,9 @@ func (e *executor) JobRescueStuck(ctx context.Context, params driver.JobRescuePa
 }
 func (e *executor) JobHeartbeat(ctx context.Context, params driver.JobHeartbeatParams) (bool, error) {
 	return jobHeartbeat(ctx, e.client, params)
+}
+func (e *executor) JobMarkStarted(ctx context.Context, params driver.JobMarkStartedParams) (bool, error) {
+	return jobMarkStarted(ctx, e.client, params)
 }
 func (e *executor) JobSetStateIfRunning(ctx context.Context, params driver.JobSetStateParams) error {
 	return jobSetStateIfRunning(ctx, e.client, e.clk, params)
@@ -490,11 +494,20 @@ func jobFetchBatch(ctx context.Context, client *firestore.Client, clk clock.Cloc
 	}
 
 	now := clk.Now()
+	candidateLimit := params.Limit * 16
+	if candidateLimit < 64 {
+		candidateLimit = 64
+	}
+	if candidateLimit > 1024 {
+		candidateLimit = 1024
+	}
 
 	snaps, err := client.Collection(colJobs).
 		Where("queue", "==", params.Queue).
 		Where("state", "in", []string{string(driver.JobStateAvailable), string(driver.JobStateScheduled)}).
 		Where("run_at", "<=", now).
+		OrderBy("run_at", firestore.Asc).
+		Limit(candidateLimit).
 		Documents(ctx).GetAll()
 	if err != nil {
 		return nil, fmt.Errorf("query available jobs: %w", err)
@@ -553,6 +566,7 @@ func jobFetchBatch(ctx context.Context, client *firestore.Client, clk clock.Cloc
 				{Path: "state", Value: string(driver.JobStateRunning)},
 				{Path: "worker_id", Value: params.WorkerID},
 				{Path: "attempted_at", Value: claimTime.UTC()},
+				{Path: "started_at", Value: time.Time{}},
 				{Path: "lease_expires_at", Value: leaseExpiresAt},
 				{Path: "attempt_num", Value: firestore.Increment(1)},
 				{Path: "version", Value: firestore.Increment(1)},
@@ -621,6 +635,7 @@ func jobRescueStuck(ctx context.Context, client *firestore.Client, params driver
 				{Path: "state", Value: string(driver.JobStateAvailable)},
 				{Path: "worker_id", Value: ""},
 				{Path: "attempted_at", Value: time.Time{}},
+				{Path: "started_at", Value: time.Time{}},
 				{Path: "lease_expires_at", Value: time.Time{}},
 				{Path: "version", Value: firestore.Increment(1)},
 			})
@@ -664,6 +679,27 @@ func jobHeartbeat(ctx context.Context, client *firestore.Client, params driver.J
 	return renewed && err == nil, err
 }
 
+func jobMarkStarted(ctx context.Context, client *firestore.Client, params driver.JobMarkStartedParams) (bool, error) {
+	jobRef := client.Collection(colJobs).Doc(params.ID)
+	marked := false
+	err := client.RunTransaction(ctx, func(ctx context.Context, tx *firestore.Transaction) error {
+		snap, err := tx.Get(jobRef)
+		if err != nil {
+			return err
+		}
+		var job jobDoc
+		if err := snap.DataTo(&job); err != nil {
+			return err
+		}
+		if job.State != string(driver.JobStateRunning) || job.WorkerID != params.WorkerID || job.AttemptNum != params.Attempt {
+			return nil
+		}
+		marked = true
+		return tx.Update(jobRef, []firestore.Update{{Path: "started_at", Value: params.At.UTC()}})
+	})
+	return marked && err == nil, err
+}
+
 // ---- JobSetStateIfRunning ----
 
 func jobSetStateIfRunning(ctx context.Context, client *firestore.Client, clk clock.Clock, params driver.JobSetStateParams) error {
@@ -691,6 +727,7 @@ func jobSetStateIfRunning(ctx context.Context, client *firestore.Client, clk clo
 				{Path: "state", Value: string(driver.JobStateAvailable)},
 				{Path: "worker_id", Value: ""},
 				{Path: "attempted_at", Value: time.Time{}},
+				{Path: "started_at", Value: time.Time{}},
 				{Path: "lease_expires_at", Value: time.Time{}},
 				{Path: "attempt_num", Value: firestore.Increment(-1)},
 				{Path: "version", Value: firestore.Increment(1)},
@@ -1021,6 +1058,10 @@ func docToRow(j jobDoc) *driver.JobRow {
 	if !j.AttemptedAt.IsZero() {
 		t := j.AttemptedAt
 		row.AttemptedAt = &t
+	}
+	if !j.StartedAt.IsZero() {
+		t := j.StartedAt
+		row.StartedAt = &t
 	}
 	if !j.LeaseExpiresAt.IsZero() {
 		t := j.LeaseExpiresAt

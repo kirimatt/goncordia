@@ -242,13 +242,16 @@ func (d *Driver) Name() string { return d.dialect.String() }
 
 func (d *Driver) Capabilities() driver.Capabilities {
 	return driver.Capabilities{
-		NativeTx:           true,
-		SkipLocked:         d.dialect.supportsSkipLocked(),
-		UniqueJobs:         true,
-		ListenNotify:       false, // stdlib doesn't support LISTEN/NOTIFY
-		AdvisoryLocks:      false,
-		LinearizableLeases: true,
-		LinearizableCAS:    true,
+		NativeTx:            true,
+		SkipLocked:          d.dialect.supportsSkipLocked(),
+		UniqueJobs:          true,
+		ListenNotify:        false, // stdlib doesn't support LISTEN/NOTIFY
+		AdvisoryLocks:       false,
+		LinearizableLeases:  true,
+		LinearizableCAS:     true,
+		LifecycleTimestamps: true,
+		BoundedFetch:        true,
+		StrictFetchOrdering: true,
 	}
 }
 

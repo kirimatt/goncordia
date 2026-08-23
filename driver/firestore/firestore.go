@@ -81,14 +81,17 @@ func (d *Driver) Name() string { return "firestore" }
 
 func (d *Driver) Capabilities() driver.Capabilities {
 	return driver.Capabilities{
-		NativeTx:           true, // *firestore.Transaction is an ACID transaction
-		UniqueJobs:         true, // atomic Create with conflict detection
-		ListenNotify:       false,
-		ChangeStreams:      false,
-		SkipLocked:         false,
-		AdvisoryLocks:      false,
-		LinearizableLeases: true,
-		LinearizableCAS:    true,
+		NativeTx:            true, // *firestore.Transaction is an ACID transaction
+		UniqueJobs:          true, // atomic Create with conflict detection
+		ListenNotify:        false,
+		ChangeStreams:       false,
+		SkipLocked:          false,
+		AdvisoryLocks:       false,
+		LinearizableLeases:  true,
+		LinearizableCAS:     true,
+		LifecycleTimestamps: true,
+		BoundedFetch:        true,
+		StrictFetchOrdering: false,
 	}
 }
 

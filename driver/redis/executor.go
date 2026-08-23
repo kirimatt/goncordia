@@ -53,6 +53,7 @@ type redisJob struct {
 	RunAtMs          millis            `json:"run_at_ms"`
 	CreatedAtMs      millis            `json:"created_at_ms"`
 	AttemptedAtMs    millis            `json:"attempted_at_ms,omitempty"`
+	StartedAtMs      millis            `json:"started_at_ms,omitempty"`
 	LeaseExpiresAtMs millis            `json:"lease_expires_at_ms,omitempty"`
 	FinalizedAtMs    millis            `json:"finalized_at_ms,omitempty"`
 	AttemptNum       int               `json:"attempt_num"`
@@ -106,6 +107,10 @@ func jobToRow(j redisJob) *driver.JobRow {
 	if j.AttemptedAtMs != 0 {
 		t := time.UnixMilli(int64(j.AttemptedAtMs)).UTC()
 		row.AttemptedAt = &t
+	}
+	if j.StartedAtMs != 0 {
+		t := time.UnixMilli(int64(j.StartedAtMs)).UTC()
+		row.StartedAt = &t
 	}
 	if j.LeaseExpiresAtMs != 0 {
 		t := time.UnixMilli(int64(j.LeaseExpiresAtMs)).UTC()
@@ -171,7 +176,7 @@ local now_ms = tonumber(ARGV[1])
 local prefix = ARGV[3]
 
 -- Promote due scheduled jobs to the available set.
-local due = redis.call('ZRANGEBYSCORE', sched, '-inf', tostring(now_ms))
+local due = redis.call('ZRANGEBYSCORE', sched, '-inf', tostring(now_ms), 'LIMIT', 0, 1024)
 for i = 1, #due do
     local id  = due[i]
     local raw = redis.call('GET', prefix .. id)
@@ -199,6 +204,7 @@ local ok, job = pcall(cjson.decode, raw)
 if not ok or type(job) ~= 'table' then return '' end
 job.state = 'running'
 job.attempted_at_ms = now_ms
+job.started_at_ms = nil
 local lease_ms = tonumber(ARGV[4]) or 0
 if lease_ms > 0 then
     job.lease_expires_at_ms = now_ms + lease_ms
@@ -236,6 +242,7 @@ else
 end
 job.state = 'available'
 job.attempted_at_ms = nil
+job.started_at_ms = nil
 job.lease_expires_at_ms = nil
 job.worker_id = nil
 if type(job.tags) == 'table' and next(job.tags) == nil then job.tags = cjson.empty_array end
@@ -261,6 +268,20 @@ if type(job.errors) == 'table' and next(job.errors) == nil then job.errors = cjs
 cjson.encode_number_precision(14)
 redis.call('SET', KEYS[1], cjson.encode(job))
 redis.call('HSET', KEYS[2], ARGV[4], ARGV[3])
+return 1
+`)
+
+var markStartedScript = redis.NewScript(`
+local raw = redis.call('GET', KEYS[1])
+if not raw then return 0 end
+local ok, job = pcall(cjson.decode, raw)
+if not ok or job.state ~= 'running' then return 0 end
+if job.worker_id ~= ARGV[1] or tonumber(job.attempt_num or 0) ~= tonumber(ARGV[2]) then return 0 end
+job.started_at_ms = tonumber(ARGV[3])
+if type(job.tags) == 'table' and next(job.tags) == nil then job.tags = cjson.empty_array end
+if type(job.errors) == 'table' and next(job.errors) == nil then job.errors = cjson.empty_array end
+cjson.encode_number_precision(14)
+redis.call('SET', KEYS[1], cjson.encode(job))
 return 1
 `)
 
@@ -322,6 +343,11 @@ func (e *executor) JobHeartbeat(ctx context.Context, params driver.JobHeartbeatP
 		params.WorkerID, params.Attempt, leaseExpiresAt.UTC().UnixMilli(), params.ID,
 	).Int64()
 	return renewed == 1, err
+}
+func (e *executor) JobMarkStarted(ctx context.Context, params driver.JobMarkStartedParams) (bool, error) {
+	marked, err := markStartedScript.Run(ctx, e.rdb, []string{jobKey(params.ID)},
+		params.WorkerID, params.Attempt, params.At.UTC().UnixMilli()).Int64()
+	return marked == 1, err
 }
 func (e *executor) JobSetStateIfRunning(ctx context.Context, params driver.JobSetStateParams) error {
 	return jobSetStateIfRunning(ctx, e.rdb, e.clk, params)
@@ -630,6 +656,7 @@ func jobSetStateIfRunning(ctx context.Context, rdb *redis.Client, clk clock.Cloc
 				job.State = string(driver.JobStateAvailable)
 				job.AttemptNum--
 				job.AttemptedAtMs = 0
+				job.StartedAtMs = 0
 				job.LeaseExpiresAtMs = 0
 				job.WorkerID = ""
 			} else {

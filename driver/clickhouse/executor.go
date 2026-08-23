@@ -48,6 +48,9 @@ func (e *executor) JobRescueStuck(ctx context.Context, params driver.JobRescuePa
 func (e *executor) JobHeartbeat(ctx context.Context, params driver.JobHeartbeatParams) (bool, error) {
 	return jobHeartbeat(ctx, e.conn, params)
 }
+func (e *executor) JobMarkStarted(ctx context.Context, params driver.JobMarkStartedParams) (bool, error) {
+	return jobMarkStarted(ctx, e.conn, params)
+}
 func (e *executor) JobSetStateIfRunning(ctx context.Context, params driver.JobSetStateParams) error {
 	return jobSetStateIfRunning(ctx, e.conn, e.clk, params)
 }
@@ -187,6 +190,7 @@ type chJob struct {
 	RunAt          time.Time
 	CreatedAt      time.Time
 	AttemptedAt    *time.Time
+	StartedAt      *time.Time
 	LeaseExpiresAt *time.Time
 	FinalizedAt    *time.Time
 	AttemptNum     int32
@@ -211,6 +215,7 @@ func (j chJob) toRow() *driver.JobRow {
 		RunAt:          j.RunAt.UTC(),
 		CreatedAt:      j.CreatedAt.UTC(),
 		AttemptedAt:    j.AttemptedAt,
+		StartedAt:      j.StartedAt,
 		LeaseExpiresAt: j.LeaseExpiresAt,
 		FinalizedAt:    j.FinalizedAt,
 		AttemptNum:     int(j.AttemptNum),
@@ -226,14 +231,14 @@ func (j chJob) toRow() *driver.JobRow {
 }
 
 const selectJobCols = `id, queue, kind, args, state, priority, run_at, created_at,
-	attempted_at, lease_expires_at, finalized_at, attempt_num, max_retry, timeout_ms,
+	attempted_at, started_at, lease_expires_at, finalized_at, attempt_num, max_retry, timeout_ms,
 	unique_key, worker_id, tags, errors_json, version, pipeline_id`
 
 func scanJob(row chdriver.Row) (chJob, error) {
 	var j chJob
 	err := row.Scan(
 		&j.ID, &j.Queue, &j.Kind, &j.Args, &j.State, &j.Priority,
-		&j.RunAt, &j.CreatedAt, &j.AttemptedAt, &j.LeaseExpiresAt, &j.FinalizedAt,
+		&j.RunAt, &j.CreatedAt, &j.AttemptedAt, &j.StartedAt, &j.LeaseExpiresAt, &j.FinalizedAt,
 		&j.AttemptNum, &j.MaxRetry, &j.TimeoutMs,
 		&j.UniqueKey, &j.WorkerID, &j.Tags, &j.ErrorsJSON, &j.Version, &j.PipelineID,
 	)
@@ -250,11 +255,11 @@ func insertJobRow(ctx context.Context, conn chdriver.Conn, j chJob) error {
 	return conn.Exec(ctx,
 		`INSERT INTO goncordia_jobs
 		(id,queue,kind,args,state,priority,run_at,created_at,
-		 attempted_at,lease_expires_at,finalized_at,attempt_num,max_retry,timeout_ms,
+		 attempted_at,started_at,lease_expires_at,finalized_at,attempt_num,max_retry,timeout_ms,
 		 unique_key,worker_id,tags,errors_json,version,pipeline_id)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		j.ID, j.Queue, j.Kind, j.Args, j.State, j.Priority,
-		j.RunAt, j.CreatedAt, j.AttemptedAt, j.LeaseExpiresAt, j.FinalizedAt,
+		j.RunAt, j.CreatedAt, j.AttemptedAt, j.StartedAt, j.LeaseExpiresAt, j.FinalizedAt,
 		j.AttemptNum, j.MaxRetry, j.TimeoutMs,
 		j.UniqueKey, j.WorkerID, j.Tags, j.ErrorsJSON, j.Version, j.PipelineID,
 	)
@@ -384,7 +389,7 @@ func jobList(ctx context.Context, conn chdriver.Conn, params driver.JobListParam
 		var j chJob
 		if err := rows.Scan(
 			&j.ID, &j.Queue, &j.Kind, &j.Args, &j.State, &j.Priority,
-			&j.RunAt, &j.CreatedAt, &j.AttemptedAt, &j.LeaseExpiresAt, &j.FinalizedAt,
+			&j.RunAt, &j.CreatedAt, &j.AttemptedAt, &j.StartedAt, &j.LeaseExpiresAt, &j.FinalizedAt,
 			&j.AttemptNum, &j.MaxRetry, &j.TimeoutMs,
 			&j.UniqueKey, &j.WorkerID, &j.Tags, &j.ErrorsJSON, &j.Version, &j.PipelineID,
 		); err != nil {
@@ -447,7 +452,7 @@ func jobFetchBatch(ctx context.Context, conn chdriver.Conn, clk clock.Clock, par
 		var j chJob
 		if err := rows.Scan(
 			&j.ID, &j.Queue, &j.Kind, &j.Args, &j.State, &j.Priority,
-			&j.RunAt, &j.CreatedAt, &j.AttemptedAt, &j.LeaseExpiresAt, &j.FinalizedAt,
+			&j.RunAt, &j.CreatedAt, &j.AttemptedAt, &j.StartedAt, &j.LeaseExpiresAt, &j.FinalizedAt,
 			&j.AttemptNum, &j.MaxRetry, &j.TimeoutMs,
 			&j.UniqueKey, &j.WorkerID, &j.Tags, &j.ErrorsJSON, &j.Version, &j.PipelineID,
 		); err != nil {
@@ -472,6 +477,7 @@ func jobFetchBatch(ctx context.Context, conn chdriver.Conn, clk clock.Clock, par
 		claimed.State = string(driver.JobStateRunning)
 		claimed.WorkerID = params.WorkerID
 		claimed.AttemptedAt = &now
+		claimed.StartedAt = nil
 		if params.LeaseDuration > 0 {
 			expires := now.Add(params.LeaseDuration)
 			claimed.LeaseExpiresAt = &expires
@@ -512,7 +518,7 @@ func jobFetchBatch(ctx context.Context, conn chdriver.Conn, clk clock.Clock, par
 		var j chJob
 		if err := confirmRows.Scan(
 			&j.ID, &j.Queue, &j.Kind, &j.Args, &j.State, &j.Priority,
-			&j.RunAt, &j.CreatedAt, &j.AttemptedAt, &j.LeaseExpiresAt, &j.FinalizedAt,
+			&j.RunAt, &j.CreatedAt, &j.AttemptedAt, &j.StartedAt, &j.LeaseExpiresAt, &j.FinalizedAt,
 			&j.AttemptNum, &j.MaxRetry, &j.TimeoutMs,
 			&j.UniqueKey, &j.WorkerID, &j.Tags, &j.ErrorsJSON, &j.Version, &j.PipelineID,
 		); err != nil {
@@ -539,7 +545,7 @@ func jobRescueStuck(ctx context.Context, conn chdriver.Conn, params driver.JobRe
 		var j chJob
 		if err := rows.Scan(
 			&j.ID, &j.Queue, &j.Kind, &j.Args, &j.State, &j.Priority,
-			&j.RunAt, &j.CreatedAt, &j.AttemptedAt, &j.LeaseExpiresAt, &j.FinalizedAt,
+			&j.RunAt, &j.CreatedAt, &j.AttemptedAt, &j.StartedAt, &j.LeaseExpiresAt, &j.FinalizedAt,
 			&j.AttemptNum, &j.MaxRetry, &j.TimeoutMs,
 			&j.UniqueKey, &j.WorkerID, &j.Tags, &j.ErrorsJSON, &j.Version, &j.PipelineID,
 		); err != nil {
@@ -589,6 +595,23 @@ func jobHeartbeat(ctx context.Context, conn chdriver.Conn, params driver.JobHear
 	return true, nil
 }
 
+func jobMarkStarted(ctx context.Context, conn chdriver.Conn, params driver.JobMarkStartedParams) (bool, error) {
+	job, err := queryJob(ctx, conn, params.ID)
+	if err != nil {
+		return false, err
+	}
+	if job.ID == "" || job.State != string(driver.JobStateRunning) || job.WorkerID != params.WorkerID || int(job.AttemptNum) != params.Attempt {
+		return false, nil
+	}
+	at := params.At.UTC()
+	job.StartedAt = &at
+	job.Version++
+	if err := insertJobRow(ctx, conn, job); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 // ---- JobSetStateIfRunning ----
 
 func jobSetStateIfRunning(ctx context.Context, conn chdriver.Conn, clk clock.Clock, params driver.JobSetStateParams) error {
@@ -608,6 +631,7 @@ func jobSetStateIfRunning(ctx context.Context, conn chdriver.Conn, clk clock.Clo
 		yielded.State = string(driver.JobStateAvailable)
 		yielded.AttemptNum = j.AttemptNum - 1
 		yielded.AttemptedAt = nil
+		yielded.StartedAt = nil
 		yielded.LeaseExpiresAt = nil
 		yielded.WorkerID = ""
 		yielded.Version = j.Version + 1

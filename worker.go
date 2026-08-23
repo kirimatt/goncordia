@@ -170,6 +170,12 @@ type WorkerConfig struct {
 	Middleware []JobMiddleware
 	// Observer receives claim, heartbeat, and rescue lifecycle events.
 	Observer WorkerObserver
+	// RequireLifecyclePersistence fails validation unless the driver persists
+	// fenced handler-start timestamps.
+	RequireLifecyclePersistence bool
+	// RequireStrictOrdering rejects drivers that can only prioritize within a
+	// bounded due-candidate page because of native index constraints.
+	RequireStrictOrdering bool
 	// ErrorHandler receives asynchronous fetch, rescue, and state-transition errors.
 	// Default: slog.Error.
 	ErrorHandler func(error)
@@ -199,7 +205,8 @@ type WorkerPool[TTx any] struct {
 	queueStateMu   sync.Mutex
 	queueStates    map[string]*queueRuntimeState
 	rateLimits     map[string][]normalizedRateLimit
-	rateGates      map[string]chan struct{}
+	rateGateMu     sync.Mutex
+	rateGates      map[string]*rateGate
 	fetchMu        sync.Mutex
 	pipelineMu     sync.Mutex
 	pipelineTails  map[string]chan struct{}
@@ -210,6 +217,11 @@ type WorkerPool[TTx any] struct {
 }
 
 type keySemaphore struct {
+	ch   chan struct{}
+	refs int
+}
+
+type rateGate struct {
 	ch   chan struct{}
 	refs int
 }
@@ -310,6 +322,12 @@ func ValidateWorkerConfig[TTx any](d driver.Driver[TTx], cfg WorkerConfig) error
 	if cfg.DistributedPipelines && !d.Capabilities().LinearizableLeases {
 		problems = append(problems, fmt.Sprintf("DistributedPipelines requires linearizable leases, unsupported by driver %q", d.Name()))
 	}
+	if cfg.RequireLifecyclePersistence && !d.Capabilities().LifecycleTimestamps {
+		problems = append(problems, fmt.Sprintf("RequireLifecyclePersistence is unsupported by driver %q", d.Name()))
+	}
+	if cfg.RequireStrictOrdering && !d.Capabilities().StrictFetchOrdering {
+		problems = append(problems, fmt.Sprintf("RequireStrictOrdering is unsupported by driver %q", d.Name()))
+	}
 	if len(problems) > 0 {
 		return fmt.Errorf("invalid worker config: %s", strings.Join(problems, "; "))
 	}
@@ -403,7 +421,7 @@ func newWorkerPool[TTx any](d driver.Driver[TTx], registry *core.Registry, cfg W
 	}
 	queueSchedule := make([]string, 0, len(cfg.Queues))
 	rateLimits := make(map[string][]normalizedRateLimit, len(cfg.Queues))
-	rateGates := make(map[string]chan struct{}, len(cfg.Queues))
+	rateGates := make(map[string]*rateGate)
 	for _, queue := range cfg.Queues {
 		policy := cfg.QueuePolicies[queue]
 		weight := policy.Weight
@@ -411,9 +429,6 @@ func newWorkerPool[TTx any](d driver.Driver[TTx], registry *core.Registry, cfg W
 			weight = 1
 		}
 		rateLimits[queue] = normalizeRateLimits(queue, policy)
-		if len(rateLimits[queue]) > 0 {
-			rateGates[queue] = make(chan struct{}, 1)
-		}
 		for range weight {
 			queueSchedule = append(queueSchedule, queue)
 		}
@@ -484,13 +499,6 @@ func (p *WorkerPool[TTx]) UpdateQueuePolicy(queue string, policy QueuePolicy) er
 	}
 	p.config.QueuePolicies = next
 	p.rateLimits[queue] = normalizeRateLimits(queue, policy)
-	if len(p.rateLimits[queue]) > 0 {
-		if p.rateGates[queue] == nil {
-			p.rateGates[queue] = make(chan struct{}, 1)
-		}
-	} else {
-		delete(p.rateGates, queue)
-	}
 	p.queueSchedule = p.queueSchedule[:0]
 	for _, configured := range p.config.Queues {
 		weight := p.config.QueuePolicies[configured].Weight
@@ -516,12 +524,6 @@ func (p *WorkerPool[TTx]) queueRateLimits(queue string) []normalizedRateLimit {
 	p.policyMu.RLock()
 	defer p.policyMu.RUnlock()
 	return append([]normalizedRateLimit(nil), p.rateLimits[queue]...)
-}
-
-func (p *WorkerPool[TTx]) queueRateGate(queue string) chan struct{} {
-	p.policyMu.RLock()
-	defer p.policyMu.RUnlock()
-	return p.rateGates[queue]
 }
 
 func (p *WorkerPool[TTx]) currentPolicyChange() <-chan struct{} {
@@ -820,7 +822,7 @@ func (p *WorkerPool[TTx]) fetchAndDispatch(ctx context.Context) {
 					return
 				}
 				defer releaseKeys()
-				releaseRateGate, rateGateAcquired := p.acquireRateGate(claimCtx, row.Queue)
+				releaseRateGate, rateGateAcquired := p.acquireRateGate(claimCtx, row)
 				if !rateGateAcquired {
 					p.setState(context.Background(), exec, fencedStateParams(row, driver.JobSetStateParams{Yield: true}))
 					return
@@ -854,6 +856,16 @@ func (p *WorkerPool[TTx]) fetchAndDispatch(ctx context.Context) {
 				// reserved every configured rate permit.
 				releaseRateGate()
 				startedAt := p.config.Clock.Now()
+				if marker, ok := exec.(driver.JobStartMarker); ok {
+					marked, err := marker.JobMarkStarted(claimCtx, driver.JobMarkStartedParams{
+						ID: row.ID, WorkerID: row.WorkerID, Attempt: row.AttemptNum, At: startedAt,
+					})
+					if err != nil {
+						p.reportError(fmt.Errorf("persist handler start for job %s: %w", row.ID, err))
+					} else if marked {
+						row.StartedAt = &startedAt
+					}
+				}
 				if observer, ok := p.config.Observer.(WorkerLifecycleObserver); ok {
 					claimWait := time.Duration(0)
 					if row.AttemptedAt != nil {
@@ -906,18 +918,43 @@ func (p *WorkerPool[TTx]) queueDone(queue string) {
 	}
 }
 
-func (p *WorkerPool[TTx]) acquireRateGate(ctx context.Context, queue string) (func(), bool) {
-	gate := p.queueRateGate(queue)
-	if gate == nil {
+func (p *WorkerPool[TTx]) acquireRateGate(ctx context.Context, row driver.JobRow) (func(), bool) {
+	rules := p.queueRateLimits(row.Queue)
+	if len(rules) == 0 {
 		return func() {}, true
 	}
+	var signature strings.Builder
+	for _, rule := range rules {
+		signature.WriteString(rateRuleKey(rule, row))
+		signature.WriteByte(0)
+	}
+	digest := sha256.Sum256([]byte(signature.String()))
+	key := hex.EncodeToString(digest[:16])
+	p.rateGateMu.Lock()
+	gate := p.rateGates[key]
+	if gate == nil {
+		gate = &rateGate{ch: make(chan struct{}, 1)}
+		p.rateGates[key] = gate
+	}
+	gate.refs++
+	p.rateGateMu.Unlock()
+	dropRef := func() {
+		p.rateGateMu.Lock()
+		gate.refs--
+		if gate.refs == 0 {
+			delete(p.rateGates, key)
+		}
+		p.rateGateMu.Unlock()
+	}
 	select {
-	case gate <- struct{}{}:
+	case gate.ch <- struct{}{}:
 		var once sync.Once
-		return func() { once.Do(func() { <-gate }) }, true
+		return func() { once.Do(func() { <-gate.ch; dropRef() }) }, true
 	case <-ctx.Done():
+		dropRef()
 		return nil, false
 	case <-p.shutdownCh:
+		dropRef()
 		return nil, false
 	}
 }

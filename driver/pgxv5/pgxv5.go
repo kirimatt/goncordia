@@ -122,13 +122,16 @@ func (d *Driver) Name() string { return "postgres" }
 
 func (d *Driver) Capabilities() driver.Capabilities {
 	return driver.Capabilities{
-		NativeTx:           true,
-		ListenNotify:       true,
-		SkipLocked:         true,
-		UniqueJobs:         true,
-		AdvisoryLocks:      false,
-		LinearizableLeases: true,
-		LinearizableCAS:    true,
+		NativeTx:            true,
+		ListenNotify:        true,
+		SkipLocked:          true,
+		UniqueJobs:          true,
+		AdvisoryLocks:       false,
+		LinearizableLeases:  true,
+		LinearizableCAS:     true,
+		LifecycleTimestamps: true,
+		BoundedFetch:        true,
+		StrictFetchOrdering: true,
 	}
 }
 

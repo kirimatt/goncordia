@@ -66,6 +66,14 @@ type Capabilities struct {
 	// LinearizableCAS means schedule-cursor compare-and-swap has exactly one
 	// winner. Strict global rate limits require this guarantee.
 	LinearizableCAS bool
+	// LifecycleTimestamps means the executor persists StartedAt with fencing.
+	LifecycleTimestamps bool
+	// BoundedFetch means one execution fetch examines a backend-bounded
+	// candidate set rather than reading the entire due backlog.
+	BoundedFetch bool
+	// StrictFetchOrdering means the backend can apply the full portable order
+	// before limiting candidates.
+	StrictFetchOrdering bool
 }
 
 // Executor executes job queue operations outside of a transaction.
@@ -94,6 +102,12 @@ type StuckJobRescuer interface {
 // long-running jobs from being rescued as abandoned.
 type JobHeartbeater interface {
 	JobHeartbeat(ctx context.Context, params JobHeartbeatParams) (renewed bool, err error)
+}
+
+// JobStartMarker is an optional executor capability that persists the instant
+// a claimed job begins handler execution.
+type JobStartMarker interface {
+	JobMarkStarted(context.Context, JobMarkStartedParams) (marked bool, err error)
 }
 
 // AdminExecutor is an optional executor capability used by the admin HTTP API
@@ -183,6 +197,14 @@ type JobHeartbeatParams struct {
 	Attempt        int
 	At             time.Time
 	LeaseExpiresAt time.Time
+}
+
+// JobMarkStartedParams fences an execution-start timestamp to one claim.
+type JobMarkStartedParams struct {
+	ID       string
+	WorkerID string
+	Attempt  int
+	At       time.Time
 }
 
 // JobSetStateParams transitions a running job to a new state.
@@ -292,6 +314,7 @@ type JobRow struct {
 	RunAt       time.Time
 	CreatedAt   time.Time
 	AttemptedAt *time.Time // immutable start time of the current attempt
+	StartedAt   *time.Time // handler start for the current attempt
 	// LeaseExpiresAt is the renewable deadline after which the claim may be rescued.
 	LeaseExpiresAt *time.Time
 	FinalizedAt    *time.Time
