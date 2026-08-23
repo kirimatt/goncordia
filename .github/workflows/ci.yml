@@ -4,8 +4,6 @@ env:
   ACTIONLINT_VERSION: v1.7.7
   STATICCHECK_VERSION: v0.7.0
   GOVULNCHECK_VERSION: v1.7.0
-  # Root-v1 bootstrap: nested modules are validated in their release follow-up
-  # after the root v1 tag becomes resolvable from the public module proxy.
   GOWORK: 'off'
 
 on:
@@ -23,16 +21,17 @@ jobs:
         with:
           go-version: '1.26.x'
           cache: true
+          cache-dependency-path: '**/go.sum'
       - name: Format check
         run: test -z "$(gofmt -l .)"
       - name: Workflow lint
         run: go run "github.com/rhysd/actionlint/cmd/actionlint@${ACTIONLINT_VERSION}"
       - name: Module files are tidy
-        run: go mod tidy -diff
+        run: ./scripts/for-each-module.sh go mod tidy -diff
       - name: Vet
-        run: go vet ./...
+        run: ./scripts/for-each-module.sh go vet ./...
       - name: Staticcheck
-        run: go run "honnef.co/go/tools/cmd/staticcheck@${STATICCHECK_VERSION}" ./...
+        run: ./scripts/for-each-module.sh go run "honnef.co/go/tools/cmd/staticcheck@${STATICCHECK_VERSION}" ./...
       - name: Release metadata
         run: ./scripts/check-release.sh
       - name: Core coverage threshold
@@ -55,10 +54,11 @@ jobs:
         with:
           go-version: ${{ matrix.go }}
           cache: true
+          cache-dependency-path: '**/go.sum'
       - name: Build
-        run: go build ./...
+        run: ./scripts/for-each-module.sh go build ./...
       - name: Test
-        run: go test ./... -timeout 15m -race -count=1
+        run: ./scripts/for-each-module.sh go test ./... -timeout 15m -race -count=1
 
   vulnerability-scan:
     runs-on: ubuntu-latest
@@ -68,5 +68,6 @@ jobs:
         with:
           go-version: '1.26.x'
           cache: true
+          cache-dependency-path: '**/go.sum'
       - name: Govulncheck
-        run: go run "golang.org/x/vuln/cmd/govulncheck@${GOVULNCHECK_VERSION}" ./...
+        run: ./scripts/for-each-module.sh go run "golang.org/x/vuln/cmd/govulncheck@${GOVULNCHECK_VERSION}" ./...
