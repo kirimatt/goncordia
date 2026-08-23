@@ -24,3 +24,53 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 4
+  - package-ecosystem: gomod
+    directory: /driver/stdlib
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 3
+  - package-ecosystem: gomod
+    directory: /driver/pgxv5
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 3
+  - package-ecosystem: gomod
+    directory: /driver/mongodb
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 3
+  - package-ecosystem: gomod
+    directory: /driver/redis
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 3
+  - package-ecosystem: gomod
+    directory: /driver/cassandra
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 3
+  - package-ecosystem: gomod
+    directory: /driver/clickhouse
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 3
+  - package-ecosystem: gomod
+    directory: /driver/dynamodb
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 3
+  - package-ecosystem: gomod
+    directory: /driver/firestore
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 3
+  - package-ecosystem: gomod
+    directory: /otel
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 3
+  - package-ecosystem: gomod
+    directory: /gontest
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 3

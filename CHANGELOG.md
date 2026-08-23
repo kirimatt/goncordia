@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- CI, static analysis, race tests, and vulnerability scanning now validate the
+  root module and every released driver/tooling module with workspace mode
+  disabled, matching the dependency graph downloaded by consumers.
+
+### Release engineering
+- Added an idempotent grouped release workflow for nested modules. A rerun may
+  reuse only tags that already point to the selected release commit.
+- Added committed dependency manifests for the first independently versioned
+  driver, OpenTelemetry, and `gontest` module releases.
+
 ---
 
 ## [v1.0.0] — 2026-08-23

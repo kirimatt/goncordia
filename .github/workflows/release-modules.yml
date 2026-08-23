@@ -1,0 +1,84 @@
+name: Release Modules
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Semantic version (for example v1.0.0)'
+        required: true
+        type: string
+      group:
+        description: 'Module release group'
+        required: true
+        type: choice
+        options:
+          - base
+          - integrations
+      ref:
+        description: 'Branch or commit SHA to tag'
+        required: false
+        default: 'main'
+        type: string
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+
+      - name: Require a commit from main
+        run: |
+          git fetch origin main
+          git merge-base --is-ancestor HEAD origin/main
+
+      - name: Validate module release
+        env:
+          MODULE_VERSION: ${{ inputs.version }}
+          MODULE_GROUP: ${{ inputs.group }}
+          ALLOW_EXISTING_TAGS: 'true'
+        run: ./scripts/check-module-release.sh "$MODULE_VERSION" "$MODULE_GROUP"
+
+      - name: Create and push module tags
+        env:
+          MODULE_VERSION: ${{ inputs.version }}
+          MODULE_GROUP: ${{ inputs.group }}
+        run: |
+          if [[ "$MODULE_GROUP" == "base" ]]; then
+            modules=(driver/stdlib driver/pgxv5 driver/mongodb driver/redis driver/cassandra driver/clickhouse driver/dynamodb driver/firestore otel gontest)
+          else
+            modules=(driver/gorm driver/bun bench)
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          refs=()
+          for module in "${modules[@]}"; do
+            tag="$module/$MODULE_VERSION"
+            if ! git rev-parse --verify --quiet "refs/tags/$tag" >/dev/null; then
+              git tag -- "$tag"
+            fi
+            refs+=("refs/tags/$tag")
+          done
+          git push origin "${refs[@]}"
+
+      - name: Publish module releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MODULE_VERSION: ${{ inputs.version }}
+          MODULE_GROUP: ${{ inputs.group }}
+        run: |
+          if [[ "$MODULE_GROUP" == "base" ]]; then
+            modules=(driver/stdlib driver/pgxv5 driver/mongodb driver/redis driver/cassandra driver/clickhouse driver/dynamodb driver/firestore otel gontest)
+          else
+            modules=(driver/gorm driver/bun bench)
+          fi
+          for module in "${modules[@]}"; do
+            tag="$module/$MODULE_VERSION"
+            if ! gh release view "$tag" >/dev/null 2>&1; then
+              gh release create "$tag" --verify-tag --title "$tag" --notes "Goncordia $module module $MODULE_VERSION. See the root v1.0.0 changelog and migration guide."
+            fi
+          done
