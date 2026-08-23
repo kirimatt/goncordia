@@ -16,8 +16,11 @@ module_dirs=(
   driver/clickhouse
   driver/dynamodb
   driver/firestore
+  driver/gorm
+  driver/bun
   otel
   gontest
+  bench
 )
 
 for module_dir in "${module_dirs[@]}"; do
