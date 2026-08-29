@@ -21,6 +21,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added committed dependency manifests for every independently versioned
   driver, integration, OpenTelemetry, `gontest`, and benchmark module release.
 
+### Documentation
+- Added a Contributor Covenant-based code of conduct, contribution guide,
+  security policy, structured bug and feature request forms, and a pull request
+  template to complete the GitHub community profile.
+
 ---
 
 ## [v1.0.0] — 2026-08-23

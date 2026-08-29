@@ -1,0 +1,58 @@
+name: Feature request
+description: Propose a new capability or an improvement to Goncordia.
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What limitation or use case should Goncordia address?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior or API
+      description: Show a small usage example when proposing public API changes.
+      placeholder: |
+        pool, err := goncordia.NewWorkerPoolChecked(...)
+    validations:
+      required: true
+  - type: dropdown
+    id: scope
+    attributes:
+      label: Affected area
+      options:
+        - Root engine or worker scheduling
+        - Driver contract or conformance suite
+        - SQL drivers or adapters
+        - NoSQL driver
+        - Admin API or dashboard
+        - OpenTelemetry
+        - Testing utilities
+        - Documentation or examples
+        - CI, packaging, or releases
+        - Other or multiple areas
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Describe workarounds or competing designs.
+  - type: textarea
+    id: compatibility
+    attributes:
+      label: Compatibility and rollout
+      description: Note API, schema, driver, dependency, or migration implications.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checklist
+      options:
+        - label: I searched existing issues and pull requests for similar proposals.
+          required: true
+        - label: I described the user problem, not only a preferred implementation.
+          required: true

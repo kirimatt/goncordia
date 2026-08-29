@@ -1124,3 +1124,12 @@ goncordia/
 | DynamoDB | **None** — at-least-once | Conditional writes; no cross-table tx |
 | Firestore | Atomic with business tx | `RunTransaction` + `EnqueueTx` |
 | In-memory | Atomic (in-process) | Single mutex |
+
+---
+
+## Community and security
+
+- Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening an issue or pull request.
+- Follow the [Code of Conduct](CODE_OF_CONDUCT.md) in all project spaces.
+- Report vulnerabilities privately according to [SECURITY.md](SECURITY.md).
+- Goncordia is available under the [MIT License](LICENSE).

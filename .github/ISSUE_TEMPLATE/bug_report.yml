@@ -1,0 +1,84 @@
+name: Bug report
+description: Report reproducible incorrect behavior in Goncordia.
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug. Do not include credentials, production data, or undisclosed security issues.
+  - type: input
+    id: goncordia-version
+    attributes:
+      label: Goncordia version
+      description: Include every affected root or nested module version.
+      placeholder: github.com/kirimatt/goncordia/driver/pgxv5 v1.0.0
+    validations:
+      required: true
+  - type: input
+    id: go-version
+    attributes:
+      label: Go version
+      placeholder: go1.26.6 linux/amd64
+    validations:
+      required: true
+  - type: dropdown
+    id: backend
+    attributes:
+      label: Backend or module
+      options:
+        - Root engine or memory driver
+        - stdlib (PostgreSQL, MySQL, or SQLite)
+        - pgxv5
+        - GORM
+        - Bun
+        - MongoDB
+        - Redis
+        - Cassandra or ScyllaDB
+        - ClickHouse
+        - DynamoDB
+        - Firestore
+        - OpenTelemetry
+        - gontest
+        - Other or multiple modules
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: Describe the observed behavior and its impact.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+      description: Provide the smallest code, configuration, and sequence that reproduces the problem.
+      render: go
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs or additional context
+      description: Redact secrets and personal or production data.
+      render: shell
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checklist
+      options:
+        - label: I searched existing issues and pull requests for this problem.
+          required: true
+        - label: I tested the latest supported release when possible.
+          required: true
+        - label: This is not an undisclosed security vulnerability.
+          required: true
