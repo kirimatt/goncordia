@@ -5,7 +5,7 @@ go 1.25.0
 require (
 	github.com/kirimatt/goncordia v1.0.0
 	github.com/testcontainers/testcontainers-go/modules/mongodb v0.44.0
-	go.mongodb.org/mongo-driver v1.17.9
+	go.mongodb.org/mongo-driver v1.17.10
 )
 
 require (
