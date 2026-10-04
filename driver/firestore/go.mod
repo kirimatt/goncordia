@@ -1,9 +1,9 @@
 module github.com/kirimatt/goncordia/driver/firestore
 
-go 1.25.0
+go 1.26.0
 
 require (
-	cloud.google.com/go/firestore v1.25.0
+	cloud.google.com/go/firestore v1.26.0
 	github.com/google/uuid v1.6.0
 	github.com/kirimatt/goncordia v1.0.0
 	github.com/testcontainers/testcontainers-go v0.44.0
