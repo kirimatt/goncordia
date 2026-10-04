@@ -5,7 +5,7 @@ go 1.25.0
 require (
 	github.com/kirimatt/goncordia v1.0.0
 	github.com/kirimatt/goncordia/driver/stdlib v1.0.0
-	github.com/uptrace/bun v1.2.18
+	github.com/uptrace/bun v1.3.0
 	github.com/uptrace/bun/dialect/sqlitedialect v1.2.18
 	modernc.org/sqlite v1.57.0
 )
