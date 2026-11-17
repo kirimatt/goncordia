@@ -36,7 +36,7 @@ jobs:
         run: ./scripts/check-release.sh
       - name: Core coverage threshold
         run: |
-          go test ./admin ./clock ./core ./driver ./driver/memory \
+          go test ./admin ./clock ./core ./driver ./driver/memory ./future \
             -covermode=atomic -coverprofile=coverage.out
           total=$(go tool cover -func=coverage.out | awk '/^total:/ {gsub("%", "", $3); print $3}')
           awk -v total="$total" 'BEGIN { if (total < 68.0) { printf "coverage %.1f%% is below 68.0%%\n", total; exit 1 } }'
