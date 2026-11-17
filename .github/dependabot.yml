@@ -1,7 +1,24 @@
 version: 2
 updates:
+  # One entry for every Go module so that a single upstream release (for
+  # example OpenTelemetry or testcontainers) produces one grouped pull request
+  # across all modules instead of one pull request per module directory.
   - package-ecosystem: gomod
-    directory: /
+    directories:
+      - /
+      - /bench
+      - /driver/bun
+      - /driver/cassandra
+      - /driver/clickhouse
+      - /driver/dynamodb
+      - /driver/firestore
+      - /driver/gorm
+      - /driver/mongodb
+      - /driver/pgxv5
+      - /driver/redis
+      - /driver/stdlib
+      - /gontest
+      - /otel
     schedule:
       interval: weekly
     groups:
@@ -18,74 +35,23 @@ updates:
       testcontainers:
         patterns:
           - github.com/testcontainers/testcontainers-go*
-    open-pull-requests-limit: 6
+      sql:
+        patterns:
+          - github.com/jackc/pgx/*
+          - github.com/go-sql-driver/*
+          - modernc.org/*
+          - github.com/uptrace/bun*
+          - gorm.io/*
+      databases:
+        patterns:
+          - go.mongodb.org/*
+          - github.com/redis/*
+          - github.com/ClickHouse/*
+          - github.com/gocql/*
+          - github.com/apache/cassandra-gocql-driver*
+    open-pull-requests-limit: 10
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: weekly
     open-pull-requests-limit: 4
-  - package-ecosystem: gomod
-    directory: /driver/stdlib
-    schedule:
-      interval: weekly
-    open-pull-requests-limit: 3
-  - package-ecosystem: gomod
-    directory: /driver/pgxv5
-    schedule:
-      interval: weekly
-    open-pull-requests-limit: 3
-  - package-ecosystem: gomod
-    directory: /driver/mongodb
-    schedule:
-      interval: weekly
-    open-pull-requests-limit: 3
-  - package-ecosystem: gomod
-    directory: /driver/redis
-    schedule:
-      interval: weekly
-    open-pull-requests-limit: 3
-  - package-ecosystem: gomod
-    directory: /driver/cassandra
-    schedule:
-      interval: weekly
-    open-pull-requests-limit: 3
-  - package-ecosystem: gomod
-    directory: /driver/clickhouse
-    schedule:
-      interval: weekly
-    open-pull-requests-limit: 3
-  - package-ecosystem: gomod
-    directory: /driver/dynamodb
-    schedule:
-      interval: weekly
-    open-pull-requests-limit: 3
-  - package-ecosystem: gomod
-    directory: /driver/firestore
-    schedule:
-      interval: weekly
-    open-pull-requests-limit: 3
-  - package-ecosystem: gomod
-    directory: /otel
-    schedule:
-      interval: weekly
-    open-pull-requests-limit: 3
-  - package-ecosystem: gomod
-    directory: /gontest
-    schedule:
-      interval: weekly
-    open-pull-requests-limit: 3
-  - package-ecosystem: gomod
-    directory: /driver/gorm
-    schedule:
-      interval: weekly
-    open-pull-requests-limit: 3
-  - package-ecosystem: gomod
-    directory: /driver/bun
-    schedule:
-      interval: weekly
-    open-pull-requests-limit: 3
-  - package-ecosystem: gomod
-    directory: /bench
-    schedule:
-      interval: weekly
-    open-pull-requests-limit: 3

@@ -87,7 +87,7 @@ tx.Commit(ctx)  // job and order appear atomically
 
 ## Installation
 
-Requires Go 1.25 or newer.
+Requires Go 1.26 or newer.
 
 ```bash
 go get github.com/kirimatt/goncordia@v1.0.0

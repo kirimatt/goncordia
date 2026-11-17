@@ -20,7 +20,7 @@ needed to act on the report.
 
 ## Development setup
 
-Goncordia requires Go 1.25 or newer. The repository uses `go.work` for local
+Goncordia requires Go 1.26 or newer. The repository uses `go.work` for local
 development and independent `go.mod` files for drivers and integrations.
 Docker is required for the complete backend integration suite.
 

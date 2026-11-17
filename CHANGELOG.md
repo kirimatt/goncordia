@@ -13,6 +13,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - CI, static analysis, race tests, and vulnerability scanning now validate the
   root module and every released driver/tooling module with workspace mode
   disabled, matching the dependency graph downloaded by consumers.
+- The supported Go floor is now Go 1.26. Current releases of `golang.org/x/*`,
+  testcontainers, go-redis, modernc sqlite, and OpenTelemetry require it, and
+  Go 1.25 no longer receives security fixes. CI tests Go 1.26 and Go 1.27.
+
+### Dependencies
+- OpenTelemetry 1.47.0, pgx 5.13.0, go-redis 9.23.0, clickhouse-go 2.51.0,
+  Firestore 1.29.2, gRPC 1.85.0, mongo-driver 1.17.10, bun 1.3.0,
+  modernc sqlite 1.60.1, go-sql-driver/mysql 1.10.1, AWS SDK 1.44.0
+  (DynamoDB 1.64.0), and testcontainers 0.45.0.
+- Dependabot groups related updates across every module directory so one
+  upstream release produces one pull request.
 
 ### Release engineering
 - Added an idempotent grouped release workflow for nested modules. A rerun may
