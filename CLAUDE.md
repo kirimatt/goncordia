@@ -116,6 +116,23 @@ client.Enqueue(ctx, args, &core.InsertOpts{RunAt: clk.Now().Add(time.Hour)})
 clk.Advance(2 * time.Hour)  // job is now available
 ```
 
+## Waiting for a job's result (futures)
+
+```go
+m, _ := future.New(d, future.Config{})            // driver must implement driver.JobResultStore, or set Config.Store
+future.RegisterWorker(registry, m, func(ctx context.Context, job *core.Job[SumArgs]) (int, error) {
+    return job.Args.A + job.Args.B, nil
+}, core.WorkerOpts{})
+wp := goncordia.NewWorkerPool(d, registry, goncordia.WorkerConfig{Observer: m}) // local wake-up
+
+f, _ := future.Enqueue[int](ctx, m, client, SumArgs{A: 2, B: 3}, nil)
+sum, err := f.Await(ctx) // errors.Is(err, future.ErrDiscarded / ErrCancelled / ErrNoResult)
+```
+
+Use `goncordia.WorkerObservers(a, b)` to combine the Manager with OTel
+instrumentation, and `otelgoncordia.NewFutureInstrumentation()` as
+`future.Config.Observer` for await/store spans and metrics.
+
 ## Periodic / cron jobs
 
 ```go

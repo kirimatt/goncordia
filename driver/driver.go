@@ -110,6 +110,20 @@ type JobStartMarker interface {
 	JobMarkStarted(context.Context, JobMarkStartedParams) (marked bool, err error)
 }
 
+// JobResultStore is an optional executor capability that persists the value
+// produced by a job handler, so that a waiting producer can read it after the
+// job completes. The future package uses it when no explicit store is given.
+//
+// Values are opaque bytes (the future package writes JSON). JobResultPut
+// replaces an earlier value for the same job, which keeps retried and
+// re-delivered executions idempotent. JobResultGet returns ErrNotFound when no
+// value was stored. Deleting a job should also delete its result.
+type JobResultStore interface {
+	JobResultPut(ctx context.Context, jobID string, value []byte) error
+	JobResultGet(ctx context.Context, jobID string) ([]byte, error)
+	JobResultDelete(ctx context.Context, jobID string) error
+}
+
 // AdminExecutor is an optional executor capability used by the admin HTTP API
 // for filtered job inspection and queue-depth metrics.
 type AdminExecutor interface {

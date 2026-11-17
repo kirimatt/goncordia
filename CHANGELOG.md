@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `future` package: `future.Enqueue` / `EnqueueTx` return a `Future[R]` whose
+  `Await` returns the value produced by a `future.RegisterWorker` handler, with
+  typed `ErrDiscarded`, `ErrCancelled`, and `ErrNoResult` outcomes, `TryGet`,
+  and `future.Of` for jobs enqueued elsewhere. Waiters in the worker's process
+  wake on completion; others poll on the injected clock.
+- Optional `driver.JobResultStore` executor capability, implemented by the
+  in-memory driver, with the `drivertest.RunResults` conformance suite.
+- `goncordia.WorkerObservers` combines several worker observers.
+- `otelgoncordia.NewFutureInstrumentation`: `goncordia.future.await` and
+  `goncordia.future.store` spans plus await duration, polls, wakeups, result
+  size, and store duration metrics.
+
 ### Changed
 - CI, static analysis, race tests, and vulnerability scanning now validate the
   root module and every released driver/tooling module with workspace mode

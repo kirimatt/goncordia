@@ -34,6 +34,7 @@ tx.Commit(ctx)  // job and order appear atomically
 - **Fair multi-queue scheduling** — weighted round-robin with per-queue concurrency and composable local/global execution rate limits
 - **Payload evolution** — versioned payloads with ordered upcasters and permanent decode failures
 - **Batch enqueue** — shared options or independent per-item options, with transactional variants
+- **Futures** — enqueue a job and `Await` the value its handler returns, with local wake-up and polling fallback
 - **Queue pause/resume** — drain a queue without stopping workers
 - **Push notifications** — LISTEN/NOTIFY (Postgres), Change Streams (MongoDB), Pub/Sub (Redis); polling fallback elsewhere
 - **SKIP LOCKED** — lock-free concurrent fetching on Postgres and MySQL
@@ -576,6 +577,50 @@ one `WorkerPool`. Set `DistributedPipelines: true` to extend the guarantee acros
 worker processes sharing the same driver. The pool renews an ownership-fenced
 lease while the handler runs and cancels the handler context if renewal is lost.
 
+### Futures: waiting for a job's result
+
+The `future` package lets a producer enqueue a job and wait for the value its
+handler returns. Register the handler with `future.RegisterWorker`; it returns
+`(R, error)` instead of `error`. The value is JSON-encoded and stored before the
+job is marked completed.
+
+```go
+import "github.com/kirimatt/goncordia/future"
+
+m, err := future.New(d, future.Config{PollInterval: 500 * time.Millisecond})
+
+// Worker side
+future.RegisterWorker(registry, m, func(ctx context.Context, job *core.Job[ResizeArgs]) (Thumbnail, error) {
+    return resize(ctx, job.Args)
+}, core.WorkerOpts{})
+wp := goncordia.NewWorkerPool(d, registry, goncordia.WorkerConfig{
+    // Wakes local Await calls the moment a job finishes. Combine with other
+    // observers through goncordia.WorkerObservers.
+    Observer: goncordia.WorkerObservers(instrumentation, m),
+})
+
+// Producer side
+f, err := future.Enqueue[Thumbnail](ctx, m, client, ResizeArgs{ImageID: id}, nil)
+thumb, err := f.Await(ctx)              // blocks until completed, discarded, or cancelled
+thumb, done, err := f.TryGet(ctx)       // one non-blocking check
+later := future.Of[Thumbnail](m, f.ID()) // follow a job enqueued elsewhere
+```
+
+`Await` returns the handler value, or an error you can classify with
+`errors.Is`: `future.ErrDiscarded` and `future.ErrCancelled` (both carry a
+`*future.JobError` with the last handler error), `future.ErrNoResult` for a job
+completed by a plain worker, and `driver.ErrNotFound` for an unknown job. Use
+`EnqueueTx` the same way, and call `Await` only after the transaction commits.
+
+Job state is read through the portable `JobGetByID`, so futures work with every
+driver. Results are written to `future.Config.Store` or, when it is nil, to the
+driver itself if its executor implements `driver.JobResultStore` (the in-memory
+driver does). Any store can be paired with any driver: for example, jobs in
+Postgres and results in your own Redis-backed `JobResultStore`. When producer
+and worker pool share a `Manager` in one process, `Await` wakes immediately.
+Across processes it polls every `PollInterval` on the injected clock. Delivery
+stays at-least-once: the last stored value wins if a handler runs twice.
+
 ### Versioned payloads
 
 Version 1 remains plain legacy JSON. A type may declare a newer version and the
@@ -1058,6 +1103,33 @@ Panics are recovered, converted to errors, recorded on the span, and persisted
 with their stack trace in `driver.AttemptError.Trace` before retry/discard. The
 worker pool always stays alive.
 
+### Futures
+
+`NewFutureInstrumentation` implements `future.Observer`:
+
+```go
+m, err := future.New(d, future.Config{
+    Observer: otelgoncordia.NewFutureInstrumentation(
+        otelgoncordia.WithTracerProvider(tp), otelgoncordia.WithMeterProvider(mp),
+    ),
+})
+```
+
+| Signal | Name | Attributes |
+|---|---|---|
+| span | `goncordia.future.await` | job id, kind, queue, state, outcome, polls, wakeups, result bytes |
+| span | `goncordia.future.store` | job id, kind, queue, attempt, result bytes; child of `goncordia.process` |
+| histogram (s) | `goncordia.future.await.duration` | kind, outcome, blocking |
+| counter | `goncordia.future.await.polls` | kind |
+| counter | `goncordia.future.await.wakeups` | kind |
+| histogram (By) | `goncordia.future.result.size` | kind |
+| histogram (s) | `goncordia.future.store.duration` | kind, status |
+
+Outcomes are `completed`, `discarded`, `cancelled`, `no_result`, `not_found`,
+`pending` (TryGet only), `abandoned` (caller context ended), and `error`.
+Few wakeups relative to polls mean producers and workers run in different
+processes, and await latency is bounded by `PollInterval`.
+
 You can also add your own middleware for logging or custom metrics:
 
 ```go
@@ -1105,6 +1177,7 @@ goncordia/
 │   ├── clickhouse/        # ClickHouse 23+ (ReplacingMergeTree; at-least-once)
 │   ├── dynamodb/          # Amazon DynamoDB (conditional writes; at-least-once)
 │   └── firestore/         # Cloud Firestore (RunTransaction; ACID inserts)
+├── future/                # Future[R]: enqueue a job and Await its handler's value
 ├── gontest/               # test helpers (Tracker, WorkerHelper, MockClock)
 └── otel/                  # OpenTelemetry middleware (spans + metrics)
 ```

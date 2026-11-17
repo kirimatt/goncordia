@@ -83,3 +83,63 @@ type WorkerLifecycleObserver interface {
 	JobFinished(context.Context, JobFinishedEvent)
 	JobRateLimited(context.Context, RateLimitWaitEvent)
 }
+
+// WorkerObservers fans worker events out to several observers in order. Nil
+// observers are skipped. Lifecycle events reach only observers that implement
+// WorkerLifecycleObserver. Use it to combine, for example, OpenTelemetry
+// instrumentation with a future.Manager.
+func WorkerObservers(observers ...WorkerObserver) WorkerObserver {
+	list := make(workerObserverList, 0, len(observers))
+	for _, observer := range observers {
+		if observer != nil {
+			list = append(list, observer)
+		}
+	}
+	return list
+}
+
+type workerObserverList []WorkerObserver
+
+func (l workerObserverList) JobClaimed(ctx context.Context, job driver.JobRow) {
+	for _, observer := range l {
+		observer.JobClaimed(ctx, job)
+	}
+}
+
+func (l workerObserverList) JobHeartbeat(ctx context.Context, event HeartbeatEvent) {
+	for _, observer := range l {
+		observer.JobHeartbeat(ctx, event)
+	}
+}
+
+func (l workerObserverList) JobsRescued(ctx context.Context, event RescueEvent) {
+	for _, observer := range l {
+		observer.JobsRescued(ctx, event)
+	}
+}
+
+func (l workerObserverList) JobStarted(ctx context.Context, event JobStartedEvent) {
+	for _, observer := range l {
+		if lifecycle, ok := observer.(WorkerLifecycleObserver); ok {
+			lifecycle.JobStarted(ctx, event)
+		}
+	}
+}
+
+func (l workerObserverList) JobFinished(ctx context.Context, event JobFinishedEvent) {
+	for _, observer := range l {
+		if lifecycle, ok := observer.(WorkerLifecycleObserver); ok {
+			lifecycle.JobFinished(ctx, event)
+		}
+	}
+}
+
+func (l workerObserverList) JobRateLimited(ctx context.Context, event RateLimitWaitEvent) {
+	for _, observer := range l {
+		if lifecycle, ok := observer.(WorkerLifecycleObserver); ok {
+			lifecycle.JobRateLimited(ctx, event)
+		}
+	}
+}
+
+var _ WorkerLifecycleObserver = workerObserverList(nil)
