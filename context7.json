@@ -1,12 +1,16 @@
 {
   "$schema": "https://context7.com/schema/context7.json",
   "projectTitle": "goncordia",
-  "description": "Transactional job queue engine for Go with 10 storage backends, composable local/global execution rate limits, crash recovery, pipelines, leader-safe scheduling, an admin dashboard, OpenTelemetry, and injected deterministic clocks.",
+  "description": "Transactional job queue engine for Go with 10 storage backends, typed futures (await a job's result), composable local/global execution rate limits, crash recovery, pipelines, leader-safe scheduling, an admin dashboard, OpenTelemetry, and injected deterministic clocks.",
   "folders": [],
-  "excludeFolders": ["bench"],
+  "excludeFolders": [
+    "bench"
+  ],
   "rules": [
+    "Import v2 paths: github.com/kirimatt/goncordia/v2 for the root and github.com/kirimatt/goncordia/driver/<name>/v2 for drivers",
     "Use EnqueueTx (not Enqueue) when inside a database transaction — this is the transactional outbox pattern and guarantees the job appears only if the transaction commits",
     "Use the in-memory driver (driver/memory) and gontest package for tests — no Docker or real database needed",
+    "To get a job's return value, register it with future.RegisterWorker, enqueue with future.Enqueue, and pass the future.Manager as WorkerConfig.Observer for instant local wake-up",
     "Inject clock.Manual into the client, worker or scheduler, and driver in tests; Advance fires timers and tickers without sleeping",
     "Redis, Cassandra, ClickHouse, and DynamoDB do not support transactional rollback; use Enqueue after commit for these backends",
     "Mount admin.New(driver) behind application authentication; it exposes mutating job and queue actions",
@@ -15,18 +19,53 @@
     "Firestore requires a composite index created manually: collection goncordia_jobs, fields queue ASC + state ASC + run_at ASC"
   ],
   "previousVersions": [
-    { "tag": "v0.17.0" },
-    { "tag": "v0.16.0" },
-    { "tag": "v0.15.1" },
-    { "tag": "v0.15.0" },
-    { "tag": "v0.14.0" },
-    { "tag": "v0.13.0" },
-    { "tag": "v0.12.0" },
-    { "tag": "v0.11.0" },
-    { "tag": "v0.10.0" },
-    { "tag": "v0.9.0" },
-    { "tag": "v0.8.0" },
-    { "tag": "v0.7.5" },
-    { "tag": "v0.7.0" }
+    {
+      "tag": "v1.0.0"
+    },
+    {
+      "tag": "v0.19.0"
+    },
+    {
+      "tag": "v0.18.0"
+    },
+    {
+      "tag": "v0.17.0"
+    },
+    {
+      "tag": "v0.16.0"
+    },
+    {
+      "tag": "v0.15.1"
+    },
+    {
+      "tag": "v0.15.0"
+    },
+    {
+      "tag": "v0.14.0"
+    },
+    {
+      "tag": "v0.13.0"
+    },
+    {
+      "tag": "v0.12.0"
+    },
+    {
+      "tag": "v0.11.0"
+    },
+    {
+      "tag": "v0.10.0"
+    },
+    {
+      "tag": "v0.9.0"
+    },
+    {
+      "tag": "v0.8.0"
+    },
+    {
+      "tag": "v0.7.5"
+    },
+    {
+      "tag": "v0.7.0"
+    }
   ]
 }

@@ -32,7 +32,7 @@ import (
 )
 
 const (
-	instrName    = "github.com/kirimatt/goncordia/v2"
+	instrName    = "github.com/kirimatt/goncordia"
 	spanName     = "goncordia.process"
 	enqueueSpan  = "goncordia.enqueue"
 	attrKind     = "goncordia.job.kind"

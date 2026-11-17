@@ -13,7 +13,7 @@ body:
     attributes:
       label: Goncordia version
       description: Include every affected root or nested module version.
-      placeholder: github.com/kirimatt/goncordia/driver/pgxv5 v1.0.0
+      placeholder: github.com/kirimatt/goncordia/driver/pgxv5/v2 v2.0.0
     validations:
       required: true
   - type: input
