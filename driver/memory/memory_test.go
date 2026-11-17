@@ -3,8 +3,8 @@ package memory_test
 import (
 	"testing"
 
-	"github.com/kirimatt/goncordia/driver/drivertest"
-	"github.com/kirimatt/goncordia/driver/memory"
+	"github.com/kirimatt/goncordia/v2/driver/drivertest"
+	"github.com/kirimatt/goncordia/v2/driver/memory"
 )
 
 func TestConformance(t *testing.T) {

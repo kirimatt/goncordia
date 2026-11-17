@@ -18,11 +18,11 @@ import (
 
 	_ "modernc.org/sqlite"
 
-	"github.com/kirimatt/goncordia"
-	"github.com/kirimatt/goncordia/core"
-	"github.com/kirimatt/goncordia/driver"
-	"github.com/kirimatt/goncordia/driver/memory"
-	stdlibdriver "github.com/kirimatt/goncordia/driver/stdlib"
+	stdlibdriver "github.com/kirimatt/goncordia/driver/stdlib/v2"
+	"github.com/kirimatt/goncordia/v2"
+	"github.com/kirimatt/goncordia/v2/core"
+	"github.com/kirimatt/goncordia/v2/driver"
+	"github.com/kirimatt/goncordia/v2/driver/memory"
 )
 
 type benchJob struct{ N int }
@@ -213,7 +213,7 @@ func benchmarkEndToEndN[TTx any](b *testing.B, d driver.Driver[TTx], concurrency
 		}
 	}
 
-	wp.Stop()
+	_ = wp.Shutdown(context.Background())
 	b.ReportMetric(float64(workload*b.N)/b.Elapsed().Seconds(), "jobs/s")
 }
 
@@ -260,7 +260,7 @@ func benchmarkEndToEnd[TTx any](b *testing.B, d driver.Driver[TTx], concurrency 
 		}
 	}
 
-	wp.Stop()
+	_ = wp.Shutdown(context.Background())
 	b.ReportMetric(float64(e2eWorkload*b.N)/b.Elapsed().Seconds(), "jobs/s")
 }
 

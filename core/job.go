@@ -107,10 +107,6 @@ type UniqueOpts struct {
 
 // WorkerOpts configures default behavior for a Worker registration.
 type WorkerOpts struct {
-	// Queue is retained for source compatibility. Queue selection belongs to
-	// InsertOpts or ClientConfig and this field has no effect.
-	// Deprecated: use InsertOpts.Queue or ClientConfig.DefaultQueue.
-	Queue string
 	// MaxRetry is the maximum number of attempts. Default: 3.
 	MaxRetry int
 	// Timeout is the maximum duration for a single job execution. 0 = no timeout.

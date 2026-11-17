@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"testing"
 
-	"github.com/kirimatt/goncordia/core"
+	"github.com/kirimatt/goncordia/v2/core"
 )
 
 type versionedArgs struct {

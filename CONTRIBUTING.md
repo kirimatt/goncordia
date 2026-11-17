@@ -25,7 +25,7 @@ development and independent `go.mod` files for drivers and integrations.
 Docker is required for the complete backend integration suite.
 
 ```bash
-git clone https://github.com/kirimatt/goncordia.git
+git clone https://github.com/kirimatt/goncordia/v2.git
 cd goncordia
 go version
 ./scripts/for-each-module.sh go mod tidy -diff

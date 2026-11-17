@@ -26,15 +26,15 @@ case "$group" in
 esac
 
 for module_dir in "${module_dirs[@]}"; do
-  expected="github.com/kirimatt/goncordia/$module_dir"
+  expected="github.com/kirimatt/goncordia/$module_dir/v2"
   actual=$(sed -n 's/^module //p' "$module_dir/go.mod")
   if [[ "$actual" != "$expected" ]]; then
     echo "$module_dir/go.mod declares $actual, want $expected" >&2
     exit 1
   fi
-  root_version=$(cd "$module_dir" && GOWORK=off go list -m -f '{{if eq .Path "github.com/kirimatt/goncordia"}}{{.Version}}{{end}}' all)
-  if [[ ! "$root_version" =~ ^v1\.[0-9]+\.[0-9]+$ ]]; then
-    echo "$module_dir/go.mod does not require a root v1 release" >&2
+  root_version=$(cd "$module_dir" && GOWORK=off go list -m -f '{{if eq .Path "github.com/kirimatt/goncordia/v2"}}{{.Version}}{{end}}' all)
+  if [[ ! "$root_version" =~ ^v2\.[0-9]+\.[0-9]+$ ]]; then
+    echo "$module_dir/go.mod does not require a root v2 release" >&2
     exit 1
   fi
   if grep -Eq '^replace[[:space:]]|^replace[[:space:]]*\(' "$module_dir/go.mod"; then

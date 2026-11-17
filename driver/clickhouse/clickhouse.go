@@ -38,10 +38,10 @@ import (
 
 	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
 
-	goncordia "github.com/kirimatt/goncordia"
-	"github.com/kirimatt/goncordia/clock"
-	"github.com/kirimatt/goncordia/core"
-	gdriver "github.com/kirimatt/goncordia/driver"
+	goncordia "github.com/kirimatt/goncordia/v2"
+	"github.com/kirimatt/goncordia/v2/clock"
+	"github.com/kirimatt/goncordia/v2/core"
+	gdriver "github.com/kirimatt/goncordia/v2/driver"
 )
 
 // NoTx is the transaction type for the ClickHouse driver.

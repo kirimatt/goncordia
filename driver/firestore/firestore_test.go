@@ -13,11 +13,11 @@ import (
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/wait"
 
-	goncordia "github.com/kirimatt/goncordia"
-	"github.com/kirimatt/goncordia/clock"
-	"github.com/kirimatt/goncordia/core"
-	"github.com/kirimatt/goncordia/driver/drivertest"
-	firestoredriver "github.com/kirimatt/goncordia/driver/firestore"
+	firestoredriver "github.com/kirimatt/goncordia/driver/firestore/v2"
+	goncordia "github.com/kirimatt/goncordia/v2"
+	"github.com/kirimatt/goncordia/v2/clock"
+	"github.com/kirimatt/goncordia/v2/core"
+	"github.com/kirimatt/goncordia/v2/driver/drivertest"
 )
 
 type EmailJob struct {
@@ -91,7 +91,7 @@ func TestFirestore_EnqueueAndProcess(t *testing.T) {
 	core.RegisterWorker(registry, core.WorkerFunc[EmailJob](func(_ context.Context, _ *core.Job[EmailJob]) error {
 		processed.Add(1)
 		return nil
-	}), core.WorkerOpts{Queue: "default"})
+	}), core.WorkerOpts{})
 
 	c := firestoredriver.NewClient(d, goncordia.ClientConfig{})
 	if _, err := c.Enqueue(ctx, EmailJob{To: "test@example.com"}, nil); err != nil {
@@ -115,7 +115,7 @@ func TestFirestore_EnqueueAndProcess(t *testing.T) {
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	pool.Stop()
+	_ = pool.Shutdown(context.Background())
 }
 
 func TestFirestore_ScheduledConformance(t *testing.T) {
@@ -166,7 +166,7 @@ func TestFirestore_RetryAndDiscard(t *testing.T) {
 	core.RegisterWorker(registry, core.WorkerFunc[EmailJob](func(_ context.Context, _ *core.Job[EmailJob]) error {
 		attempts.Add(1)
 		return errors.New("always fails")
-	}), core.WorkerOpts{Queue: "default", MaxRetry: 3})
+	}), core.WorkerOpts{MaxRetry: 3})
 
 	c := firestoredriver.NewClient(d, goncordia.ClientConfig{})
 	if _, err := c.Enqueue(ctx, EmailJob{To: "fail@test.com"}, nil); err != nil {
@@ -191,7 +191,7 @@ func TestFirestore_RetryAndDiscard(t *testing.T) {
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	pool.Stop()
+	_ = pool.Shutdown(context.Background())
 	if got := attempts.Load(); got < 3 {
 		t.Errorf("expected >= 3 attempts, got %d", got)
 	}
@@ -209,7 +209,7 @@ func TestFirestore_EnqueueTx(t *testing.T) {
 	core.RegisterWorker(registry, core.WorkerFunc[EmailJob](func(_ context.Context, _ *core.Job[EmailJob]) error {
 		processed.Add(1)
 		return nil
-	}), core.WorkerOpts{Queue: "default"})
+	}), core.WorkerOpts{})
 
 	c := firestoredriver.NewClient(d, goncordia.ClientConfig{})
 
@@ -244,5 +244,5 @@ func TestFirestore_EnqueueTx(t *testing.T) {
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	pool.Stop()
+	_ = pool.Shutdown(context.Background())
 }

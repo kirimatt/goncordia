@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kirimatt/goncordia/clock"
+	"github.com/kirimatt/goncordia/v2/clock"
 )
 
 func TestManualAdvanceFiresTimerAndTicker(t *testing.T) {

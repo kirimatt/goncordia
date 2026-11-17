@@ -1,11 +1,11 @@
-module github.com/kirimatt/goncordia/driver/cassandra
+module github.com/kirimatt/goncordia/driver/cassandra/v2
 
 go 1.26.0
 
 require (
 	github.com/gocql/gocql v1.7.0
 	github.com/google/uuid v1.6.0
-	github.com/kirimatt/goncordia v1.0.1-0.20261117221011-eac235b7c801
+	github.com/kirimatt/goncordia/v2 v2.0.0-20261117224351-5e304c8536ad
 	github.com/testcontainers/testcontainers-go/modules/cassandra v0.45.0
 )
 

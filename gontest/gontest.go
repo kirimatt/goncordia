@@ -33,11 +33,11 @@ import (
 	"testing"
 	"time"
 
-	goncordia "github.com/kirimatt/goncordia"
-	"github.com/kirimatt/goncordia/clock"
-	"github.com/kirimatt/goncordia/core"
-	"github.com/kirimatt/goncordia/driver"
-	"github.com/kirimatt/goncordia/driver/memory"
+	goncordia "github.com/kirimatt/goncordia/v2"
+	"github.com/kirimatt/goncordia/v2/clock"
+	"github.com/kirimatt/goncordia/v2/core"
+	"github.com/kirimatt/goncordia/v2/driver"
+	"github.com/kirimatt/goncordia/v2/driver/memory"
 )
 
 // NoTx is the transaction type for the test client.
@@ -52,12 +52,12 @@ type WorkerPool = goncordia.WorkerPool[memory.NoTx]
 
 // MockClock is a controllable fake clock for deterministic time in tests.
 // Use Advance to move time forward; inject into workers via WorkerConfig.Clock.
-type MockClock = clock.Mock
+type MockClock = clock.Manual
 type ManualClock = clock.Manual
 
 // NewMockClock returns a MockClock set to 2024-01-01 00:00:00 UTC.
 func NewMockClock() *MockClock {
-	return clock.NewMock(time.Time{})
+	return clock.NewManual(time.Time{})
 }
 
 // Tracker wraps the in-memory driver and provides typed inspection and assertion
@@ -107,16 +107,9 @@ func (tr *Tracker) NewWorkerPool(registry *core.Registry, cfg goncordia.WorkerCo
 // (e.g. checking job state, errors, or worker ID).
 func (tr *Tracker) Driver() *memory.Driver { return tr.d }
 
-// Jobs returns all decodable jobs of kind T currently in the store.
-// Deprecated: use JobsE to observe corrupt or incompatible payloads.
-func Jobs[T core.JobArgs](tr *Tracker) []*core.Job[T] {
-	jobs, _ := JobsE[T](tr)
-	return jobs
-}
-
-// JobsE returns all jobs of kind T and fails on the first payload that cannot
+// Jobs returns all jobs of kind T and fails on the first payload that cannot
 // be decoded. Versioned envelopes are unwrapped before T is deserialized.
-func JobsE[T core.JobArgs](tr *Tracker) ([]*core.Job[T], error) {
+func Jobs[T core.JobArgs](tr *Tracker) ([]*core.Job[T], error) {
 	var zero T
 	kind := zero.Kind()
 	var result []*core.Job[T]
@@ -152,7 +145,7 @@ func JobsE[T core.JobArgs](tr *Tracker) ([]*core.Job[T], error) {
 // Calls t.Fatal if the count does not match.
 func RequireEnqueued[T core.JobArgs](t testing.TB, tr *Tracker, n int) []*core.Job[T] {
 	t.Helper()
-	jobs, err := JobsE[T](tr)
+	jobs, err := Jobs[T](tr)
 	if err != nil {
 		t.Fatal(err)
 	}

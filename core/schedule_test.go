@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kirimatt/goncordia/core"
+	"github.com/kirimatt/goncordia/v2/core"
 )
 
 func TestCronUsesExplicitLocation(t *testing.T) {

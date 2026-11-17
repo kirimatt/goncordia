@@ -11,12 +11,12 @@ import (
 	"github.com/gocql/gocql"
 	tccassandra "github.com/testcontainers/testcontainers-go/modules/cassandra"
 
-	"github.com/kirimatt/goncordia"
-	"github.com/kirimatt/goncordia/clock"
-	"github.com/kirimatt/goncordia/core"
-	"github.com/kirimatt/goncordia/driver"
-	cassandradriver "github.com/kirimatt/goncordia/driver/cassandra"
-	"github.com/kirimatt/goncordia/driver/drivertest"
+	cassandradriver "github.com/kirimatt/goncordia/driver/cassandra/v2"
+	"github.com/kirimatt/goncordia/v2"
+	"github.com/kirimatt/goncordia/v2/clock"
+	"github.com/kirimatt/goncordia/v2/core"
+	"github.com/kirimatt/goncordia/v2/driver"
+	"github.com/kirimatt/goncordia/v2/driver/drivertest"
 )
 
 func skipIfNoDocker(t *testing.T) {
@@ -102,7 +102,7 @@ func TestCassandra_EnqueueAndProcess(t *testing.T) {
 	core.RegisterWorker(registry, core.WorkerFunc[EmailJob](func(_ context.Context, _ *core.Job[EmailJob]) error {
 		processed.Add(1)
 		return nil
-	}), core.WorkerOpts{Queue: "default", MaxRetry: 3})
+	}), core.WorkerOpts{MaxRetry: 3})
 
 	client := cassandradriver.NewClient(d, goncordia.ClientConfig{})
 	for i := 0; i < 5; i++ {
@@ -128,7 +128,7 @@ func TestCassandra_EnqueueAndProcess(t *testing.T) {
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	pool.Stop()
+	_ = pool.Shutdown(context.Background())
 }
 
 func TestCassandra_ScheduledConformance(t *testing.T) {
@@ -241,7 +241,7 @@ func TestCassandra_RetryAndDiscard(t *testing.T) {
 	core.RegisterWorker(registry, core.WorkerFunc[EmailJob](func(_ context.Context, _ *core.Job[EmailJob]) error {
 		attempts.Add(1)
 		return errors.New("always fails")
-	}), core.WorkerOpts{Queue: "default", MaxRetry: 2})
+	}), core.WorkerOpts{MaxRetry: 2})
 
 	client := cassandradriver.NewClient(d, goncordia.ClientConfig{})
 	if _, err := client.Enqueue(ctx, EmailJob{To: "fail@test.com"}, nil); err != nil {
@@ -266,7 +266,7 @@ func TestCassandra_RetryAndDiscard(t *testing.T) {
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	pool.Stop()
+	_ = pool.Shutdown(context.Background())
 	if got := attempts.Load(); got < 2 {
 		t.Errorf("expected >= 2 attempts, got %d", got)
 	}

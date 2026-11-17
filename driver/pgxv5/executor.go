@@ -11,8 +11,8 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/kirimatt/goncordia/clock"
-	"github.com/kirimatt/goncordia/driver"
+	"github.com/kirimatt/goncordia/v2/clock"
+	"github.com/kirimatt/goncordia/v2/driver"
 )
 
 // querier is the common interface satisfied by both *pgxpool.Pool and pgx.Tx.

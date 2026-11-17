@@ -29,14 +29,14 @@ import (
 
 	"cloud.google.com/go/firestore"
 
-	"github.com/kirimatt/goncordia/driver"
-	cassandradriver "github.com/kirimatt/goncordia/driver/cassandra"
-	clickhousedriver "github.com/kirimatt/goncordia/driver/clickhouse"
-	dynamodbdriver "github.com/kirimatt/goncordia/driver/dynamodb"
-	firestoredriver "github.com/kirimatt/goncordia/driver/firestore"
-	mongodriver "github.com/kirimatt/goncordia/driver/mongodb"
-	pgxv5driver "github.com/kirimatt/goncordia/driver/pgxv5"
-	redisdriver "github.com/kirimatt/goncordia/driver/redis"
+	cassandradriver "github.com/kirimatt/goncordia/driver/cassandra/v2"
+	clickhousedriver "github.com/kirimatt/goncordia/driver/clickhouse/v2"
+	dynamodbdriver "github.com/kirimatt/goncordia/driver/dynamodb/v2"
+	firestoredriver "github.com/kirimatt/goncordia/driver/firestore/v2"
+	mongodriver "github.com/kirimatt/goncordia/driver/mongodb/v2"
+	pgxv5driver "github.com/kirimatt/goncordia/driver/pgxv5/v2"
+	redisdriver "github.com/kirimatt/goncordia/driver/redis/v2"
+	"github.com/kirimatt/goncordia/v2/driver"
 )
 
 var (

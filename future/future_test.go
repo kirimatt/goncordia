@@ -7,11 +7,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kirimatt/goncordia"
-	"github.com/kirimatt/goncordia/clock"
-	"github.com/kirimatt/goncordia/core"
-	"github.com/kirimatt/goncordia/driver"
-	"github.com/kirimatt/goncordia/driver/memory"
+	"github.com/kirimatt/goncordia/v2"
+	"github.com/kirimatt/goncordia/v2/clock"
+	"github.com/kirimatt/goncordia/v2/core"
+	"github.com/kirimatt/goncordia/v2/driver"
+	"github.com/kirimatt/goncordia/v2/driver/memory"
 )
 
 type sumArgs struct {
@@ -156,23 +156,26 @@ func awaitAsync[R any](ctx context.Context, f *Future[R]) <-chan awaitResult[R] 
 	return ch
 }
 
-func TestNewRequiresResultStore(t *testing.T) {
-	_, err := New[memory.NoTx](storeless{memory.New()}, Config{})
-	if !errors.Is(err, driver.ErrUnsupported) {
-		t.Fatalf("err = %v, want ErrUnsupported", err)
-	}
-	if _, err := New[memory.NoTx](storeless{memory.New()}, Config{Store: memory.New().Executor().(driver.JobResultStore)}); err != nil {
-		t.Fatalf("explicit store: %v", err)
+func TestNewValidatesConfig(t *testing.T) {
+	if _, err := New[memory.NoTx](nil, Config{}); err == nil {
+		t.Fatal("nil driver accepted")
 	}
 	if _, err := New[memory.NoTx](memory.New(), Config{PollInterval: -time.Second}); err == nil {
 		t.Fatal("negative poll interval accepted")
 	}
 }
 
-// storeless hides the memory executor's JobResultStore methods.
-type storeless struct{ *memory.Driver }
-
-func (s storeless) Executor() driver.Executor { return struct{ driver.Executor }{s.Driver.Executor()} }
+func TestExplicitStoreOverridesDriver(t *testing.T) {
+	d := memory.New()
+	other := memory.New().Executor()
+	m, err := New(d, Config{Store: other})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.store != other {
+		t.Fatal("Config.Store was not used")
+	}
+}
 
 func TestAwaitWakesLocallyWithoutPolling(t *testing.T) {
 	fx := newFixture(t)

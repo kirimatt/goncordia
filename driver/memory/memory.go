@@ -11,8 +11,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/kirimatt/goncordia/clock"
-	"github.com/kirimatt/goncordia/driver"
+	"github.com/kirimatt/goncordia/v2/clock"
+	"github.com/kirimatt/goncordia/v2/driver"
 )
 
 // NoTx is the transaction type for the memory driver.
@@ -40,7 +40,7 @@ type memoryLeader struct {
 // Option configures a memory Driver.
 type Option func(*Driver)
 
-// WithClock injects a custom Clock (e.g. clock.NewMock() in tests).
+// WithClock injects a custom Clock (e.g. clock.NewManual() in tests).
 func WithClock(c clock.Clock) Option {
 	return func(d *Driver) { d.clk = c }
 }

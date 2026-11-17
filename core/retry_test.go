@@ -5,13 +5,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kirimatt/goncordia/clock"
-	"github.com/kirimatt/goncordia/core"
+	"github.com/kirimatt/goncordia/v2/clock"
+	"github.com/kirimatt/goncordia/v2/core"
 )
 
 func TestExponentialRetry(t *testing.T) {
 	base := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
-	clk := clock.NewMock(base)
+	clk := clock.NewManual(base)
 
 	policy := core.ExponentialRetry{Base: time.Second, Max: 24 * time.Hour}
 
@@ -35,7 +35,7 @@ func TestExponentialRetry(t *testing.T) {
 }
 
 func TestExponentialRetryCapsAtMax(t *testing.T) {
-	clk := clock.NewMock(time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC))
+	clk := clock.NewManual(time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC))
 	policy := core.ExponentialRetry{Base: time.Hour, Max: 6 * time.Hour}
 
 	got := policy.NextRetryAt(10, nil, clk)
@@ -53,7 +53,7 @@ func TestExponentialRetryDoesNotOverflow(t *testing.T) {
 }
 
 func TestExponentialRetryInjectedJitter(t *testing.T) {
-	clk := clock.NewMock(time.Date(2026, 8, 16, 0, 0, 0, 0, time.UTC))
+	clk := clock.NewManual(time.Date(2026, 8, 16, 0, 0, 0, 0, time.UTC))
 	policy := core.ExponentialRetry{
 		Base: time.Second, Max: time.Hour, Jitter: 0.25,
 		Random: func() float64 { return 0 },
@@ -68,7 +68,7 @@ func TestExponentialRetryInjectedJitter(t *testing.T) {
 }
 
 func TestExponentialRetryJitterDoesNotOverflow(t *testing.T) {
-	clk := clock.NewMock(time.Unix(0, 0))
+	clk := clock.NewManual(time.Unix(0, 0))
 	max := time.Duration(1<<63 - 1)
 	policy := core.ExponentialRetry{
 		Base: max/2 + 1, Max: max, Jitter: 1,
@@ -91,7 +91,7 @@ func TestRetryDirectivesUnwrap(t *testing.T) {
 
 func TestFixedRetry(t *testing.T) {
 	base := time.Date(2024, 3, 15, 9, 0, 0, 0, time.UTC)
-	clk := clock.NewMock(base)
+	clk := clock.NewManual(base)
 
 	policy := core.FixedRetry{Delay: 30 * time.Second}
 	got := policy.NextRetryAt(5, nil, clk)
@@ -102,7 +102,7 @@ func TestFixedRetry(t *testing.T) {
 }
 
 func TestNoRetry(t *testing.T) {
-	clk := clock.NewMock(time.Now())
+	clk := clock.NewManual(time.Now())
 	got := core.NoRetry{}.NextRetryAt(1, nil, clk)
 	if !got.IsZero() {
 		t.Errorf("expected zero time, got %v", got)

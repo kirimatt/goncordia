@@ -11,8 +11,8 @@ import (
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
 
-	"github.com/kirimatt/goncordia/clock"
-	"github.com/kirimatt/goncordia/driver"
+	"github.com/kirimatt/goncordia/v2/clock"
+	"github.com/kirimatt/goncordia/v2/driver"
 )
 
 // ---- BSON document types ----

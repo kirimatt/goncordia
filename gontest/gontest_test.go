@@ -8,10 +8,10 @@ import (
 	"testing"
 	"time"
 
-	goncordia "github.com/kirimatt/goncordia"
-	"github.com/kirimatt/goncordia/core"
-	"github.com/kirimatt/goncordia/driver"
-	"github.com/kirimatt/goncordia/gontest"
+	"github.com/kirimatt/goncordia/gontest/v2"
+	goncordia "github.com/kirimatt/goncordia/v2"
+	"github.com/kirimatt/goncordia/v2/core"
+	"github.com/kirimatt/goncordia/v2/driver"
 )
 
 // --- test job types ---
@@ -61,7 +61,7 @@ func TestRequireEnqueued_wrongKindNotCounted(t *testing.T) {
 
 func TestJobs_emptyWhenNoneEnqueued(t *testing.T) {
 	_, tracker := gontest.NewClient(t)
-	if got := gontest.Jobs[EmailJob](tracker); len(got) != 0 {
+	if got, err := gontest.Jobs[EmailJob](tracker); err != nil || len(got) != 0 {
 		t.Errorf("expected 0 jobs, got %d", len(got))
 	}
 }
@@ -72,8 +72,8 @@ func TestJobs_returnsTypedArgs(t *testing.T) {
 
 	gontest.MustEnqueue[EmailJob](t, ctx, client, EmailJob{To: "x@y.com", Subject: "Hi"}, nil)
 
-	jobs := gontest.Jobs[EmailJob](tracker)
-	if len(jobs) != 1 {
+	jobs, err := gontest.Jobs[EmailJob](tracker)
+	if err != nil || len(jobs) != 1 {
 		t.Fatalf("want 1 job, got %d", len(jobs))
 	}
 	if jobs[0].Args.Subject != "Hi" {
@@ -81,7 +81,7 @@ func TestJobs_returnsTypedArgs(t *testing.T) {
 	}
 }
 
-func TestJobsE_reportsCorruptPayload(t *testing.T) {
+func TestJobs_reportsCorruptPayload(t *testing.T) {
 	ctx := context.Background()
 	_, tracker := gontest.NewClient(t)
 	_, err := tracker.Driver().Executor().JobInsertMany(ctx, []driver.JobInsertParams{{
@@ -90,12 +90,12 @@ func TestJobsE_reportsCorruptPayload(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := gontest.JobsE[EmailJob](tracker); err == nil {
-		t.Fatal("JobsE accepted corrupt payload")
+	if _, err := gontest.Jobs[EmailJob](tracker); err == nil {
+		t.Fatal("Jobs accepted corrupt payload")
 	}
 }
 
-func TestJobsE_unwrapsVersionedPayload(t *testing.T) {
+func TestJobs_unwrapsVersionedPayload(t *testing.T) {
 	ctx := context.Background()
 	_, tracker := gontest.NewClient(t)
 	payload, err := json.Marshal(EmailJob{To: "versioned@test.com", Subject: "v2"})
@@ -112,7 +112,7 @@ func TestJobsE_unwrapsVersionedPayload(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	jobs, err := gontest.JobsE[EmailJob](tracker)
+	jobs, err := gontest.Jobs[EmailJob](tracker)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -213,7 +213,7 @@ func TestNewClientWithClock_scheduledJob(t *testing.T) {
 	core.RegisterWorker(registry, core.WorkerFunc[EmailJob](func(_ context.Context, _ *core.Job[EmailJob]) error {
 		processed.Add(1)
 		return nil
-	}), core.WorkerOpts{Queue: "default"})
+	}), core.WorkerOpts{})
 
 	pool := tracker.NewWorkerPool(registry, goncordia.WorkerConfig{
 		Queues:       []string{"default"},
@@ -233,7 +233,7 @@ func TestNewClientWithClock_scheduledJob(t *testing.T) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	pool.Stop()
+	_ = pool.Shutdown(context.Background())
 }
 
 // --- Tracker.NewWorkerPool integration ---
@@ -247,7 +247,7 @@ func TestTrackerNewWorkerPool_endToEnd(t *testing.T) {
 	core.RegisterWorker(registry, core.WorkerFunc[EmailJob](func(_ context.Context, _ *core.Job[EmailJob]) error {
 		processed.Add(1)
 		return nil
-	}), core.WorkerOpts{Queue: "default"})
+	}), core.WorkerOpts{})
 
 	gontest.MustEnqueue[EmailJob](t, ctx, client, EmailJob{To: "pool@test.com"}, nil)
 
@@ -268,5 +268,5 @@ func TestTrackerNewWorkerPool_endToEnd(t *testing.T) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	pool.Stop()
+	_ = pool.Shutdown(context.Background())
 }

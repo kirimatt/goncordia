@@ -2,7 +2,7 @@
 //
 // Add the middleware to WorkerConfig to get a span and metrics for every job:
 //
-//	import otelgoncordia "github.com/kirimatt/goncordia/otel"
+//	import otelgoncordia "github.com/kirimatt/goncordia/otel/v2"
 //
 //	wp := pgxdriver.NewWorkerPool(d, registry, goncordia.WorkerConfig{
 //	    Queues:     []string{"default"},
@@ -25,14 +25,14 @@ import (
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/trace"
 
-	goncordia "github.com/kirimatt/goncordia"
-	gonclock "github.com/kirimatt/goncordia/clock"
-	"github.com/kirimatt/goncordia/core"
-	"github.com/kirimatt/goncordia/driver"
+	goncordia "github.com/kirimatt/goncordia/v2"
+	gonclock "github.com/kirimatt/goncordia/v2/clock"
+	"github.com/kirimatt/goncordia/v2/core"
+	"github.com/kirimatt/goncordia/v2/driver"
 )
 
 const (
-	instrName    = "github.com/kirimatt/goncordia"
+	instrName    = "github.com/kirimatt/goncordia/v2"
 	spanName     = "goncordia.process"
 	enqueueSpan  = "goncordia.enqueue"
 	attrKind     = "goncordia.job.kind"
@@ -255,7 +255,6 @@ func nonNegativeSeconds(duration time.Duration) float64 {
 
 var _ goncordia.ClientObserver = (*Instrumentation)(nil)
 var _ goncordia.WorkerObserver = (*Instrumentation)(nil)
-var _ goncordia.WorkerLifecycleObserver = (*Instrumentation)(nil)
 
 // NewMiddleware returns a JobMiddleware that:
 //   - creates a span for each job execution named "goncordia.process"

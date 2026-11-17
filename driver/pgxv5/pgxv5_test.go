@@ -14,11 +14,11 @@ import (
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
 	"github.com/testcontainers/testcontainers-go/wait"
 
-	"github.com/kirimatt/goncordia"
-	"github.com/kirimatt/goncordia/clock"
-	"github.com/kirimatt/goncordia/core"
-	"github.com/kirimatt/goncordia/driver/drivertest"
-	pgxdriver "github.com/kirimatt/goncordia/driver/pgxv5"
+	pgxdriver "github.com/kirimatt/goncordia/driver/pgxv5/v2"
+	"github.com/kirimatt/goncordia/v2"
+	"github.com/kirimatt/goncordia/v2/clock"
+	"github.com/kirimatt/goncordia/v2/core"
+	"github.com/kirimatt/goncordia/v2/driver/drivertest"
 )
 
 func TestPgxv5_ConcurrentMigrateAndOwnership(t *testing.T) {
@@ -124,7 +124,7 @@ func TestPgxv5_EnqueueAndProcess(t *testing.T) {
 	core.RegisterWorker(registry, core.WorkerFunc[EmailJob](func(_ context.Context, _ *core.Job[EmailJob]) error {
 		processed.Add(1)
 		return nil
-	}), core.WorkerOpts{Queue: "default", MaxRetry: 3})
+	}), core.WorkerOpts{MaxRetry: 3})
 
 	client := goncordia.NewClient(d, goncordia.ClientConfig{})
 
@@ -151,7 +151,7 @@ func TestPgxv5_EnqueueAndProcess(t *testing.T) {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	pool2.Stop()
+	_ = pool2.Shutdown(context.Background())
 }
 
 func TestPgxv5_EnqueueTx(t *testing.T) {
@@ -232,7 +232,7 @@ func TestPgxv5_ScheduledJob(t *testing.T) {
 	defer cleanup()
 
 	ctx := context.Background()
-	clk := clock.NewMock(time.Date(2024, 6, 1, 0, 0, 0, 0, time.UTC))
+	clk := clock.NewManual(time.Date(2024, 6, 1, 0, 0, 0, 0, time.UTC))
 	d := pgxdriver.New(pool, pgxdriver.WithClock(clk))
 	if err := d.Migrate(ctx); err != nil {
 		t.Fatal(err)
@@ -266,7 +266,7 @@ func TestPgxv5_RetryAndDiscard(t *testing.T) {
 	defer cleanup()
 
 	ctx := context.Background()
-	clk := clock.NewMock(time.Now())
+	clk := clock.NewManual(time.Now())
 	d := pgxdriver.New(pool, pgxdriver.WithClock(clk))
 	if err := d.Migrate(ctx); err != nil {
 		t.Fatal(err)
@@ -278,7 +278,7 @@ func TestPgxv5_RetryAndDiscard(t *testing.T) {
 	core.RegisterWorker(registry, core.WorkerFunc[EmailJob](func(_ context.Context, _ *core.Job[EmailJob]) error {
 		attempts.Add(1)
 		return errors.New("always fails")
-	}), core.WorkerOpts{Queue: "default", MaxRetry: 2})
+	}), core.WorkerOpts{MaxRetry: 2})
 
 	if _, err := client.Enqueue(ctx, EmailJob{To: "fail@test.com"}, nil); err != nil {
 		t.Fatal(err)
@@ -306,7 +306,7 @@ func TestPgxv5_RetryAndDiscard(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 
-	workerPool.Stop()
+	_ = workerPool.Shutdown(context.Background())
 	if got := attempts.Load(); got < 2 {
 		t.Errorf("expected >= 2 attempts, got %d", got)
 	}

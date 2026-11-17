@@ -13,8 +13,8 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
-	"github.com/kirimatt/goncordia/clock"
-	"github.com/kirimatt/goncordia/driver"
+	"github.com/kirimatt/goncordia/v2/clock"
+	"github.com/kirimatt/goncordia/v2/driver"
 )
 
 // errJobGone signals that a candidate job was already claimed by another worker.

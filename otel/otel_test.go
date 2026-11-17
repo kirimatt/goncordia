@@ -10,10 +10,10 @@ import (
 	"go.opentelemetry.io/otel/metric/noop"
 	nooptrace "go.opentelemetry.io/otel/trace/noop"
 
-	"github.com/kirimatt/goncordia"
-	"github.com/kirimatt/goncordia/core"
-	"github.com/kirimatt/goncordia/driver/memory"
-	otelgoncordia "github.com/kirimatt/goncordia/otel"
+	otelgoncordia "github.com/kirimatt/goncordia/otel/v2"
+	"github.com/kirimatt/goncordia/v2"
+	"github.com/kirimatt/goncordia/v2/core"
+	"github.com/kirimatt/goncordia/v2/driver/memory"
 )
 
 type emailJob struct{ To string }
@@ -63,7 +63,7 @@ func TestMiddleware_SuccessfulJob(t *testing.T) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	wp.Stop()
+	_ = wp.Shutdown(context.Background())
 }
 
 func TestInstrumentation_ClientAndWorkerObservers(t *testing.T) {
@@ -95,7 +95,7 @@ func TestInstrumentation_ClientAndWorkerObservers(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("instrumented job did not run")
 	}
-	pool.Stop()
+	_ = pool.Shutdown(context.Background())
 }
 
 func TestMiddleware_FailingJob(t *testing.T) {
@@ -126,7 +126,7 @@ func TestMiddleware_FailingJob(t *testing.T) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	wp.Stop()
+	_ = wp.Shutdown(context.Background())
 }
 
 func TestMiddleware_PanicJob(t *testing.T) {
@@ -158,5 +158,5 @@ func TestMiddleware_PanicJob(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	// Panic was recovered — pool should still be alive.
-	wp.Stop()
+	_ = wp.Shutdown(context.Background())
 }

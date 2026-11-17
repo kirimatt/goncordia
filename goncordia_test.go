@@ -7,10 +7,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kirimatt/goncordia"
-	"github.com/kirimatt/goncordia/core"
-	"github.com/kirimatt/goncordia/driver"
-	memdriver "github.com/kirimatt/goncordia/driver/memory"
+	"github.com/kirimatt/goncordia/v2"
+	"github.com/kirimatt/goncordia/v2/core"
+	"github.com/kirimatt/goncordia/v2/driver"
+	memdriver "github.com/kirimatt/goncordia/v2/driver/memory"
 )
 
 // --- test job types ---
@@ -38,7 +38,7 @@ func TestEnqueueAndProcess(t *testing.T) {
 	registry := core.NewRegistry()
 
 	w := &EmailWorker{}
-	core.RegisterWorker(registry, w, core.WorkerOpts{Queue: "default", MaxRetry: 3})
+	core.RegisterWorker(registry, w, core.WorkerOpts{MaxRetry: 3})
 
 	client := goncordia.NewClient(d, goncordia.ClientConfig{})
 
@@ -77,7 +77,7 @@ func TestEnqueueAndProcess(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 
-	pool.Stop()
+	_ = pool.Shutdown(context.Background())
 	<-done
 
 	if got := w.processed.Load(); got != 5 {
@@ -132,7 +132,7 @@ func TestQueuePauseResume(t *testing.T) {
 	registry := core.NewRegistry()
 
 	w := &EmailWorker{}
-	core.RegisterWorker(registry, w, core.WorkerOpts{Queue: "default", MaxRetry: 1})
+	core.RegisterWorker(registry, w, core.WorkerOpts{MaxRetry: 1})
 
 	ctx := context.Background()
 
@@ -174,5 +174,5 @@ func TestQueuePauseResume(t *testing.T) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	pool.Stop()
+	_ = pool.Shutdown(context.Background())
 }

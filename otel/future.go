@@ -9,8 +9,8 @@ import (
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/trace"
 
-	gonclock "github.com/kirimatt/goncordia/clock"
-	"github.com/kirimatt/goncordia/future"
+	gonclock "github.com/kirimatt/goncordia/v2/clock"
+	"github.com/kirimatt/goncordia/v2/future"
 )
 
 const (

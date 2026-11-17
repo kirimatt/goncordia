@@ -5,7 +5,7 @@ import (
 	"math/rand/v2"
 	"time"
 
-	"github.com/kirimatt/goncordia/clock"
+	"github.com/kirimatt/goncordia/v2/clock"
 )
 
 // RetryPolicy determines when a failed job should next be retried.

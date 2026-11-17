@@ -1,4 +1,4 @@
-github.com/kirimatt/goncordia v1.0.0 h1:WzxB7l3OVL45B8ciL+f8ECJVRwe9Dw/Op9E0wnJ3hF4=
-github.com/kirimatt/goncordia v1.0.0/go.mod h1:9ij3ADfrYsxyS1zXK9up8R5V9exPYCHrvMhkuHndT8U=
+github.com/kirimatt/goncordia/v2 v2.0.0-20261117224351-5e304c8536ad h1:kL/lon8QZ5cimPS+ihXRbPtnlKgGH8Kc/6LMpLDFrPA=
+github.com/kirimatt/goncordia/v2 v2.0.0-20261117224351-5e304c8536ad/go.mod h1:9DGFKBiqNXbjvUB4SmCxZZOyBZ5gvFx1BvOT6ETkTRs=
 github.com/robfig/cron/v3 v3.0.1 h1:WdRxkvbJztn8LMz/QEvLN5sBU+xKpSqwwUO1Pjr4qDs=
 github.com/robfig/cron/v3 v3.0.1/go.mod h1:eQICP3HwyT7UooqI/z+Ov+PtYAWygg1TEWWzGIFLtro=

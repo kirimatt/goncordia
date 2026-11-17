@@ -16,9 +16,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/kirimatt/goncordia/clock"
-	"github.com/kirimatt/goncordia/core"
-	"github.com/kirimatt/goncordia/driver"
+	"github.com/kirimatt/goncordia/v2/clock"
+	"github.com/kirimatt/goncordia/v2/core"
+	"github.com/kirimatt/goncordia/v2/driver"
 )
 
 // JobMiddleware wraps job execution. Call next to continue the chain.
@@ -111,13 +111,6 @@ type QueuePolicy struct {
 	KeyConcurrency []KeyConcurrencyLimit
 	// RateLimits bounds handler starts. Every configured rule must allow a start.
 	RateLimits []QueueRateLimit
-	// RateLimit bounds starts per RatePeriod using a local burst equal to the
-	// limit. Zero is unlimited.
-	// Deprecated: use RateLimits.
-	RateLimit int
-	// RatePeriod is the legacy rate-limit period. Default: 1 second.
-	// Deprecated: use RateLimits.
-	RatePeriod time.Duration
 }
 
 // WorkerConfig configures the worker pool.
@@ -163,12 +156,13 @@ type WorkerConfig struct {
 	// defaults to one third of StuckJobTimeout. A negative value disables it.
 	HeartbeatInterval time.Duration
 	// Clock overrides the time source. Defaults to clock.Real{}.
-	// Inject clock.NewMock() in tests to control time.
+	// Inject clock.NewManual() in tests to control time.
 	Clock clock.Clock
 	// Middleware is applied around each job execution in order (outermost first).
 	// Use it to add tracing, logging, or metrics without modifying job handlers.
 	Middleware []JobMiddleware
-	// Observer receives claim, heartbeat, and rescue lifecycle events.
+	// Observer receives worker lifecycle events. Combine several with
+	// WorkerObservers.
 	Observer WorkerObserver
 	// RequireLifecyclePersistence fails validation unless the driver persists
 	// fenced handler-start timestamps.
@@ -278,7 +272,7 @@ func ValidateWorkerConfig[TTx any](d driver.Driver[TTx], cfg WorkerConfig) error
 		if _, configured := queues[queue]; !configured {
 			problems = append(problems, fmt.Sprintf("QueuePolicies[%q] is not listed in Queues", queue))
 		}
-		if policy.Weight < 0 || policy.Concurrency < 0 || policy.RateLimit < 0 {
+		if policy.Weight < 0 || policy.Concurrency < 0 {
 			problems = append(problems, fmt.Sprintf("QueuePolicies[%q] contains a negative limit", queue))
 		}
 		for i, rule := range policy.RateLimits {
@@ -534,11 +528,6 @@ func (p *WorkerPool[TTx]) currentPolicyChange() <-chan struct{} {
 
 func normalizeRateLimits(queue string, policy QueuePolicy) []normalizedRateLimit {
 	configured := append([]QueueRateLimit(nil), policy.RateLimits...)
-	if policy.RateLimit > 0 {
-		configured = append(configured, QueueRateLimit{
-			Limit: policy.RateLimit, Period: policy.RatePeriod, Burst: policy.RateLimit,
-		})
-	}
 	result := make([]normalizedRateLimit, 0, len(configured))
 	seen := make(map[string]struct{}, len(configured))
 	for _, configuredRule := range configured {
@@ -597,7 +586,7 @@ func newWorkerID() string {
 
 var workerSequence atomic.Uint64
 
-// Start launches the fetch-and-process loops. Blocks until ctx is cancelled or Stop is called.
+// Start launches the fetch-and-process loops. Blocks until ctx is cancelled or Shutdown is called.
 func (p *WorkerPool[TTx]) Start(ctx context.Context) error {
 	if p.configErr != nil {
 		return p.configErr
@@ -614,9 +603,9 @@ func (p *WorkerPool[TTx]) Start(ctx context.Context) error {
 	return p.runWithPolling(ctx)
 }
 
-// Stop initiates a graceful shutdown, waiting up to ShutdownTimeout for in-flight jobs.
-// Deprecated: use Shutdown to observe whether the drain completed.
-func (p *WorkerPool[TTx]) Stop() {
+// drainOnCancel shuts the pool down after Start's context ends, waiting up to
+// ShutdownTimeout for in-flight jobs.
+func (p *WorkerPool[TTx]) drainOnCancel() {
 	ctx, cancel := clock.WithTimeout(context.Background(), p.config.Clock, p.config.ShutdownTimeout)
 	defer cancel()
 	if err := p.Shutdown(ctx); err != nil {
@@ -670,7 +659,7 @@ func (p *WorkerPool[TTx]) runMainLoop(ctx context.Context, ticks <-chan time.Tim
 	for {
 		select {
 		case <-ctx.Done():
-			p.Stop()
+			p.drainOnCancel()
 			return ctx.Err()
 		case <-p.shutdownCh:
 			return nil
@@ -866,7 +855,7 @@ func (p *WorkerPool[TTx]) fetchAndDispatch(ctx context.Context) {
 						row.StartedAt = &startedAt
 					}
 				}
-				if observer, ok := p.config.Observer.(WorkerLifecycleObserver); ok {
+				if observer := p.config.Observer; observer != nil {
 					claimWait := time.Duration(0)
 					if row.AttemptedAt != nil {
 						claimWait = startedAt.Sub(*row.AttemptedAt)
@@ -874,7 +863,7 @@ func (p *WorkerPool[TTx]) fetchAndDispatch(ctx context.Context) {
 					observer.JobStarted(claimCtx, JobStartedEvent{Job: row, StartedAt: startedAt, ClaimWait: claimWait})
 				}
 				state, jobErr := p.processRow(claimCtx, exec, row)
-				if observer, ok := p.config.Observer.(WorkerLifecycleObserver); ok {
+				if observer := p.config.Observer; observer != nil {
 					observer.JobFinished(claimCtx, JobFinishedEvent{
 						Job: row, State: state, Err: jobErr, StartedAt: startedAt, FinishedAt: p.config.Clock.Now(),
 					})
@@ -1121,7 +1110,7 @@ func (p *WorkerPool[TTx]) waitForRatePermit(ctx context.Context, exec driver.Exe
 	for {
 		now := p.config.Clock.Now()
 		if delay := p.localRateDelay(row, now); delay > 0 {
-			if observer, ok := p.config.Observer.(WorkerLifecycleObserver); ok {
+			if observer := p.config.Observer; observer != nil {
 				observer.JobRateLimited(ctx, RateLimitWaitEvent{
 					Job: row, Scope: RateLimitScopeLocal, RetryAt: now.Add(delay),
 				})
@@ -1148,7 +1137,7 @@ func (p *WorkerPool[TTx]) waitForRatePermit(ctx context.Context, exec driver.Exe
 		} else if retryAt.After(p.config.Clock.Now()) {
 			delay = retryAt.Sub(p.config.Clock.Now())
 		}
-		if observer, ok := p.config.Observer.(WorkerLifecycleObserver); ok {
+		if observer := p.config.Observer; observer != nil {
 			observer.JobRateLimited(ctx, RateLimitWaitEvent{
 				Job: row, Scope: RateLimitScopeGlobal, RetryAt: p.config.Clock.Now().Add(delay), Err: err,
 			})
@@ -1160,20 +1149,10 @@ func (p *WorkerPool[TTx]) waitForRatePermit(ctx context.Context, exec driver.Exe
 }
 
 func (p *WorkerPool[TTx]) waitForRateDelay(ctx context.Context, delay time.Duration) bool {
-	var timerC <-chan time.Time
-	stop := func() {}
-	if factory, ok := p.config.Clock.(interface {
-		NewTimer(time.Duration) clock.Timer
-	}); ok {
-		timer := factory.NewTimer(delay)
-		timerC = timer.C()
-		stop = timer.Stop
-	} else {
-		timerC = p.config.Clock.After(delay)
-	}
-	defer stop()
+	timer := p.config.Clock.NewTimer(delay)
+	defer timer.Stop()
 	select {
-	case <-timerC:
+	case <-timer.C():
 		return true
 	case <-p.currentPolicyChange():
 		return true

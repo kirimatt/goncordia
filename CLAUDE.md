@@ -10,17 +10,17 @@ Job queue engine for Go. One `Driver[TTx]` interface works across Postgres, MySQ
 
 | You use | Driver package | Import |
 |---|---|---|
-| pgx v5 | `driver/pgxv5` | `pgxdriver "github.com/kirimatt/goncordia/driver/pgxv5"` |
-| `database/sql` (Postgres, MySQL, SQLite) | `driver/stdlib` | `stdlibdriver "github.com/kirimatt/goncordia/driver/stdlib"` |
-| gorm | `driver/gorm` | `gormdriver "github.com/kirimatt/goncordia/driver/gorm"` |
-| bun | `driver/bun` | `bundriver "github.com/kirimatt/goncordia/driver/bun"` |
-| MongoDB | `driver/mongodb` | `mongodriver "github.com/kirimatt/goncordia/driver/mongodb"` |
-| Redis | `driver/redis` | `redisdriver "github.com/kirimatt/goncordia/driver/redis"` |
-| Cassandra / ScyllaDB | `driver/cassandra` | `cassandradriver "github.com/kirimatt/goncordia/driver/cassandra"` |
-| ClickHouse | `driver/clickhouse` | `clickhousedriver "github.com/kirimatt/goncordia/driver/clickhouse"` |
-| DynamoDB | `driver/dynamodb` | `dynamodbdriver "github.com/kirimatt/goncordia/driver/dynamodb"` |
-| Firestore | `driver/firestore` | `firestoredriver "github.com/kirimatt/goncordia/driver/firestore"` |
-| tests / no DB | `driver/memory` | `memorydriver "github.com/kirimatt/goncordia/driver/memory"` |
+| pgx v5 | `driver/pgxv5` | `pgxdriver "github.com/kirimatt/goncordia/driver/pgxv5/v2"` |
+| `database/sql` (Postgres, MySQL, SQLite) | `driver/stdlib` | `stdlibdriver "github.com/kirimatt/goncordia/driver/stdlib/v2"` |
+| gorm | `driver/gorm` | `gormdriver "github.com/kirimatt/goncordia/driver/gorm/v2"` |
+| bun | `driver/bun` | `bundriver "github.com/kirimatt/goncordia/driver/bun/v2"` |
+| MongoDB | `driver/mongodb` | `mongodriver "github.com/kirimatt/goncordia/driver/mongodb/v2"` |
+| Redis | `driver/redis` | `redisdriver "github.com/kirimatt/goncordia/driver/redis/v2"` |
+| Cassandra / ScyllaDB | `driver/cassandra` | `cassandradriver "github.com/kirimatt/goncordia/driver/cassandra/v2"` |
+| ClickHouse | `driver/clickhouse` | `clickhousedriver "github.com/kirimatt/goncordia/driver/clickhouse/v2"` |
+| DynamoDB | `driver/dynamodb` | `dynamodbdriver "github.com/kirimatt/goncordia/driver/dynamodb/v2"` |
+| Firestore | `driver/firestore` | `firestoredriver "github.com/kirimatt/goncordia/driver/firestore/v2"` |
+| tests / no DB | `driver/memory` | `memorydriver "github.com/kirimatt/goncordia/v2/driver/memory"` |
 
 ## Defining a job
 
@@ -43,7 +43,7 @@ core.RegisterWorker(registry, core.WorkerFunc[SendEmailArgs](
     func(ctx context.Context, job *core.Job[SendEmailArgs]) error {
         return sendEmail(job.Args.To, job.Args.Subject)
     },
-), core.WorkerOpts{Queue: "default", MaxRetry: 5})
+), core.WorkerOpts{MaxRetry: 5})
 ```
 
 ## Transactional insert (outbox pattern)
@@ -88,7 +88,7 @@ wp := pgxdriver.NewWorkerPool(d, registry, goncordia.WorkerConfig{
     Concurrency: 10,
     PollInterval: 500 * time.Millisecond,
 })
-go wp.Start(ctx)  // blocks; cancel ctx or call wp.Stop() to drain
+go wp.Start(ctx)  // blocks; cancel ctx or call wp.Shutdown(ctx) to drain
 ```
 
 ## Testing — always use the in-memory driver
@@ -97,8 +97,8 @@ No Docker, no database, deterministic time:
 
 ```go
 import (
-    "github.com/kirimatt/goncordia/gontest"
-    "github.com/kirimatt/goncordia/clock"
+    "github.com/kirimatt/goncordia/gontest/v2"
+    "github.com/kirimatt/goncordia/v2/clock"
 )
 
 // Assert that business code enqueues the right job:
@@ -189,7 +189,7 @@ Workers on these backends must be **idempotent** — a job may be executed more 
 
 ## Injected time
 
-Use `github.com/kirimatt/goncordia/clock`. Pass the same `clock.Manual` to the
+Use `github.com/kirimatt/goncordia/v2/clock`. Pass the same `clock.Manual` to the
 client, worker/scheduler config, and driver `WithClock` option in tests. Calling
 `Advance` fires due timers and tickers without sleeping.
 

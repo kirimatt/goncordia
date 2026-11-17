@@ -13,8 +13,8 @@ import (
 	"strings"
 	"time"
 
-	gonclock "github.com/kirimatt/goncordia/clock"
-	"github.com/kirimatt/goncordia/driver"
+	gonclock "github.com/kirimatt/goncordia/v2/clock"
+	"github.com/kirimatt/goncordia/v2/driver"
 )
 
 //go:embed dashboard.html

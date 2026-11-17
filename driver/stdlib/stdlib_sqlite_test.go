@@ -12,11 +12,11 @@ import (
 
 	_ "modernc.org/sqlite"
 
-	"github.com/kirimatt/goncordia"
-	"github.com/kirimatt/goncordia/clock"
-	"github.com/kirimatt/goncordia/core"
-	"github.com/kirimatt/goncordia/driver/drivertest"
-	stdlibdriver "github.com/kirimatt/goncordia/driver/stdlib"
+	stdlibdriver "github.com/kirimatt/goncordia/driver/stdlib/v2"
+	"github.com/kirimatt/goncordia/v2"
+	"github.com/kirimatt/goncordia/v2/clock"
+	"github.com/kirimatt/goncordia/v2/core"
+	"github.com/kirimatt/goncordia/v2/driver/drivertest"
 )
 
 func TestStdlibSQLite_ConcurrentMigrateAndOwnership(t *testing.T) {
@@ -162,7 +162,7 @@ func TestStdlibSQLite_EnqueueAndProcess(t *testing.T) {
 	core.RegisterWorker(registry, core.WorkerFunc[EmailJob](func(_ context.Context, _ *core.Job[EmailJob]) error {
 		processed.Add(1)
 		return nil
-	}), core.WorkerOpts{Queue: "default", MaxRetry: 3})
+	}), core.WorkerOpts{MaxRetry: 3})
 
 	client := stdlibdriver.NewClient(d, goncordia.ClientConfig{})
 	for i := 0; i < 5; i++ {
@@ -187,7 +187,7 @@ func TestStdlibSQLite_EnqueueAndProcess(t *testing.T) {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	wp.Stop()
+	_ = wp.Shutdown(context.Background())
 }
 
 func TestStdlibSQLite_EnqueueTx(t *testing.T) {
@@ -247,7 +247,7 @@ func TestStdlibSQLite_UniqueJobs(t *testing.T) {
 
 func TestStdlibSQLite_ScheduledJob(t *testing.T) {
 	ctx := context.Background()
-	clk := clock.NewMock(time.Date(2024, 6, 1, 0, 0, 0, 0, time.UTC))
+	clk := clock.NewManual(time.Date(2024, 6, 1, 0, 0, 0, 0, time.UTC))
 	d, _ := newSQLiteDriver(t, stdlibdriver.WithClock(clk))
 	client := stdlibdriver.NewClient(d, goncordia.ClientConfig{})
 
@@ -273,7 +273,7 @@ func TestStdlibSQLite_ScheduledJob(t *testing.T) {
 
 func TestStdlibSQLite_RetryAndDiscard(t *testing.T) {
 	ctx := context.Background()
-	clk := clock.NewMock(time.Now())
+	clk := clock.NewManual(time.Now())
 	d, _ := newSQLiteDriver(t, stdlibdriver.WithClock(clk))
 
 	var attempts atomic.Int64
@@ -281,7 +281,7 @@ func TestStdlibSQLite_RetryAndDiscard(t *testing.T) {
 	core.RegisterWorker(registry, core.WorkerFunc[EmailJob](func(_ context.Context, _ *core.Job[EmailJob]) error {
 		attempts.Add(1)
 		return errors.New("always fails")
-	}), core.WorkerOpts{Queue: "default", MaxRetry: 2})
+	}), core.WorkerOpts{MaxRetry: 2})
 
 	client := stdlibdriver.NewClient(d, goncordia.ClientConfig{})
 	if _, err := client.Enqueue(ctx, EmailJob{To: "fail@test.com"}, nil); err != nil {
@@ -308,5 +308,5 @@ func TestStdlibSQLite_RetryAndDiscard(t *testing.T) {
 		clk.Advance(200 * time.Millisecond)
 		time.Sleep(50 * time.Millisecond)
 	}
-	wp.Stop()
+	_ = wp.Shutdown(context.Background())
 }

@@ -1,4 +1,4 @@
-module github.com/kirimatt/goncordia/driver/dynamodb
+module github.com/kirimatt/goncordia/driver/dynamodb/v2
 
 go 1.26.0
 
@@ -9,7 +9,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/feature/dynamodb/attributevalue v1.20.64
 	github.com/aws/aws-sdk-go-v2/service/dynamodb v1.64.0
 	github.com/google/uuid v1.6.0
-	github.com/kirimatt/goncordia v1.0.1-0.20261117221011-eac235b7c801
+	github.com/kirimatt/goncordia/v2 v2.0.0-20261117224351-5e304c8536ad
 	github.com/testcontainers/testcontainers-go v0.45.0
 )
 

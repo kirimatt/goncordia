@@ -22,9 +22,9 @@ import (
 	"reflect"
 	"time"
 
-	"github.com/kirimatt/goncordia/clock"
-	"github.com/kirimatt/goncordia/core"
-	"github.com/kirimatt/goncordia/driver"
+	"github.com/kirimatt/goncordia/v2/clock"
+	"github.com/kirimatt/goncordia/v2/core"
+	"github.com/kirimatt/goncordia/v2/driver"
 )
 
 // Client enqueues jobs into the job queue.
@@ -41,9 +41,6 @@ type ClientConfig struct {
 	DefaultQueue string
 	// Clock controls period-based unique-key windows. Default: clock.Real{}.
 	Clock clock.Clock
-	// Now overrides the wall clock used for period-based unique keys.
-	// Deprecated: use Clock.
-	Now func() time.Time
 	// Observer instruments enqueue storage operations.
 	Observer ClientObserver
 	// Admission optionally rejects new work before storage access. Portable
@@ -63,7 +60,7 @@ func NewClient[TTx any](d driver.Driver[TTx], cfg ClientConfig) *Client[TTx] {
 	if cfg.DefaultQueue == "" {
 		cfg.DefaultQueue = "default"
 	}
-	if cfg.Clock == nil && cfg.Now == nil {
+	if cfg.Clock == nil {
 		cfg.Clock = clock.Real{}
 	}
 	return &Client[TTx]{driver: d, config: cfg}
@@ -324,13 +321,7 @@ func (c *Client[TTx]) buildInsertParams(args core.JobArgs, opts *core.InsertOpts
 		pipelineID = opts.PipelineID
 
 		if opts.UniqueOpts != nil {
-			var now time.Time
-			if c.config.Clock != nil {
-				now = c.config.Clock.Now()
-			} else {
-				now = c.config.Now()
-			}
-			uniqueKey, err = buildUniqueKey(args, queue, opts.UniqueOpts, now)
+			uniqueKey, err = buildUniqueKey(args, queue, opts.UniqueOpts, c.config.Clock.Now())
 			if err != nil {
 				return driver.JobInsertParams{}, err
 			}

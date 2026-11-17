@@ -10,11 +10,11 @@ import (
 	"github.com/glebarez/sqlite"
 	gormpkg "gorm.io/gorm"
 
-	"github.com/kirimatt/goncordia"
-	"github.com/kirimatt/goncordia/clock"
-	"github.com/kirimatt/goncordia/core"
-	"github.com/kirimatt/goncordia/driver/drivertest"
-	gormdriver "github.com/kirimatt/goncordia/driver/gorm"
+	gormdriver "github.com/kirimatt/goncordia/driver/gorm/v2"
+	"github.com/kirimatt/goncordia/v2"
+	"github.com/kirimatt/goncordia/v2/clock"
+	"github.com/kirimatt/goncordia/v2/core"
+	"github.com/kirimatt/goncordia/v2/driver/drivertest"
 )
 
 type EmailJob struct {
@@ -60,7 +60,7 @@ func TestGorm_EnqueueAndProcess(t *testing.T) {
 	core.RegisterWorker(registry, core.WorkerFunc[EmailJob](func(_ context.Context, _ *core.Job[EmailJob]) error {
 		processed.Add(1)
 		return nil
-	}), core.WorkerOpts{Queue: "default", MaxRetry: 3})
+	}), core.WorkerOpts{MaxRetry: 3})
 
 	client := gormdriver.NewClient(d, goncordia.ClientConfig{})
 	for i := 0; i < 3; i++ {
@@ -85,7 +85,7 @@ func TestGorm_EnqueueAndProcess(t *testing.T) {
 		}
 		time.Sleep(30 * time.Millisecond)
 	}
-	wp.Stop()
+	_ = wp.Shutdown(context.Background())
 }
 
 func TestGorm_EnqueueTx(t *testing.T) {
@@ -162,7 +162,7 @@ func TestGorm_UniqueJobs(t *testing.T) {
 }
 
 func TestGorm_ScheduledJob(t *testing.T) {
-	clk := clock.NewMock(time.Date(2024, 6, 1, 0, 0, 0, 0, time.UTC))
+	clk := clock.NewManual(time.Date(2024, 6, 1, 0, 0, 0, 0, time.UTC))
 	d, _ := newDriver(t, gormdriver.WithClock(clk))
 	ctx := context.Background()
 	client := gormdriver.NewClient(d, goncordia.ClientConfig{})
@@ -187,7 +187,7 @@ func TestGorm_ScheduledJob(t *testing.T) {
 }
 
 func TestGorm_RetryAndDiscard(t *testing.T) {
-	clk := clock.NewMock(time.Now())
+	clk := clock.NewManual(time.Now())
 	d, _ := newDriver(t, gormdriver.WithClock(clk))
 	ctx := context.Background()
 
@@ -196,7 +196,7 @@ func TestGorm_RetryAndDiscard(t *testing.T) {
 	core.RegisterWorker(registry, core.WorkerFunc[EmailJob](func(_ context.Context, _ *core.Job[EmailJob]) error {
 		attempts.Add(1)
 		return errors.New("always fails")
-	}), core.WorkerOpts{Queue: "default", MaxRetry: 2})
+	}), core.WorkerOpts{MaxRetry: 2})
 
 	client := gormdriver.NewClient(d, goncordia.ClientConfig{})
 	if _, err := client.Enqueue(ctx, EmailJob{To: "fail@test.com"}, nil); err != nil {
@@ -222,5 +222,5 @@ func TestGorm_RetryAndDiscard(t *testing.T) {
 		clk.Advance(100 * time.Millisecond)
 		time.Sleep(60 * time.Millisecond)
 	}
-	wp.Stop()
+	_ = wp.Shutdown(context.Background())
 }

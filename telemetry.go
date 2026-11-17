@@ -4,7 +4,7 @@ import (
 	"context"
 	"time"
 
-	"github.com/kirimatt/goncordia/driver"
+	"github.com/kirimatt/goncordia/v2/driver"
 )
 
 // EnqueueStart describes an enqueue operation before storage access.
@@ -68,25 +68,31 @@ type RateLimitWaitEvent struct {
 	Err     error
 }
 
-// WorkerObserver receives claim, heartbeat, and rescue lifecycle events.
+// WorkerObserver receives worker lifecycle events: claims, handler start and
+// finish, rate-limit waits, heartbeats, and rescues. Embed NopWorkerObserver
+// to implement only the events you need.
 type WorkerObserver interface {
 	JobClaimed(context.Context, driver.JobRow)
+	JobStarted(context.Context, JobStartedEvent)
+	JobFinished(context.Context, JobFinishedEvent)
+	JobRateLimited(context.Context, RateLimitWaitEvent)
 	JobHeartbeat(context.Context, HeartbeatEvent)
 	JobsRescued(context.Context, RescueEvent)
 }
 
-// WorkerLifecycleObserver is an optional extension implemented by observers
-// that need execution and rate-limit lifecycle events. WorkerObserver remains
-// source-compatible for existing instrumentation.
-type WorkerLifecycleObserver interface {
-	JobStarted(context.Context, JobStartedEvent)
-	JobFinished(context.Context, JobFinishedEvent)
-	JobRateLimited(context.Context, RateLimitWaitEvent)
-}
+// NopWorkerObserver ignores every event. Embed it in observers that handle
+// only some events.
+type NopWorkerObserver struct{}
+
+func (NopWorkerObserver) JobClaimed(context.Context, driver.JobRow)          {}
+func (NopWorkerObserver) JobStarted(context.Context, JobStartedEvent)        {}
+func (NopWorkerObserver) JobFinished(context.Context, JobFinishedEvent)      {}
+func (NopWorkerObserver) JobRateLimited(context.Context, RateLimitWaitEvent) {}
+func (NopWorkerObserver) JobHeartbeat(context.Context, HeartbeatEvent)       {}
+func (NopWorkerObserver) JobsRescued(context.Context, RescueEvent)           {}
 
 // WorkerObservers fans worker events out to several observers in order. Nil
-// observers are skipped. Lifecycle events reach only observers that implement
-// WorkerLifecycleObserver. Use it to combine, for example, OpenTelemetry
+// observers are skipped. Use it to combine, for example, OpenTelemetry
 // instrumentation with a future.Manager.
 func WorkerObservers(observers ...WorkerObserver) WorkerObserver {
 	list := make(workerObserverList, 0, len(observers))
@@ -106,6 +112,24 @@ func (l workerObserverList) JobClaimed(ctx context.Context, job driver.JobRow) {
 	}
 }
 
+func (l workerObserverList) JobStarted(ctx context.Context, event JobStartedEvent) {
+	for _, observer := range l {
+		observer.JobStarted(ctx, event)
+	}
+}
+
+func (l workerObserverList) JobFinished(ctx context.Context, event JobFinishedEvent) {
+	for _, observer := range l {
+		observer.JobFinished(ctx, event)
+	}
+}
+
+func (l workerObserverList) JobRateLimited(ctx context.Context, event RateLimitWaitEvent) {
+	for _, observer := range l {
+		observer.JobRateLimited(ctx, event)
+	}
+}
+
 func (l workerObserverList) JobHeartbeat(ctx context.Context, event HeartbeatEvent) {
 	for _, observer := range l {
 		observer.JobHeartbeat(ctx, event)
@@ -118,28 +142,7 @@ func (l workerObserverList) JobsRescued(ctx context.Context, event RescueEvent) 
 	}
 }
 
-func (l workerObserverList) JobStarted(ctx context.Context, event JobStartedEvent) {
-	for _, observer := range l {
-		if lifecycle, ok := observer.(WorkerLifecycleObserver); ok {
-			lifecycle.JobStarted(ctx, event)
-		}
-	}
-}
-
-func (l workerObserverList) JobFinished(ctx context.Context, event JobFinishedEvent) {
-	for _, observer := range l {
-		if lifecycle, ok := observer.(WorkerLifecycleObserver); ok {
-			lifecycle.JobFinished(ctx, event)
-		}
-	}
-}
-
-func (l workerObserverList) JobRateLimited(ctx context.Context, event RateLimitWaitEvent) {
-	for _, observer := range l {
-		if lifecycle, ok := observer.(WorkerLifecycleObserver); ok {
-			lifecycle.JobRateLimited(ctx, event)
-		}
-	}
-}
-
-var _ WorkerLifecycleObserver = workerObserverList(nil)
+var (
+	_ WorkerObserver = NopWorkerObserver{}
+	_ WorkerObserver = workerObserverList(nil)
+)

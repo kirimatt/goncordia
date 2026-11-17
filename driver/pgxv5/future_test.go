@@ -6,10 +6,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kirimatt/goncordia"
-	"github.com/kirimatt/goncordia/core"
-	pgxdriver "github.com/kirimatt/goncordia/driver/pgxv5"
-	"github.com/kirimatt/goncordia/future"
+	pgxdriver "github.com/kirimatt/goncordia/driver/pgxv5/v2"
+	"github.com/kirimatt/goncordia/v2"
+	"github.com/kirimatt/goncordia/v2/core"
+	"github.com/kirimatt/goncordia/v2/future"
 )
 
 type doubleArgs struct{ N int }

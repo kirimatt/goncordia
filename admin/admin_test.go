@@ -10,11 +10,11 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/kirimatt/goncordia"
-	"github.com/kirimatt/goncordia/admin"
-	"github.com/kirimatt/goncordia/core"
-	"github.com/kirimatt/goncordia/driver"
-	"github.com/kirimatt/goncordia/driver/memory"
+	"github.com/kirimatt/goncordia/v2"
+	"github.com/kirimatt/goncordia/v2/admin"
+	"github.com/kirimatt/goncordia/v2/core"
+	"github.com/kirimatt/goncordia/v2/driver"
+	"github.com/kirimatt/goncordia/v2/driver/memory"
 )
 
 type args struct{ Value string }
