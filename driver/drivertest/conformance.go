@@ -432,3 +432,55 @@ func fetchEventually(t *testing.T, ctx context.Context, exec driver.Executor, qu
 		time.Sleep(25 * time.Millisecond)
 	}
 }
+
+// RunResults verifies a driver.JobResultStore: missing results report
+// ErrNotFound, writes replace earlier values, deletes are idempotent, and
+// deleting a job also removes its result.
+func RunResults(t *testing.T, exec driver.Executor) {
+	t.Helper()
+	ctx := context.Background()
+	store, ok := exec.(driver.JobResultStore)
+	if !ok {
+		t.Fatalf("%T does not implement driver.JobResultStore", exec)
+	}
+	inserted, err := exec.JobInsertMany(ctx, []driver.JobInsertParams{{
+		Queue: "results_conformance", Kind: "result_test", Args: []byte(`{}`), MaxRetry: 1,
+	}})
+	if err != nil || len(inserted) != 1 || inserted[0].Job == nil {
+		t.Fatalf("insert: %+v, %v", inserted, err)
+	}
+	id := inserted[0].Job.ID
+
+	if _, err := store.JobResultGet(ctx, id); !errors.Is(err, driver.ErrNotFound) {
+		t.Fatalf("get before put: err = %v, want ErrNotFound", err)
+	}
+	if err := store.JobResultPut(ctx, id, []byte(`{"v":1}`)); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	if err := store.JobResultPut(ctx, id, []byte(`{"v":2}`)); err != nil {
+		t.Fatalf("overwrite: %v", err)
+	}
+	got, err := store.JobResultGet(ctx, id)
+	if err != nil || string(got) != `{"v":2}` {
+		t.Fatalf("get = %q, %v; want last write", got, err)
+	}
+	if err := store.JobResultDelete(ctx, id); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	if err := store.JobResultDelete(ctx, id); err != nil {
+		t.Fatalf("repeated delete: %v", err)
+	}
+	if _, err := store.JobResultGet(ctx, id); !errors.Is(err, driver.ErrNotFound) {
+		t.Fatalf("get after delete: err = %v, want ErrNotFound", err)
+	}
+
+	if err := store.JobResultPut(ctx, id, []byte(`"kept"`)); err != nil {
+		t.Fatalf("put before job delete: %v", err)
+	}
+	if err := exec.JobDelete(ctx, id); err != nil {
+		t.Fatalf("job delete: %v", err)
+	}
+	if _, err := store.JobResultGet(ctx, id); !errors.Is(err, driver.ErrNotFound) {
+		t.Fatalf("result survived job delete: err = %v", err)
+	}
+}

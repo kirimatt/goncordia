@@ -28,6 +28,7 @@ type Driver struct {
 	notify  map[string][]chan driver.Notification
 	leaders map[string]memoryLeader
 	cursors map[string]time.Time
+	results map[string][]byte
 	clk     clock.Clock
 }
 
@@ -52,6 +53,7 @@ func New(opts ...Option) *Driver {
 		notify:  make(map[string][]chan driver.Notification),
 		leaders: make(map[string]memoryLeader),
 		cursors: make(map[string]time.Time),
+		results: make(map[string][]byte),
 		clk:     clock.Real{},
 	}
 	for _, o := range opts {
@@ -377,6 +379,37 @@ func (e *executor) JobDelete(_ context.Context, id string) error {
 		return fmt.Errorf("%w: job %q", driver.ErrNotFound, id)
 	}
 	delete(e.d.jobs, id)
+	delete(e.d.results, id)
+	return nil
+}
+
+// JobResultPut stores a handler result. The job must exist.
+func (e *executor) JobResultPut(_ context.Context, jobID string, value []byte) error {
+	e.d.mu.Lock()
+	defer e.d.mu.Unlock()
+	if _, ok := e.d.jobs[jobID]; !ok {
+		return fmt.Errorf("%w: job %q", driver.ErrNotFound, jobID)
+	}
+	e.d.results[jobID] = append([]byte(nil), value...)
+	return nil
+}
+
+// JobResultGet returns a stored handler result or driver.ErrNotFound.
+func (e *executor) JobResultGet(_ context.Context, jobID string) ([]byte, error) {
+	e.d.mu.Lock()
+	defer e.d.mu.Unlock()
+	value, ok := e.d.results[jobID]
+	if !ok {
+		return nil, fmt.Errorf("%w: result for job %q", driver.ErrNotFound, jobID)
+	}
+	return append([]byte(nil), value...), nil
+}
+
+// JobResultDelete removes a stored handler result. Missing results are ignored.
+func (e *executor) JobResultDelete(_ context.Context, jobID string) error {
+	e.d.mu.Lock()
+	defer e.d.mu.Unlock()
+	delete(e.d.results, jobID)
 	return nil
 }
 
@@ -597,3 +630,4 @@ func (d *Driver) AllJobs() []driver.JobRow {
 // compile-time interface checks
 var _ driver.Driver[NoTx] = (*Driver)(nil)
 var _ driver.Executor = (*executor)(nil)
+var _ driver.JobResultStore = (*executor)(nil)
