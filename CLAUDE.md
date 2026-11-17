@@ -129,9 +129,13 @@ f, _ := future.Enqueue[int](ctx, m, client, SumArgs{A: 2, B: 3}, nil)
 sum, err := f.Await(ctx) // errors.Is(err, future.ErrDiscarded / ErrCancelled / ErrNoResult)
 ```
 
+Full runnable examples: `future/example_test.go` (memory) and
+`driver/pgxv5/example_future_test.go` (Postgres with `EnqueueTx`).
+
 Use `goncordia.WorkerObservers(a, b)` to combine the Manager with OTel
 instrumentation, and `otelgoncordia.NewFutureInstrumentation()` as
-`future.Config.Observer` for await/store spans and metrics.
+`future.Config.Observer` for await/store spans and metrics. Custom observers embed
+`goncordia.NopWorkerObserver` and override only the events they need.
 
 ## Periodic / cron jobs
 
@@ -181,6 +185,8 @@ if err == nil {
 Workers on these backends must be **idempotent** — a job may be executed more than once if a worker crashes after claiming but before completing. Use `UniqueOpts` or application-level deduplication (e.g. check-then-insert with a unique key) to guard against duplicates.
 
 ## Common mistakes
+
+- **Import paths**: v2 uses `github.com/kirimatt/goncordia/v2/...` for the root module and `github.com/kirimatt/goncordia/driver/<name>/v2` for drivers. `WorkerPool.Stop`, `ClientConfig.Now`, and `QueuePolicy.RateLimit` no longer exist; see `MIGRATING_TO_V2.md`.
 
 - **Redis / Cassandra / ClickHouse / DynamoDB**: `EnqueueTx` is rejected. Use the post-commit enqueue pattern for at-least-once delivery.
 - **MongoDB**: requires a replica set; standalone MongoDB will fail at `New()`.

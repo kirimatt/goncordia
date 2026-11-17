@@ -20,10 +20,9 @@
 //
 // Futures work with every driver. Job state is read through
 // Executor.JobGetByID and results are stored by the driver, or by Config.Store
-// when it is set. When the producer and
-// the worker pool share a Manager in one process, and the Manager is installed
-// as (or inside goncordia.WorkerObservers for) WorkerConfig.Observer, Await
-// wakes as soon as the job finishes. Otherwise it polls storage every
+// when it is set. When the producer and the worker pool share a Manager in one
+// process, and the Manager is installed as (or inside goncordia.WorkerObservers
+// for) WorkerConfig.Observer, Await wakes as soon as the job finishes. Otherwise it polls storage every
 // Config.PollInterval on the injected clock.
 //
 // Delivery is at-least-once. A handler may run again after a crash or a failed

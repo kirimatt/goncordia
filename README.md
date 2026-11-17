@@ -1,8 +1,8 @@
 # goncordia
 
-[![CI](https://github.com/kirimatt/goncordia/v2/actions/workflows/ci.yml/badge.svg)](https://github.com/kirimatt/goncordia/v2/actions/workflows/ci.yml)
+[![CI](https://github.com/kirimatt/goncordia/actions/workflows/ci.yml/badge.svg)](https://github.com/kirimatt/goncordia/actions/workflows/ci.yml)
 [![Go Reference](https://pkg.go.dev/badge/github.com/kirimatt/goncordia/v2.svg)](https://pkg.go.dev/github.com/kirimatt/goncordia/v2)
-[![GitHub release](https://img.shields.io/github/v/tag/kirimatt/goncordia?label=version)](https://github.com/kirimatt/goncordia/v2/releases)
+[![GitHub release](https://img.shields.io/github/v/tag/kirimatt/goncordia?label=version)](https://github.com/kirimatt/goncordia/releases)
 
 [Changelog](CHANGELOG.md)
 
@@ -331,7 +331,7 @@ cfg, _ := config.LoadDefaultConfig(ctx)
 svc := dynamodb.NewFromConfig(cfg)
 
 d := dynamodbdriver.New(svc)
-d.Migrate(ctx)  // creates goncordia_jobs + goncordia_uniq + goncordia_queues + goncordia_leaders (idempotent)
+d.Migrate(ctx)  // creates goncordia_jobs, _uniq, _queues, _leaders, _schedule_cursors, _job_results (idempotent)
 
 client := dynamodbdriver.NewClient(d, goncordia.ClientConfig{})
 client.Enqueue(ctx, SendEmailArgs{To: "user@example.com", Subject: "Welcome"}, nil)
@@ -622,6 +622,11 @@ and worker pool share a `Manager` in one process, `Await` wakes immediately.
 Across processes it polls every `PollInterval` on the injected clock. Delivery
 stays at-least-once: the last stored value wins if a handler runs twice.
 
+Runnable examples: [`future/example_test.go`](future/example_test.go) runs the
+whole flow on the in-memory driver with a `clock.Manual`, and
+[`driver/pgxv5/example_future_test.go`](driver/pgxv5/example_future_test.go)
+enqueues with `EnqueueTx` inside a Postgres transaction and awaits the result.
+
 ### Versioned payloads
 
 Version 1 remains plain legacy JSON. A type may declare a newer version and the
@@ -895,7 +900,7 @@ func (d *MyDriver) Listener() driver.Listener          { return nil } // nil = p
 func (d *MyDriver) Close() error                       { return nil }
 ```
 
-See [`driver/driver.go`](driver/driver.go) for the full core interface and optional rescue/admin capabilities, and [`driver/memory/memory.go`](driver/memory/memory.go) for a reference implementation. Driver authors can reuse `driver/drivertest.Run` for the base contract and `driver/drivertest.RunScheduled` with an injected `clock.Manual` for scheduled-job conformance. The base contract includes opaque job/queue pagination, deterministic ordering, invalid-cursor classification, fencing, and typed stale-claim behavior.
+See [`driver/driver.go`](driver/driver.go) for the full core interface and optional rescue/admin capabilities, and [`driver/memory/memory.go`](driver/memory/memory.go) for a reference implementation. Every `Executor` also implements `driver.JobResultStore` (`JobResultPut`, `JobResultGet`, `JobResultDelete`; `JobDelete` removes the result too), which `driver/drivertest.RunResults` verifies. Driver authors can reuse `driver/drivertest.Run` for the base contract and `driver/drivertest.RunScheduled` with an injected `clock.Manual` for scheduled-job conformance. The base contract includes opaque job/queue pagination, deterministic ordering, invalid-cursor classification, fencing, and typed stale-claim behavior.
 
 ---
 
@@ -1130,6 +1135,25 @@ Outcomes are `completed`, `discarded`, `cancelled`, `no_result`, `not_found`,
 Few wakeups relative to polls mean producers and workers run in different
 processes, and await latency is bounded by `PollInterval`.
 
+### Custom observers
+
+`WorkerConfig.Observer` receives every worker lifecycle event: claim, handler
+start and finish, rate-limit wait, heartbeat, and rescue. Embed
+`goncordia.NopWorkerObserver` to handle only the events you need, and combine
+observers with `goncordia.WorkerObservers`:
+
+```go
+type slowJobs struct{ goncordia.NopWorkerObserver }
+
+func (slowJobs) JobFinished(ctx context.Context, e goncordia.JobFinishedEvent) {
+    if e.FinishedAt.Sub(e.StartedAt) > time.Minute {
+        slog.WarnContext(ctx, "slow job", "kind", e.Job.Kind, "id", e.Job.ID)
+    }
+}
+
+Observer: goncordia.WorkerObservers(instrumentation, futures, slowJobs{}),
+```
+
 You can also add your own middleware for logging or custom metrics:
 
 ```go
@@ -1179,7 +1203,7 @@ goncordia/
 │   └── firestore/         # Cloud Firestore (RunTransaction; ACID inserts)
 ├── future/                # Future[R]: enqueue a job and Await its handler's value
 ├── gontest/               # test helpers (Tracker, WorkerHelper, MockClock)
-└── otel/                  # OpenTelemetry middleware (spans + metrics)
+└── otel/                  # OpenTelemetry middleware, worker and future instrumentation
 ```
 
 ---

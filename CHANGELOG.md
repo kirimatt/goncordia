@@ -9,7 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Breaking (v2)
+---
+
+## [v2.0.0] — 2026-11-18
+
+### Breaking
 - Module paths gain the `/v2` suffix (`github.com/kirimatt/goncordia/v2`,
   `github.com/kirimatt/goncordia/driver/pgxv5/v2`, ...). See
   `MIGRATING_TO_V2.md`.
@@ -24,12 +28,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `clock.Clock` requires `NewTimer`.
 
 ### Added
+- `goncordia.NopWorkerObserver` for observers that handle only some events.
+- Runnable futures examples for the in-memory driver and pgx v5.
 - `future` package: `future.Enqueue` / `EnqueueTx` return a `Future[R]` whose
   `Await` returns the value produced by a `future.RegisterWorker` handler, with
   typed `ErrDiscarded`, `ErrCancelled`, and `ErrNoResult` outcomes, `TryGet`,
   and `future.Of` for jobs enqueued elsewhere. Waiters in the worker's process
   wake on completion; others poll on the injected clock.
-- Optional `driver.JobResultStore` executor capability with the
+- `driver.JobResultStore`, embedded in every `Executor`, with the
   `drivertest.RunResults` conformance suite, implemented by every driver:
   memory, pgxv5 and stdlib (migration 008, `goncordia_job_results`), gorm,
   bun, MongoDB, Redis, Cassandra, ClickHouse, DynamoDB (new

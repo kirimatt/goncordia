@@ -68,3 +68,10 @@ func (metrics) JobFinished(ctx context.Context, e goncordia.JobFinishedEvent) { 
   absent), and `JobResultDelete`, and delete a job's result in `JobDelete`.
   `drivertest.RunResults` checks the contract.
 - `clock.Clock` now requires `NewTimer(time.Duration) clock.Timer`.
+
+## 6. Unchanged
+
+Database schemas other than the new results table, job payloads, metric and
+span names, and the OpenTelemetry instrumentation scope
+(`github.com/kirimatt/goncordia`) stay the same, so dashboards and alerts keep
+working.
