@@ -612,11 +612,13 @@ later := future.Of[Thumbnail](m, f.ID()) // follow a job enqueued elsewhere
 completed by a plain worker, and `driver.ErrNotFound` for an unknown job. Use
 `EnqueueTx` the same way, and call `Await` only after the transaction commits.
 
-Job state is read through the portable `JobGetByID`, so futures work with every
-driver. Results are written to `future.Config.Store` or, when it is nil, to the
-driver itself if its executor implements `driver.JobResultStore` (the in-memory
-driver does). Any store can be paired with any driver: for example, jobs in
-Postgres and results in your own Redis-backed `JobResultStore`. When producer
+Futures work with every driver. Job state is read through the portable
+`JobGetByID`, and every built-in driver implements `driver.JobResultStore`, so
+results live next to the jobs: a `goncordia_job_results` table (SQL, Cassandra,
+ClickHouse, DynamoDB — run `Migrate` after upgrading), collection (MongoDB,
+Firestore), or key (Redis). Deleting a job deletes its result. Set
+`future.Config.Store` to keep results elsewhere, for example jobs in Postgres
+and results in your own Redis-backed `JobResultStore`. When producer
 and worker pool share a `Manager` in one process, `Await` wakes immediately.
 Across processes it polls every `PollInterval` on the injected clock. Delivery
 stays at-least-once: the last stored value wins if a handler runs twice.

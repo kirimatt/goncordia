@@ -119,7 +119,7 @@ clk.Advance(2 * time.Hour)  // job is now available
 ## Waiting for a job's result (futures)
 
 ```go
-m, _ := future.New(d, future.Config{})            // driver must implement driver.JobResultStore, or set Config.Store
+m, _ := future.New(d, future.Config{})            // every built-in driver stores results; run Migrate after upgrading
 future.RegisterWorker(registry, m, func(ctx context.Context, job *core.Job[SumArgs]) (int, error) {
     return job.Args.A + job.Args.B, nil
 }, core.WorkerOpts{})
