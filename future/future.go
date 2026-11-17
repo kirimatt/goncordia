@@ -18,9 +18,9 @@
 //	f, err := future.Enqueue[Thumbnail](ctx, m, client, ResizeArgs{ImageID: id}, nil)
 //	thumb, err := f.Await(ctx)
 //
-// Futures work with every driver. Job state is read through the portable
-// Executor.JobGetByID. Results go to Config.Store or, when that is nil, to the
-// driver executor if it implements driver.JobResultStore. When the producer and
+// Futures work with every driver. Job state is read through
+// Executor.JobGetByID and results are stored by the driver, or by Config.Store
+// when it is set. When the producer and
 // the worker pool share a Manager in one process, and the Manager is installed
 // as (or inside goncordia.WorkerObservers for) WorkerConfig.Observer, Await
 // wakes as soon as the job finishes. Otherwise it polls storage every
@@ -38,10 +38,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/kirimatt/goncordia"
-	"github.com/kirimatt/goncordia/clock"
-	"github.com/kirimatt/goncordia/core"
-	"github.com/kirimatt/goncordia/driver"
+	"github.com/kirimatt/goncordia/v2"
+	"github.com/kirimatt/goncordia/v2/clock"
+	"github.com/kirimatt/goncordia/v2/core"
+	"github.com/kirimatt/goncordia/v2/driver"
 )
 
 // DefaultPollInterval is used when Config.PollInterval is zero.
@@ -49,8 +49,7 @@ const DefaultPollInterval = time.Second
 
 // Config configures a Manager.
 type Config struct {
-	// Store persists handler results. Nil uses the driver executor when it
-	// implements driver.JobResultStore.
+	// Store persists handler results. Nil stores them with the driver.
 	Store driver.JobResultStore
 	// PollInterval bounds how long Await sleeps between storage reads when no
 	// local completion signal arrives. Default: DefaultPollInterval.
@@ -70,6 +69,8 @@ type jobReader interface {
 // Manager is safe for concurrent use and should be shared by the producers and
 // worker pools of a process.
 type Manager struct {
+	goncordia.NopWorkerObserver
+
 	jobs     jobReader
 	store    driver.JobResultStore
 	clock    clock.Clock
@@ -80,8 +81,8 @@ type Manager struct {
 	waiters map[string]map[chan struct{}]struct{}
 }
 
-// New creates a Manager for d. It fails with driver.ErrUnsupported when
-// Config.Store is nil and the driver cannot store results itself.
+// New creates a Manager for d. Results are stored by the driver unless
+// Config.Store is set.
 func New[TTx any](d driver.Driver[TTx], cfg Config) (*Manager, error) {
 	if d == nil {
 		return nil, errors.New("goncordia/future: nil driver")
@@ -89,11 +90,7 @@ func New[TTx any](d driver.Driver[TTx], cfg Config) (*Manager, error) {
 	exec := d.Executor()
 	store := cfg.Store
 	if store == nil {
-		var ok bool
-		if store, ok = exec.(driver.JobResultStore); !ok {
-			return nil, fmt.Errorf("%w: driver %q does not store job results; set future.Config.Store",
-				driver.ErrUnsupported, d.Name())
-		}
+		store = exec
 	}
 	if cfg.PollInterval < 0 {
 		return nil, fmt.Errorf("goncordia/future: negative PollInterval %s", cfg.PollInterval)
@@ -347,21 +344,6 @@ func (m *Manager) waiting(jobID string) int {
 	return len(m.waiters[jobID])
 }
 
-// JobClaimed implements goncordia.WorkerObserver.
-func (*Manager) JobClaimed(context.Context, driver.JobRow) {}
-
-// JobHeartbeat implements goncordia.WorkerObserver.
-func (*Manager) JobHeartbeat(context.Context, goncordia.HeartbeatEvent) {}
-
-// JobsRescued implements goncordia.WorkerObserver.
-func (*Manager) JobsRescued(context.Context, goncordia.RescueEvent) {}
-
-// JobStarted implements goncordia.WorkerLifecycleObserver.
-func (*Manager) JobStarted(context.Context, goncordia.JobStartedEvent) {}
-
-// JobRateLimited implements goncordia.WorkerLifecycleObserver.
-func (*Manager) JobRateLimited(context.Context, goncordia.RateLimitWaitEvent) {}
-
 // JobFinished wakes local Await calls once the worker has persisted a
 // terminal state. Retryable outcomes keep waiters asleep.
 func (m *Manager) JobFinished(_ context.Context, event goncordia.JobFinishedEvent) {
@@ -371,7 +353,4 @@ func (m *Manager) JobFinished(_ context.Context, event goncordia.JobFinishedEven
 	}
 }
 
-var (
-	_ goncordia.WorkerObserver          = (*Manager)(nil)
-	_ goncordia.WorkerLifecycleObserver = (*Manager)(nil)
-)
+var _ goncordia.WorkerObserver = (*Manager)(nil)

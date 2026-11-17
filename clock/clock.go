@@ -13,15 +13,8 @@ func WithTimeout(parent context.Context, clk Clock, d time.Duration) (context.Co
 	ctx := &timeoutContext{
 		parent: parent, done: make(chan struct{}), deadline: clk.Now().Add(d),
 	}
-	var timerC <-chan time.Time
-	stopTimer := func() {}
-	if factory, ok := clk.(interface{ NewTimer(time.Duration) Timer }); ok {
-		timer := factory.NewTimer(d)
-		timerC = timer.C()
-		stopTimer = timer.Stop
-	} else {
-		timerC = clk.After(d)
-	}
+	timer := clk.NewTimer(d)
+	timerC, stopTimer := timer.C(), timer.Stop
 	go func() {
 		defer stopTimer()
 		select {
@@ -88,6 +81,7 @@ type Clock interface {
 	Since(time.Time) time.Duration
 	After(time.Duration) <-chan time.Time
 	NewTicker(time.Duration) Ticker
+	NewTimer(time.Duration) Timer
 }
 
 // Real is the production clock. Persisted timestamps are always UTC.
@@ -131,11 +125,6 @@ func NewManual(t time.Time) *Manual {
 	}
 	return &Manual{now: t, timers: make(map[*manualTimer]struct{})}
 }
-
-// Mock and NewMock are compatibility aliases for the former test clock names.
-type Mock = Manual
-
-func NewMock(t time.Time) *Manual { return NewManual(t) }
 
 func (m *Manual) Now() time.Time {
 	m.mu.Lock()

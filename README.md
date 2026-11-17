@@ -1,8 +1,8 @@
 # goncordia
 
-[![CI](https://github.com/kirimatt/goncordia/actions/workflows/ci.yml/badge.svg)](https://github.com/kirimatt/goncordia/actions/workflows/ci.yml)
-[![Go Reference](https://pkg.go.dev/badge/github.com/kirimatt/goncordia.svg)](https://pkg.go.dev/github.com/kirimatt/goncordia)
-[![GitHub release](https://img.shields.io/github/v/tag/kirimatt/goncordia?label=version)](https://github.com/kirimatt/goncordia/releases)
+[![CI](https://github.com/kirimatt/goncordia/v2/actions/workflows/ci.yml/badge.svg)](https://github.com/kirimatt/goncordia/v2/actions/workflows/ci.yml)
+[![Go Reference](https://pkg.go.dev/badge/github.com/kirimatt/goncordia/v2.svg)](https://pkg.go.dev/github.com/kirimatt/goncordia/v2)
+[![GitHub release](https://img.shields.io/github/v/tag/kirimatt/goncordia?label=version)](https://github.com/kirimatt/goncordia/v2/releases)
 
 [Changelog](CHANGELOG.md)
 
@@ -91,46 +91,46 @@ tx.Commit(ctx)  // job and order appear atomically
 Requires Go 1.26 or newer.
 
 ```bash
-go get github.com/kirimatt/goncordia@v1.0.0
+go get github.com/kirimatt/goncordia/v2@v2.0.0
 ```
 
 Pick a driver:
 
 ```bash
 # PostgreSQL via pgx v5
-go get github.com/kirimatt/goncordia/driver/pgxv5@v1.0.0
+go get github.com/kirimatt/goncordia/driver/pgxv5/v2@v2.0.0
 
 # PostgreSQL / MySQL / SQLite via database/sql
-go get github.com/kirimatt/goncordia/driver/stdlib@v1.0.0
+go get github.com/kirimatt/goncordia/driver/stdlib/v2@v2.0.0
 
 # gorm adapter
-go get github.com/kirimatt/goncordia/driver/gorm@v1.0.0
+go get github.com/kirimatt/goncordia/driver/gorm/v2@v2.0.0
 
 # bun adapter
-go get github.com/kirimatt/goncordia/driver/bun@v1.0.0
+go get github.com/kirimatt/goncordia/driver/bun/v2@v2.0.0
 
 # MongoDB (replica set required)
-go get github.com/kirimatt/goncordia/driver/mongodb@v1.0.0
+go get github.com/kirimatt/goncordia/driver/mongodb/v2@v2.0.0
 
 # Redis
-go get github.com/kirimatt/goncordia/driver/redis@v1.0.0
+go get github.com/kirimatt/goncordia/driver/redis/v2@v2.0.0
 
 # Cassandra / ScyllaDB
-go get github.com/kirimatt/goncordia/driver/cassandra@v1.0.0
+go get github.com/kirimatt/goncordia/driver/cassandra/v2@v2.0.0
 
 # ClickHouse
-go get github.com/kirimatt/goncordia/driver/clickhouse@v1.0.0
+go get github.com/kirimatt/goncordia/driver/clickhouse/v2@v2.0.0
 
 # Amazon DynamoDB
-go get github.com/kirimatt/goncordia/driver/dynamodb@v1.0.0
+go get github.com/kirimatt/goncordia/driver/dynamodb/v2@v2.0.0
 
 # Cloud Firestore
-go get github.com/kirimatt/goncordia/driver/firestore@v1.0.0
+go get github.com/kirimatt/goncordia/driver/firestore/v2@v2.0.0
 ```
 
 The root v1 module intentionally does not download every database SDK. Driver,
 OpenTelemetry, and testing dependencies arrive only when their submodule is
-selected. See [Migrating to v1](MIGRATING_TO_V1.md) for upgrade commands.
+selected. See [Migrating to v2](MIGRATING_TO_V2.md) for upgrade commands.
 
 ---
 
@@ -140,9 +140,9 @@ selected. See [Migrating to v1](MIGRATING_TO_V1.md) for upgrade commands.
 
 ```go
 import (
-    "github.com/kirimatt/goncordia"
-    "github.com/kirimatt/goncordia/core"
-    pgxdriver "github.com/kirimatt/goncordia/driver/pgxv5"
+    "github.com/kirimatt/goncordia/v2"
+    "github.com/kirimatt/goncordia/v2/core"
+    pgxdriver "github.com/kirimatt/goncordia/driver/pgxv5/v2"
     "github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -191,7 +191,7 @@ tx.Commit(ctx)  // job and order are atomic
 
 ```go
 import (
-    mongodriver "github.com/kirimatt/goncordia/driver/mongodb"
+    mongodriver "github.com/kirimatt/goncordia/driver/mongodb/v2"
     "go.mongodb.org/mongo-driver/mongo"
     "go.mongodb.org/mongo-driver/mongo/options"
 )
@@ -216,7 +216,7 @@ mongoClient.UseSession(ctx, func(sc mongo.SessionContext) error {
 
 ```go
 import (
-    gormdriver "github.com/kirimatt/goncordia/driver/gorm"
+    gormdriver "github.com/kirimatt/goncordia/driver/gorm/v2"
     "gorm.io/gorm"
 )
 
@@ -236,7 +236,7 @@ db.Transaction(func(tx *gorm.DB) error {
 
 ```go
 import (
-    bundriver "github.com/kirimatt/goncordia/driver/bun"
+    bundriver "github.com/kirimatt/goncordia/driver/bun/v2"
     "github.com/uptrace/bun"
 )
 
@@ -255,7 +255,7 @@ tx.Commit()
 
 ```go
 import (
-    redisdriver "github.com/kirimatt/goncordia/driver/redis"
+    redisdriver "github.com/kirimatt/goncordia/driver/redis/v2"
     "github.com/redis/go-redis/v9"
 )
 
@@ -275,7 +275,7 @@ client.Enqueue(ctx, SendEmailArgs{To: "user@example.com", Subject: "Welcome"}, n
 
 ```go
 import (
-    cassandradriver "github.com/kirimatt/goncordia/driver/cassandra"
+    cassandradriver "github.com/kirimatt/goncordia/driver/cassandra/v2"
     "github.com/gocql/gocql"
 )
 
@@ -298,7 +298,7 @@ client.Enqueue(ctx, SendEmailArgs{To: "user@example.com", Subject: "Welcome"}, n
 
 ```go
 import (
-    clickhousedriver "github.com/kirimatt/goncordia/driver/clickhouse"
+    clickhousedriver "github.com/kirimatt/goncordia/driver/clickhouse/v2"
     "github.com/ClickHouse/clickhouse-go/v2"
 )
 
@@ -324,7 +324,7 @@ client.Enqueue(ctx, SendEmailArgs{To: "user@example.com", Subject: "Welcome"}, n
 import (
     "github.com/aws/aws-sdk-go-v2/config"
     "github.com/aws/aws-sdk-go-v2/service/dynamodb"
-    dynamodbdriver "github.com/kirimatt/goncordia/driver/dynamodb"
+    dynamodbdriver "github.com/kirimatt/goncordia/driver/dynamodb/v2"
 )
 
 cfg, _ := config.LoadDefaultConfig(ctx)
@@ -346,7 +346,7 @@ client.Enqueue(ctx, SendEmailArgs{To: "user@example.com", Subject: "Welcome"}, n
 ```go
 import (
     "cloud.google.com/go/firestore"
-    firestoredriver "github.com/kirimatt/goncordia/driver/firestore"
+    firestoredriver "github.com/kirimatt/goncordia/driver/firestore/v2"
 )
 
 fsClient, _ := firestore.NewClient(ctx, "my-gcp-project")
@@ -371,7 +371,7 @@ fsClient.RunTransaction(ctx, func(ctx context.Context, tx *firestore.Transaction
 ```go
 import (
     _ "modernc.org/sqlite"
-    stdlibdriver "github.com/kirimatt/goncordia/driver/stdlib"
+    stdlibdriver "github.com/kirimatt/goncordia/driver/stdlib/v2"
 )
 
 db, _ := sql.Open("sqlite", "./jobs.db")
@@ -523,8 +523,7 @@ coordinate all pools that share the same backend, queue name, and rule. Global
 permits use an O(1) compare-and-swap cursor and return an exact retry time.
 Waiting jobs retain and heartbeat their claims, consume at most one execution
 slot per rate-limited queue, and yield without entering the handler during
-shutdown. The deprecated `RateLimit`/`RatePeriod` fields remain compatible and
-behave as a local rule whose burst equals its limit.
+shutdown.
 
 ClickHouse is rejected for global rate limits and distributed pipelines because
 it cannot provide the required linearizable CAS/lease guarantees.
@@ -585,7 +584,7 @@ handler returns. Register the handler with `future.RegisterWorker`; it returns
 job is marked completed.
 
 ```go
-import "github.com/kirimatt/goncordia/future"
+import "github.com/kirimatt/goncordia/v2/future"
 
 m, err := future.New(d, future.Config{PollInterval: 500 * time.Millisecond})
 
@@ -651,7 +650,7 @@ schedule. `InsertOpts.PayloadVersion` can override the type-provided version.
 ## Admin dashboard, health, and metrics
 
 ```go
-import "github.com/kirimatt/goncordia/admin"
+import "github.com/kirimatt/goncordia/v2/admin"
 
 handler := admin.New(d,
     admin.WithReadOnly(false),
@@ -751,7 +750,7 @@ durations of zero disable that state, and negative durations are rejected.
 `CronScheduler` enqueues jobs on a schedule. Pair it with a `WorkerPool` that processes them.
 
 ```go
-import "github.com/kirimatt/goncordia/core"
+import "github.com/kirimatt/goncordia/v2/core"
 
 cs := goncordia.NewCronScheduler(d, []goncordia.PeriodicJob{
     {
@@ -847,7 +846,7 @@ return core.RetryAfter(30*time.Second, err)
 return core.RetryAt(nextWindow, err)
 
 // Custom
-import "github.com/kirimatt/goncordia/clock"
+import "github.com/kirimatt/goncordia/v2/clock"
 
 type MyPolicy struct{}
 func (MyPolicy) NextRetryAt(attempt int, err error, clk clock.Clock) time.Time {
@@ -863,8 +862,8 @@ Use the in-memory driver — no database, no Docker, deterministic time:
 
 ```go
 import (
-    "github.com/kirimatt/goncordia/clock"
-    "github.com/kirimatt/goncordia/driver/memory"
+    "github.com/kirimatt/goncordia/v2/clock"
+    "github.com/kirimatt/goncordia/v2/driver/memory"
 )
 
 clk := clock.NewManual(time.Now())
@@ -975,7 +974,7 @@ Cassandra's high per-operation latency comes from Lightweight Transaction consen
 `gontest` makes it easy to test workers and enqueue assertions without a real database.
 
 ```bash
-go get github.com/kirimatt/goncordia/gontest@v1.0.0
+go get github.com/kirimatt/goncordia/gontest/v2@v2.0.0
 ```
 
 **Assert that business logic enqueues the right jobs:**
@@ -994,9 +993,8 @@ func TestPlaceOrder_EnqueuesConfirmationEmail(t *testing.T) {
 }
 ```
 
-Use `gontest.JobsE[T]` when payload corruption must fail the test explicitly.
-The legacy `Jobs[T]` helper remains available but intentionally discards its
-decode error for source compatibility.
+`gontest.Jobs[T]` returns every enqueued job of kind T and an error for the
+first payload that cannot be decoded.
 
 **Unit-test a worker function without a database or pool:**
 
@@ -1034,7 +1032,7 @@ clk.Advance(25 * time.Hour)
 
 ```go
 registry := core.NewRegistry()
-core.RegisterWorker(registry, emailWorker, core.WorkerOpts{Queue: "default"})
+core.RegisterWorker(registry, emailWorker, core.WorkerOpts{})
 
 client, tracker := gontest.NewClient(t)
 pool := tracker.NewWorkerPool(registry, goncordia.WorkerConfig{
@@ -1045,7 +1043,7 @@ runCtx, cancel := context.WithCancel(ctx)
 defer cancel()
 go pool.Start(runCtx)
 // enqueue and wait for processed.Load() >= 1 ...
-pool.Stop()
+_ = pool.Shutdown(context.Background())
 ```
 
 ---
@@ -1053,11 +1051,11 @@ pool.Stop()
 ## Observability (OpenTelemetry)
 
 ```bash
-go get github.com/kirimatt/goncordia/otel@v1.0.0
+go get github.com/kirimatt/goncordia/otel/v2@v2.0.0
 ```
 
 ```go
-import otelgoncordia "github.com/kirimatt/goncordia/otel"
+import otelgoncordia "github.com/kirimatt/goncordia/otel/v2"
 
 instrumentation := otelgoncordia.NewInstrumentation(
     otelgoncordia.WithTracerProvider(tp),

@@ -7,7 +7,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/kirimatt/goncordia/driver"
+	"github.com/kirimatt/goncordia/v2/driver"
 )
 
 // listener implements driver.Listener using PostgreSQL LISTEN/NOTIFY.

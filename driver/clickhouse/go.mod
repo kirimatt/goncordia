@@ -1,11 +1,11 @@
-module github.com/kirimatt/goncordia/driver/clickhouse
+module github.com/kirimatt/goncordia/driver/clickhouse/v2
 
 go 1.26.0
 
 require (
 	github.com/ClickHouse/clickhouse-go/v2 v2.51.0
 	github.com/google/uuid v1.6.0
-	github.com/kirimatt/goncordia v1.0.1-0.20261117221011-eac235b7c801
+	github.com/kirimatt/goncordia/v2 v2.0.0
 	github.com/testcontainers/testcontainers-go/modules/clickhouse v0.45.0
 )
 

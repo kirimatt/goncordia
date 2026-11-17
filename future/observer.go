@@ -5,7 +5,7 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/kirimatt/goncordia/driver"
+	"github.com/kirimatt/goncordia/v2/driver"
 )
 
 // Errors returned by Await. Use errors.Is to classify them.

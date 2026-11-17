@@ -6,10 +6,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kirimatt/goncordia"
-	"github.com/kirimatt/goncordia/clock"
-	"github.com/kirimatt/goncordia/driver"
-	"github.com/kirimatt/goncordia/driver/memory"
+	"github.com/kirimatt/goncordia/v2"
+	"github.com/kirimatt/goncordia/v2/clock"
+	"github.com/kirimatt/goncordia/v2/driver"
+	"github.com/kirimatt/goncordia/v2/driver/memory"
 )
 
 type maintenanceArgs struct{ Value string }
@@ -18,7 +18,7 @@ func (maintenanceArgs) Kind() string { return "maintenance_test" }
 
 func TestMaintenancePruneUsesInjectedClock(t *testing.T) {
 	ctx := context.Background()
-	clk := clock.NewMock(time.Date(2026, 8, 16, 8, 0, 0, 0, time.UTC))
+	clk := clock.NewManual(time.Date(2026, 8, 16, 8, 0, 0, 0, time.UTC))
 	d := memory.New(memory.WithClock(clk))
 	client := goncordia.NewClient(d, goncordia.ClientConfig{Clock: clk})
 	maintenance := goncordia.NewMaintenance(d, goncordia.MaintenanceConfig{Clock: clk})
@@ -58,7 +58,7 @@ func TestMaintenancePruneUsesInjectedClock(t *testing.T) {
 
 func TestMaintenanceBulkAndDeadLetterAPIs(t *testing.T) {
 	ctx := context.Background()
-	clk := clock.NewMock(time.Date(2026, 8, 16, 12, 0, 0, 0, time.UTC))
+	clk := clock.NewManual(time.Date(2026, 8, 16, 12, 0, 0, 0, time.UTC))
 	d := memory.New(memory.WithClock(clk))
 	client := goncordia.NewClient(d, goncordia.ClientConfig{Clock: clk})
 	maintenance := goncordia.NewMaintenance(d, goncordia.MaintenanceConfig{Clock: clk})

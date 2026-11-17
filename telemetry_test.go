@@ -4,53 +4,48 @@ import (
 	"context"
 	"testing"
 
-	"github.com/kirimatt/goncordia"
-	"github.com/kirimatt/goncordia/driver"
+	"github.com/kirimatt/goncordia/v2"
+	"github.com/kirimatt/goncordia/v2/driver"
 )
 
-type countingObserver struct{ claimed, heartbeats, rescued int }
+type countingObserver struct {
+	claimed, started, finished, limited, heartbeats, rescued int
+}
 
-func (o *countingObserver) JobClaimed(context.Context, driver.JobRow)              { o.claimed++ }
+func (o *countingObserver) JobClaimed(context.Context, driver.JobRow)               { o.claimed++ }
+func (o *countingObserver) JobStarted(context.Context, goncordia.JobStartedEvent)   { o.started++ }
+func (o *countingObserver) JobFinished(context.Context, goncordia.JobFinishedEvent) { o.finished++ }
+func (o *countingObserver) JobRateLimited(context.Context, goncordia.RateLimitWaitEvent) {
+	o.limited++
+}
 func (o *countingObserver) JobHeartbeat(context.Context, goncordia.HeartbeatEvent) { o.heartbeats++ }
 func (o *countingObserver) JobsRescued(context.Context, goncordia.RescueEvent)     { o.rescued++ }
 
-type countingLifecycleObserver struct {
-	countingObserver
-	started, finished, limited int
+// finishedOnly handles one event and inherits no-ops for the rest.
+type finishedOnly struct {
+	goncordia.NopWorkerObserver
+	finished int
 }
 
-func (o *countingLifecycleObserver) JobStarted(context.Context, goncordia.JobStartedEvent) {
-	o.started++
-}
-func (o *countingLifecycleObserver) JobFinished(context.Context, goncordia.JobFinishedEvent) {
-	o.finished++
-}
-func (o *countingLifecycleObserver) JobRateLimited(context.Context, goncordia.RateLimitWaitEvent) {
-	o.limited++
-}
+func (o *finishedOnly) JobFinished(context.Context, goncordia.JobFinishedEvent) { o.finished++ }
 
 func TestWorkerObserversFanOut(t *testing.T) {
-	plain := &countingObserver{}
-	lifecycle := &countingLifecycleObserver{}
-	combined := goncordia.WorkerObservers(plain, nil, lifecycle)
+	all := &countingObserver{}
+	partial := &finishedOnly{}
+	combined := goncordia.WorkerObservers(all, nil, partial)
 	ctx := context.Background()
 
 	combined.JobClaimed(ctx, driver.JobRow{})
+	combined.JobStarted(ctx, goncordia.JobStartedEvent{})
+	combined.JobFinished(ctx, goncordia.JobFinishedEvent{})
+	combined.JobRateLimited(ctx, goncordia.RateLimitWaitEvent{})
 	combined.JobHeartbeat(ctx, goncordia.HeartbeatEvent{})
 	combined.JobsRescued(ctx, goncordia.RescueEvent{})
-	events, ok := combined.(goncordia.WorkerLifecycleObserver)
-	if !ok {
-		t.Fatal("combined observer must implement WorkerLifecycleObserver")
-	}
-	events.JobStarted(ctx, goncordia.JobStartedEvent{})
-	events.JobFinished(ctx, goncordia.JobFinishedEvent{})
-	events.JobRateLimited(ctx, goncordia.RateLimitWaitEvent{})
 
-	if *plain != (countingObserver{1, 1, 1}) {
-		t.Fatalf("plain observer = %+v", *plain)
+	if *all != (countingObserver{1, 1, 1, 1, 1, 1}) {
+		t.Fatalf("observer = %+v", *all)
 	}
-	if lifecycle.countingObserver != (countingObserver{1, 1, 1}) ||
-		lifecycle.started != 1 || lifecycle.finished != 1 || lifecycle.limited != 1 {
-		t.Fatalf("lifecycle observer = %+v", *lifecycle)
+	if partial.finished != 1 {
+		t.Fatalf("partial observer finished = %d", partial.finished)
 	}
 }

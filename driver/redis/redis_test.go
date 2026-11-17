@@ -13,11 +13,11 @@ import (
 	"github.com/redis/go-redis/v9"
 	tcredis "github.com/testcontainers/testcontainers-go/modules/redis"
 
-	"github.com/kirimatt/goncordia"
-	"github.com/kirimatt/goncordia/clock"
-	"github.com/kirimatt/goncordia/core"
-	"github.com/kirimatt/goncordia/driver/drivertest"
-	redisdriver "github.com/kirimatt/goncordia/driver/redis"
+	redisdriver "github.com/kirimatt/goncordia/driver/redis/v2"
+	"github.com/kirimatt/goncordia/v2"
+	"github.com/kirimatt/goncordia/v2/clock"
+	"github.com/kirimatt/goncordia/v2/core"
+	"github.com/kirimatt/goncordia/v2/driver/drivertest"
 )
 
 var redisAddr string
@@ -82,7 +82,7 @@ func TestRedis_EnqueueAndProcess(t *testing.T) {
 	core.RegisterWorker(registry, core.WorkerFunc[EmailJob](func(_ context.Context, _ *core.Job[EmailJob]) error {
 		processed.Add(1)
 		return nil
-	}), core.WorkerOpts{Queue: "default", MaxRetry: 3})
+	}), core.WorkerOpts{MaxRetry: 3})
 
 	client := redisdriver.NewClient(d, goncordia.ClientConfig{})
 	for i := range 5 {
@@ -107,7 +107,7 @@ func TestRedis_EnqueueAndProcess(t *testing.T) {
 		}
 		time.Sleep(30 * time.Millisecond)
 	}
-	wp.Stop()
+	_ = wp.Shutdown(context.Background())
 }
 
 // TestRedis_EnqueueTxUnsupported verifies that EnqueueTx is correctly
@@ -191,7 +191,7 @@ func TestRedis_ConcurrentUniqueInsertIsAtomic(t *testing.T) {
 }
 
 func TestRedis_ScheduledJob(t *testing.T) {
-	clk := clock.NewMock(time.Date(2024, 6, 1, 0, 0, 0, 0, time.UTC))
+	clk := clock.NewManual(time.Date(2024, 6, 1, 0, 0, 0, 0, time.UTC))
 	d, _ := newDriver(t, redisdriver.WithClock(clk))
 	ctx := context.Background()
 	client := redisdriver.NewClient(d, goncordia.ClientConfig{})
@@ -216,7 +216,7 @@ func TestRedis_ScheduledJob(t *testing.T) {
 }
 
 func TestRedis_RetryAndDiscard(t *testing.T) {
-	clk := clock.NewMock(time.Now())
+	clk := clock.NewManual(time.Now())
 	d, _ := newDriver(t, redisdriver.WithClock(clk))
 	ctx := context.Background()
 
@@ -225,7 +225,7 @@ func TestRedis_RetryAndDiscard(t *testing.T) {
 	core.RegisterWorker(registry, core.WorkerFunc[EmailJob](func(_ context.Context, _ *core.Job[EmailJob]) error {
 		attempts.Add(1)
 		return errors.New("always fails")
-	}), core.WorkerOpts{Queue: "default", MaxRetry: 2})
+	}), core.WorkerOpts{MaxRetry: 2})
 
 	client := redisdriver.NewClient(d, goncordia.ClientConfig{})
 	if _, err := client.Enqueue(ctx, EmailJob{To: "fail@test.com"}, nil); err != nil {
@@ -251,7 +251,7 @@ func TestRedis_RetryAndDiscard(t *testing.T) {
 		clk.Advance(100 * time.Millisecond)
 		time.Sleep(60 * time.Millisecond)
 	}
-	wp.Stop()
+	_ = wp.Shutdown(context.Background())
 }
 
 func TestRedis_QueuePauseResume(t *testing.T) {

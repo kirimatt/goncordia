@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kirimatt/goncordia/driver"
+	"github.com/kirimatt/goncordia/v2/driver"
 )
 
 func TestJobCursorRoundTrip(t *testing.T) {

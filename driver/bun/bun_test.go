@@ -12,11 +12,11 @@ import (
 	"github.com/uptrace/bun/dialect/sqlitedialect"
 	_ "modernc.org/sqlite"
 
-	"github.com/kirimatt/goncordia"
-	"github.com/kirimatt/goncordia/clock"
-	"github.com/kirimatt/goncordia/core"
-	bundriver "github.com/kirimatt/goncordia/driver/bun"
-	"github.com/kirimatt/goncordia/driver/drivertest"
+	bundriver "github.com/kirimatt/goncordia/driver/bun/v2"
+	"github.com/kirimatt/goncordia/v2"
+	"github.com/kirimatt/goncordia/v2/clock"
+	"github.com/kirimatt/goncordia/v2/core"
+	"github.com/kirimatt/goncordia/v2/driver/drivertest"
 )
 
 type EmailJob struct {
@@ -59,7 +59,7 @@ func TestBun_EnqueueAndProcess(t *testing.T) {
 	core.RegisterWorker(registry, core.WorkerFunc[EmailJob](func(_ context.Context, _ *core.Job[EmailJob]) error {
 		processed.Add(1)
 		return nil
-	}), core.WorkerOpts{Queue: "default", MaxRetry: 3})
+	}), core.WorkerOpts{MaxRetry: 3})
 
 	client := bundriver.NewClient(d, goncordia.ClientConfig{})
 	for i := 0; i < 3; i++ {
@@ -84,7 +84,7 @@ func TestBun_EnqueueAndProcess(t *testing.T) {
 		}
 		time.Sleep(30 * time.Millisecond)
 	}
-	wp.Stop()
+	_ = wp.Shutdown(context.Background())
 }
 
 func TestBun_EnqueueTx(t *testing.T) {
@@ -161,7 +161,7 @@ func TestBun_UniqueJobs(t *testing.T) {
 }
 
 func TestBun_ScheduledJob(t *testing.T) {
-	clk := clock.NewMock(time.Date(2024, 6, 1, 0, 0, 0, 0, time.UTC))
+	clk := clock.NewManual(time.Date(2024, 6, 1, 0, 0, 0, 0, time.UTC))
 	d, _ := newDriver(t, bundriver.WithClock(clk))
 	ctx := context.Background()
 	client := bundriver.NewClient(d, goncordia.ClientConfig{})
@@ -186,7 +186,7 @@ func TestBun_ScheduledJob(t *testing.T) {
 }
 
 func TestBun_RetryAndDiscard(t *testing.T) {
-	clk := clock.NewMock(time.Now())
+	clk := clock.NewManual(time.Now())
 	d, _ := newDriver(t, bundriver.WithClock(clk))
 	ctx := context.Background()
 
@@ -195,7 +195,7 @@ func TestBun_RetryAndDiscard(t *testing.T) {
 	core.RegisterWorker(registry, core.WorkerFunc[EmailJob](func(_ context.Context, _ *core.Job[EmailJob]) error {
 		attempts.Add(1)
 		return errors.New("always fails")
-	}), core.WorkerOpts{Queue: "default", MaxRetry: 2})
+	}), core.WorkerOpts{MaxRetry: 2})
 
 	client := bundriver.NewClient(d, goncordia.ClientConfig{})
 	if _, err := client.Enqueue(ctx, EmailJob{To: "fail@test.com"}, nil); err != nil {
@@ -221,5 +221,5 @@ func TestBun_RetryAndDiscard(t *testing.T) {
 		clk.Advance(100 * time.Millisecond)
 		time.Sleep(60 * time.Millisecond)
 	}
-	wp.Stop()
+	_ = wp.Shutdown(context.Background())
 }

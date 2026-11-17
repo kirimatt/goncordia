@@ -1,11 +1,11 @@
-module github.com/kirimatt/goncordia/driver/firestore
+module github.com/kirimatt/goncordia/driver/firestore/v2
 
 go 1.26.0
 
 require (
 	cloud.google.com/go/firestore v1.29.2
 	github.com/google/uuid v1.6.0
-	github.com/kirimatt/goncordia v1.0.1-0.20261117221011-eac235b7c801
+	github.com/kirimatt/goncordia/v2 v2.0.0
 	github.com/testcontainers/testcontainers-go v0.45.0
 	google.golang.org/grpc v1.85.0
 )

@@ -11,11 +11,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kirimatt/goncordia"
-	"github.com/kirimatt/goncordia/clock"
-	"github.com/kirimatt/goncordia/core"
-	"github.com/kirimatt/goncordia/driver"
-	"github.com/kirimatt/goncordia/driver/memory"
+	"github.com/kirimatt/goncordia/v2"
+	"github.com/kirimatt/goncordia/v2/clock"
+	"github.com/kirimatt/goncordia/v2/core"
+	"github.com/kirimatt/goncordia/v2/driver"
+	"github.com/kirimatt/goncordia/v2/driver/memory"
 )
 
 type featureArgs struct {
@@ -33,6 +33,7 @@ func (d *limitedCapabilityDriver) Capabilities() driver.Capabilities {
 }
 
 type claimRecorder struct {
+	goncordia.NopWorkerObserver
 	mu     sync.Mutex
 	queues []string
 }
@@ -75,7 +76,7 @@ func TestNoRetryDiscardsAfterFirstFailure(t *testing.T) {
 	if got := attempts.Load(); got != 1 {
 		t.Fatalf("attempts=%d, want 1", got)
 	}
-	pool.Stop()
+	_ = pool.Shutdown(context.Background())
 }
 
 func TestWorkerPersistsPanicStackTrace(t *testing.T) {
@@ -98,7 +99,7 @@ func TestWorkerPersistsPanicStackTrace(t *testing.T) {
 		jobs := d.AllJobs()
 		return len(jobs) == 1 && jobs[0].State == driver.JobStateDiscarded
 	}, "panic discard")
-	pool.Stop()
+	_ = pool.Shutdown(context.Background())
 	job := d.AllJobs()[0]
 	if len(job.Errors) != 1 || job.Errors[0].Error != "panic: boom" {
 		t.Fatalf("panic errors=%+v", job.Errors)
@@ -147,13 +148,13 @@ func TestWorkerHonorsRetryDirectives(t *testing.T) {
 			states[2].State == driver.JobStateAvailable &&
 			states[2].RunAt.Equal(clk.Now().Add(time.Hour))
 	}, "retry directives")
-	pool.Stop()
+	_ = pool.Shutdown(context.Background())
 }
 
 func (featureArgs) Kind() string { return "worker_feature" }
 
 func TestWorkerPassesMetadataAndAppliesTimeout(t *testing.T) {
-	clk := clock.NewMock(time.Date(2025, 1, 2, 3, 4, 5, 0, time.UTC))
+	clk := clock.NewManual(time.Date(2025, 1, 2, 3, 4, 5, 0, time.UTC))
 	d := memory.New(memory.WithClock(clk))
 	client := goncordia.NewClient(d, goncordia.ClientConfig{})
 	registry := core.NewRegistry()
@@ -193,7 +194,7 @@ func TestWorkerPassesMetadataAndAppliesTimeout(t *testing.T) {
 	if len(jobs[0].Errors) != 1 || jobs[0].Errors[0].Error != context.DeadlineExceeded.Error() {
 		t.Fatalf("expected deadline error, got %+v", jobs[0].Errors)
 	}
-	pool.Stop()
+	_ = pool.Shutdown(context.Background())
 }
 
 func TestWorkerHeartbeatsLongRunningJob(t *testing.T) {
@@ -255,7 +256,7 @@ func TestWorkerHeartbeatsLongRunningJob(t *testing.T) {
 		jobs := d.AllJobs()
 		return len(jobs) == 1 && jobs[0].State == driver.JobStateCompleted
 	}, "heartbeating job completion")
-	pool.Stop()
+	_ = pool.Shutdown(context.Background())
 }
 
 func TestWorkerShutdownReportsTimeoutAndKeepsLeaseAlive(t *testing.T) {
@@ -339,7 +340,7 @@ func TestWorkerCancellationYieldsWithoutConsumingAttempt(t *testing.T) {
 		jobs := d.AllJobs()
 		return len(jobs) == 1 && jobs[0].State == driver.JobStateAvailable && jobs[0].AttemptNum == 0 && len(jobs[0].Errors) == 0
 	}, "cancelled worker to yield claim")
-	pool.Stop()
+	_ = pool.Shutdown(context.Background())
 }
 
 func TestWorkerOptsConcurrencyIsEnforced(t *testing.T) {
@@ -375,7 +376,7 @@ func TestWorkerOptsConcurrencyIsEnforced(t *testing.T) {
 	if got := maximum.Load(); got != 1 {
 		t.Fatalf("max kind concurrency=%d, want 1", got)
 	}
-	pool.Stop()
+	_ = pool.Shutdown(context.Background())
 }
 
 func TestPipelineWaitDoesNotConsumeGlobalConcurrency(t *testing.T) {
@@ -423,15 +424,15 @@ func TestPipelineWaitDoesNotConsumeGlobalConcurrency(t *testing.T) {
 		// The second pipeline job is waiting without occupying the other slot.
 	case <-time.After(250 * time.Millisecond):
 		close(releaseFirst)
-		pool.Stop()
+		_ = pool.Shutdown(context.Background())
 		t.Fatal("pipeline waiter consumed global concurrency and starved unrelated work")
 	}
 	close(releaseFirst)
-	pool.Stop()
+	_ = pool.Shutdown(context.Background())
 }
 
 func TestPipelineSerializesInQueueOrder(t *testing.T) {
-	clk := clock.NewMock(time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC))
+	clk := clock.NewManual(time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC))
 	d := memory.New(memory.WithClock(clk))
 	client := goncordia.NewClient(d, goncordia.ClientConfig{})
 	registry := core.NewRegistry()
@@ -463,7 +464,7 @@ func TestPipelineSerializesInQueueOrder(t *testing.T) {
 	if !slices.Equal(order, []int{0, 1, 2, 3, 4}) {
 		t.Fatalf("pipeline order=%v", order)
 	}
-	pool.Stop()
+	_ = pool.Shutdown(context.Background())
 }
 
 func TestWeightedQueueFairnessAndConcurrencyLimit(t *testing.T) {
@@ -498,7 +499,7 @@ func TestWeightedQueueFairnessAndConcurrencyLimit(t *testing.T) {
 		t.Fatalf("claim order=%v", got)
 	}
 	close(release)
-	pool.Stop()
+	_ = pool.Shutdown(context.Background())
 }
 
 func TestQueueRateLimitUsesInjectedClock(t *testing.T) {
@@ -522,7 +523,7 @@ func TestQueueRateLimitUsesInjectedClock(t *testing.T) {
 	pool := goncordia.NewWorkerPool(d, registry, goncordia.WorkerConfig{
 		Concurrency: 4, MaxPending: 4, PollInterval: time.Second, Clock: clk, Observer: recorder,
 		QueuePolicies: map[string]goncordia.QueuePolicy{
-			"default": {RateLimit: 2, RatePeriod: time.Minute},
+			"default": {RateLimits: []goncordia.QueueRateLimit{{Limit: 2, Period: time.Minute, Burst: 2}}},
 		},
 	})
 	go pool.Start(context.Background()) //nolint:errcheck
@@ -538,7 +539,7 @@ func TestQueueRateLimitUsesInjectedClock(t *testing.T) {
 	clk.Advance(30 * time.Second)
 	waitForCondition(t, time.Second, func() bool { return started.Load() == 4 }, "start after second token refill")
 	close(release)
-	pool.Stop()
+	_ = pool.Shutdown(context.Background())
 }
 
 func TestQueueRateLimitsCombineSecondAndMinuteWindows(t *testing.T) {
@@ -579,7 +580,7 @@ func TestQueueRateLimitsCombineSecondAndMinuteWindows(t *testing.T) {
 	clk.Advance(time.Millisecond)
 	waitForCondition(t, time.Second, func() bool { return started.Load() == 4 }, "fourth start after minute window")
 	close(release)
-	pool.Stop()
+	_ = pool.Shutdown(context.Background())
 }
 
 func TestQueueRateLimitDefaultBurstSpacesStarts(t *testing.T) {
@@ -615,7 +616,7 @@ func TestQueueRateLimitDefaultBurstSpacesStarts(t *testing.T) {
 	clk.Advance(time.Second)
 	waitForCondition(t, time.Second, func() bool { return started.Load() == 2 }, "second smoothed start")
 	close(release)
-	pool.Stop()
+	_ = pool.Shutdown(context.Background())
 }
 
 func TestKeyedTagRateLimitHasIndependentBudgets(t *testing.T) {
@@ -659,7 +660,7 @@ func TestKeyedTagRateLimitHasIndependentBudgets(t *testing.T) {
 		t.Fatal("same-tag job did not start after refill")
 	}
 	close(release)
-	pool.Stop()
+	_ = pool.Shutdown(context.Background())
 }
 
 func TestKeyedTagConcurrencyLimit(t *testing.T) {
@@ -710,7 +711,7 @@ func TestKeyedTagConcurrencyLimit(t *testing.T) {
 		t.Fatal("waiting tenant:a job did not start")
 	}
 	close(releaseB)
-	pool.Stop()
+	_ = pool.Shutdown(context.Background())
 }
 
 func TestUpdateQueuePolicyWakesRateLimitedJobs(t *testing.T) {
@@ -752,7 +753,7 @@ func TestUpdateQueuePolicyWakesRateLimitedJobs(t *testing.T) {
 		t.Fatal("policy reload did not wake waiting job")
 	}
 	close(release)
-	pool.Stop()
+	_ = pool.Shutdown(context.Background())
 }
 
 func TestWorkerConfigValidationFailsBeforeStart(t *testing.T) {
@@ -842,8 +843,8 @@ func TestGlobalQueueRateLimitCoordinatesWorkerPools(t *testing.T) {
 		jobs := d.AllJobs()
 		return len(jobs) == 2 && jobs[0].State == driver.JobStateCompleted && jobs[1].State == driver.JobStateCompleted
 	}, "globally rate-limited jobs")
-	poolA.Stop()
-	poolB.Stop()
+	_ = poolA.Shutdown(context.Background())
+	_ = poolB.Shutdown(context.Background())
 }
 
 func TestShutdownYieldsJobWaitingForRatePermit(t *testing.T) {
@@ -947,6 +948,6 @@ func TestDistributedPipelinesSerializeAcrossPools(t *testing.T) {
 		jobs := d.AllJobs()
 		return len(jobs) == 2 && jobs[0].State == driver.JobStateCompleted && jobs[1].State == driver.JobStateCompleted
 	}, "distributed pipeline completion")
-	poolA.Stop()
-	poolB.Stop()
+	_ = poolA.Shutdown(context.Background())
+	_ = poolB.Shutdown(context.Background())
 }

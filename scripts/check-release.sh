@@ -16,7 +16,7 @@ if ! grep -Eq "^## \[$tag\] — [0-9]{4}-[0-9]{2}-[0-9]{2}$" CHANGELOG.md; then
   echo "CHANGELOG.md has no dated section for $tag" >&2
   exit 1
 fi
-if ! grep -Fq "github.com/kirimatt/goncordia@$tag" README.md; then
+if ! grep -Fq "github.com/kirimatt/goncordia/v2@$tag" README.md; then
   echo "README.md installation version does not match $tag" >&2
   exit 1
 fi

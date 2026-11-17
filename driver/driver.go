@@ -110,9 +110,9 @@ type JobStartMarker interface {
 	JobMarkStarted(context.Context, JobMarkStartedParams) (marked bool, err error)
 }
 
-// JobResultStore is an optional executor capability that persists the value
-// produced by a job handler, so that a waiting producer can read it after the
-// job completes. The future package uses it when no explicit store is given.
+// JobResultStore persists the value produced by a job handler, so that a
+// waiting producer can read it after the job completes. Every Executor
+// implements it; the future package can also use a separate store.
 //
 // Values are opaque bytes (the future package writes JSON). JobResultPut
 // replaces an earlier value for the same job, which keeps retried and
@@ -164,6 +164,10 @@ type baseExecutor interface {
 
 	ScheduleCursorGetOrCreate(ctx context.Context, params ScheduleCursorCreateParams) (ScheduleCursorResult, error)
 	ScheduleCursorAdvance(ctx context.Context, params ScheduleCursorAdvanceParams) (advanced bool, err error)
+
+	// --- Job results (see JobResultStore) ---
+
+	JobResultStore
 }
 
 // --- Parameter and result types ---

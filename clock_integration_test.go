@@ -7,18 +7,18 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kirimatt/goncordia"
-	"github.com/kirimatt/goncordia/clock"
-	"github.com/kirimatt/goncordia/core"
-	"github.com/kirimatt/goncordia/driver"
-	memdriver "github.com/kirimatt/goncordia/driver/memory"
+	"github.com/kirimatt/goncordia/v2"
+	"github.com/kirimatt/goncordia/v2/clock"
+	"github.com/kirimatt/goncordia/v2/core"
+	"github.com/kirimatt/goncordia/v2/driver"
+	memdriver "github.com/kirimatt/goncordia/v2/driver/memory"
 )
 
 // TestScheduledJobNotVisibleUntilRunAt verifies that a job with a future RunAt
 // is not picked up until the clock advances past that time — no real sleeping needed.
 func TestScheduledJobNotVisibleUntilRunAt(t *testing.T) {
 	base := time.Date(2024, 6, 1, 12, 0, 0, 0, time.UTC)
-	clk := clock.NewMock(base)
+	clk := clock.NewManual(base)
 
 	d := memdriver.New(memdriver.WithClock(clk))
 	client := goncordia.NewClient(d, goncordia.ClientConfig{})
@@ -60,7 +60,7 @@ func TestScheduledJobNotVisibleUntilRunAt(t *testing.T) {
 // according to the retry policy, and only becomes visible after the clock advances.
 func TestRetryRescheduledWithMockClock(t *testing.T) {
 	base := time.Date(2024, 6, 1, 0, 0, 0, 0, time.UTC)
-	clk := clock.NewMock(base)
+	clk := clock.NewManual(base)
 
 	d := memdriver.New(memdriver.WithClock(clk))
 	client := goncordia.NewClient(d, goncordia.ClientConfig{})
@@ -70,7 +70,7 @@ func TestRetryRescheduledWithMockClock(t *testing.T) {
 	core.RegisterWorker(registry, core.WorkerFunc[EmailArgs](func(_ context.Context, _ *core.Job[EmailArgs]) error {
 		attempts.Add(1)
 		return errors.New("transient error")
-	}), core.WorkerOpts{Queue: "default", MaxRetry: 3})
+	}), core.WorkerOpts{MaxRetry: 3})
 
 	ctx := context.Background()
 	if _, err := client.Enqueue(ctx, EmailArgs{To: "retry@test.com"}, nil); err != nil {
@@ -115,7 +115,7 @@ func TestRetryRescheduledWithMockClock(t *testing.T) {
 	clk.Advance(6 * time.Minute) // total: 11min > retryAt (10min)
 	waitForCondition(t, 2*time.Second, func() bool { return attempts.Load() >= 2 }, "second attempt after clock advance")
 
-	pool.Stop()
+	_ = pool.Shutdown(context.Background())
 }
 
 func waitForCondition(t *testing.T, timeout time.Duration, cond func() bool, label string) {

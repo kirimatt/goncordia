@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"github.com/kirimatt/goncordia/core"
+	"github.com/kirimatt/goncordia/v2/core"
 )
 
 // Handler processes a job and returns the value delivered to its Future.

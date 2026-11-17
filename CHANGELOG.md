@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Breaking (v2)
+- Module paths gain the `/v2` suffix (`github.com/kirimatt/goncordia/v2`,
+  `github.com/kirimatt/goncordia/driver/pgxv5/v2`, ...). See
+  `MIGRATING_TO_V2.md`.
+- Removed deprecated APIs: `WorkerPool.Stop`, `ClientConfig.Now`,
+  `core.WorkerOpts.Queue`, `QueuePolicy.RateLimit`/`RatePeriod`,
+  `clock.Mock`/`NewMock`, and the `internal/clock` forwarding package.
+- `gontest.Jobs` returns `([]*core.Job[T], error)`; `JobsE` is removed.
+- `WorkerObserver` includes the lifecycle events; `WorkerLifecycleObserver`
+  is removed. Embed the new `NopWorkerObserver` for partial observers.
+- `driver.Executor` embeds `driver.JobResultStore`; `future.New` no longer
+  fails for drivers without result storage.
+- `clock.Clock` requires `NewTimer`.
+
 ### Added
 - `future` package: `future.Enqueue` / `EnqueueTx` return a `Future[R]` whose
   `Await` returns the value produced by a `future.RegisterWorker` handler, with
