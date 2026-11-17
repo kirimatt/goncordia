@@ -51,6 +51,7 @@ func newDriver(t *testing.T, opts ...bundriver.Option) (*bundriver.Driver, *bun.
 func TestBun_EnqueueAndProcess(t *testing.T) {
 	d, _ := newDriver(t)
 	drivertest.Run(t, d.Executor())
+	drivertest.RunResults(t, d.Executor())
 	ctx := context.Background()
 
 	var processed atomic.Int64

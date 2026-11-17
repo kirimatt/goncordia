@@ -67,6 +67,7 @@ func TestStdlibMySQL_ConcurrentMigrate(t *testing.T) {
 func TestStdlibMySQL_EnqueueAndProcess(t *testing.T) {
 	d := newMySQLDriver(t)
 	drivertest.Run(t, d.Executor())
+	drivertest.RunResults(t, d.Executor())
 	ctx := context.Background()
 
 	var processed atomic.Int64

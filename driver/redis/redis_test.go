@@ -74,6 +74,7 @@ func newDriver(t *testing.T, opts ...redisdriver.Option) (*redisdriver.Driver, *
 func TestRedis_EnqueueAndProcess(t *testing.T) {
 	d, _ := newDriver(t)
 	drivertest.Run(t, d.Executor())
+	drivertest.RunResults(t, d.Executor())
 	ctx := context.Background()
 
 	var processed atomic.Int64

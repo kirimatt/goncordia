@@ -128,6 +128,17 @@ func (d *Driver) Migrate(ctx context.Context) error {
 		) ENGINE = ReplacingMergeTree(version)
 		ORDER BY id`,
 
+		// Handler results for the future package. Deletes write a tombstone
+		// with a higher version.
+		`CREATE TABLE IF NOT EXISTS goncordia_job_results (
+			job_id     String,
+			value      String,
+			deleted    UInt8,
+			updated_at DateTime64(3, 'UTC'),
+			version    Int64
+		) ENGINE = ReplacingMergeTree(version)
+		ORDER BY job_id`,
+
 		`ALTER TABLE goncordia_jobs
 		 ADD COLUMN IF NOT EXISTS lease_expires_at Nullable(DateTime64(3, 'UTC')) AFTER attempted_at`,
 		`ALTER TABLE goncordia_jobs

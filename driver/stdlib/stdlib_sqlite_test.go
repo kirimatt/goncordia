@@ -154,6 +154,7 @@ func (EmailJob) Kind() string { return "email" }
 func TestStdlibSQLite_EnqueueAndProcess(t *testing.T) {
 	d, _ := newSQLiteDriver(t)
 	drivertest.Run(t, d.Executor())
+	drivertest.RunResults(t, d.Executor())
 	ctx := context.Background()
 
 	var processed atomic.Int64

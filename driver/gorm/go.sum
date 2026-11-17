@@ -64,8 +64,8 @@ github.com/jinzhu/inflection v1.0.0 h1:K317FqzuhWc8YvSVlFMCCUb36O/S9MCKRDI7QkRKD
 github.com/jinzhu/inflection v1.0.0/go.mod h1:h+uFLlag+Qp1Va5pdKtLDYj+kHp5pxUVkryuEj+Srlc=
 github.com/jinzhu/now v1.1.5 h1:/o9tlHleP7gOFmsnYNz3RGnqzefHA47wQpKrrdTIwXQ=
 github.com/jinzhu/now v1.1.5/go.mod h1:d3SSVoowX0Lcu0IBviAWJpolVfI5UJVZZ7cO71lE/z8=
-github.com/kirimatt/goncordia v1.0.0 h1:WzxB7l3OVL45B8ciL+f8ECJVRwe9Dw/Op9E0wnJ3hF4=
-github.com/kirimatt/goncordia v1.0.0/go.mod h1:9ij3ADfrYsxyS1zXK9up8R5V9exPYCHrvMhkuHndT8U=
+github.com/kirimatt/goncordia v1.0.1-0.20261117221011-eac235b7c801 h1:5qd0hTRHEj14avTz54NPQQXUu2A3U/5AtVbNa24mXVQ=
+github.com/kirimatt/goncordia v1.0.1-0.20261117221011-eac235b7c801/go.mod h1:JAXVSWqvgfqXLg3oMCJGoAQ+Ny+sfZRdO1Nm46BWEUo=
 github.com/kirimatt/goncordia/driver/stdlib v1.0.0 h1:6w5/f4U640RWL5AN4up4cp/fnFKgh5rnCEKrVFBwDJ0=
 github.com/kirimatt/goncordia/driver/stdlib v1.0.0/go.mod h1:pjo9UZy97E4D+n/wgs7uYXOJk0/pcjgWbledijNSJ6o=
 github.com/klauspost/compress v1.18.6 h1:2jupLlAwFm95+YDR+NwD2MEfFO9d4z4Prjl1XXDjuao=

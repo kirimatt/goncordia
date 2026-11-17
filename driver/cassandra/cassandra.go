@@ -148,6 +148,13 @@ func (d *Driver) Migrate(ctx context.Context) error {
 			expires_at timestamp
 		)`,
 
+		// Handler results for the future package, keyed by job id.
+		`CREATE TABLE IF NOT EXISTS goncordia_job_results (
+			job_id     text PRIMARY KEY,
+			value      blob,
+			updated_at timestamp
+		)`,
+
 		`CREATE TABLE IF NOT EXISTS goncordia_schema_migrations (
 			version    text PRIMARY KEY,
 			applied_at timestamp

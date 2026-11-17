@@ -32,6 +32,7 @@ func runKey(q string) string        { return "goncordia:q:" + q + ":run" }
 func metaKey(q string) string       { return "goncordia:q:" + q + ":meta" }
 func jobKey(id string) string       { return jobKeyPrefix + id }
 func uniqKey(k string) string       { return "goncordia:uniq:" + k }
+func resultKey(id string) string    { return "goncordia:result:" + id }
 func leaderKey(n string) string     { return "goncordia:leader:" + n }
 func notifyChannel(q string) string { return "goncordia:notify:" + q }
 
@@ -255,6 +256,14 @@ redis.call('ZADD', KEYS[2], score, ARGV[1])
 return 1
 `)
 
+var putResultScript = redis.NewScript(`
+if redis.call('EXISTS', KEYS[1]) == 0 then
+  return 0
+end
+redis.call('SET', KEYS[2], ARGV[1])
+return 1
+`)
+
 var heartbeatScript = redis.NewScript(`
 local raw = redis.call('GET', KEYS[1])
 if not raw then return 0 end
@@ -355,6 +364,33 @@ func (e *executor) JobSetStateIfRunning(ctx context.Context, params driver.JobSe
 func (e *executor) JobCancel(ctx context.Context, id string) error {
 	return jobCancel(ctx, e.rdb, e.clk, id)
 }
+
+// JobResultPut stores a result only while the job key exists.
+func (e *executor) JobResultPut(ctx context.Context, jobID string, value []byte) error {
+	stored, err := putResultScript.Run(ctx, e.rdb, []string{jobKey(jobID), resultKey(jobID)}, value).Int()
+	if err != nil {
+		return err
+	}
+	if stored == 0 {
+		return fmt.Errorf("%w: job %q", driver.ErrNotFound, jobID)
+	}
+	return nil
+}
+
+// JobResultGet returns a stored result or driver.ErrNotFound.
+func (e *executor) JobResultGet(ctx context.Context, jobID string) ([]byte, error) {
+	value, err := e.rdb.Get(ctx, resultKey(jobID)).Bytes()
+	if errors.Is(err, redis.Nil) {
+		return nil, fmt.Errorf("%w: result for job %q", driver.ErrNotFound, jobID)
+	}
+	return value, err
+}
+
+// JobResultDelete removes a stored result. Missing results are ignored.
+func (e *executor) JobResultDelete(ctx context.Context, jobID string) error {
+	return e.rdb.Del(ctx, resultKey(jobID)).Err()
+}
+
 func (e *executor) JobDelete(ctx context.Context, id string) error {
 	return jobDelete(ctx, e.rdb, id)
 }
@@ -764,7 +800,7 @@ func jobDelete(ctx context.Context, rdb *redis.Client, id string) error {
 		return err
 	}
 	pipe := rdb.Pipeline()
-	pipe.Del(ctx, jobKey(id))
+	pipe.Del(ctx, jobKey(id), resultKey(id))
 	pipe.ZRem(ctx, availKey(job.Queue), id)
 	pipe.ZRem(ctx, schedKey(job.Queue), id)
 	pipe.HDel(ctx, runKey(job.Queue), id)
@@ -1024,3 +1060,8 @@ func (l *listener) Close() error {
 // compile-time checks
 var _ driver.Executor = (*executor)(nil)
 var _ driver.ExecutorTx = (*txExecutor)(nil)
+
+var (
+	_ driver.JobResultStore = (*executor)(nil)
+	_ driver.JobResultStore = (*txExecutor)(nil)
+)

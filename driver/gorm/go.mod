@@ -4,7 +4,7 @@ go 1.26.0
 
 require (
 	github.com/glebarez/sqlite v1.11.0
-	github.com/kirimatt/goncordia v1.0.0
+	github.com/kirimatt/goncordia v1.0.1-0.20261117221011-eac235b7c801
 	github.com/kirimatt/goncordia/driver/stdlib v1.0.0
 	gorm.io/gorm v1.31.2
 )

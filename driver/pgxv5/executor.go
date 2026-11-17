@@ -3,6 +3,7 @@ package pgxv5
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
 	"time"
@@ -96,6 +97,15 @@ func (e *executor) JobCancel(ctx context.Context, id string) error {
 func (e *executor) JobDelete(ctx context.Context, id string) error {
 	return jobDelete(ctx, poolQuerier{e.pool}, id)
 }
+func (e *executor) JobResultPut(ctx context.Context, jobID string, value []byte) error {
+	return jobResultPut(ctx, poolQuerier{e.pool}, e.clk, jobID, value)
+}
+func (e *executor) JobResultGet(ctx context.Context, jobID string) ([]byte, error) {
+	return jobResultGet(ctx, poolQuerier{e.pool}, jobID)
+}
+func (e *executor) JobResultDelete(ctx context.Context, jobID string) error {
+	return jobResultDelete(ctx, poolQuerier{e.pool}, jobID)
+}
 func (e *executor) JobReschedule(ctx context.Context, params driver.RescheduleParams) error {
 	return jobReschedule(ctx, poolQuerier{e.pool}, params)
 }
@@ -162,6 +172,15 @@ func (t *txExecutor) JobCancel(ctx context.Context, id string) error {
 }
 func (t *txExecutor) JobDelete(ctx context.Context, id string) error {
 	return jobDelete(ctx, txQuerier{t.querier}, id)
+}
+func (t *txExecutor) JobResultPut(ctx context.Context, jobID string, value []byte) error {
+	return jobResultPut(ctx, txQuerier{t.querier}, t.clk, jobID, value)
+}
+func (t *txExecutor) JobResultGet(ctx context.Context, jobID string) ([]byte, error) {
+	return jobResultGet(ctx, txQuerier{t.querier}, jobID)
+}
+func (t *txExecutor) JobResultDelete(ctx context.Context, jobID string) error {
+	return jobResultDelete(ctx, txQuerier{t.querier}, jobID)
 }
 func (t *txExecutor) JobReschedule(ctx context.Context, params driver.RescheduleParams) error {
 	return jobReschedule(ctx, txQuerier{t.querier}, params)
@@ -528,6 +547,45 @@ func jobDelete(ctx context.Context, q querier, id string) error {
 	return err
 }
 
+// jobResultPut upserts a result for an existing job. The foreign key removes
+// the result together with its job.
+func jobResultPut(ctx context.Context, q querier, clk clock.Clock, jobID string, value []byte) error {
+	idInt, err := strconv.ParseInt(jobID, 10, 64)
+	if err != nil {
+		return fmt.Errorf("invalid job id %q: %w", jobID, err)
+	}
+	const sql = `INSERT INTO goncordia_job_results (job_id, value, updated_at)
+SELECT id, $2, $3 FROM goncordia_jobs WHERE id = $1
+ON CONFLICT (job_id) DO UPDATE SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at`
+	tag, err := q.Exec(ctx, sql, idInt, value, clk.Now())
+	if err == nil && tag.RowsAffected() == 0 {
+		return fmt.Errorf("%w: job %q", driver.ErrNotFound, jobID)
+	}
+	return err
+}
+
+func jobResultGet(ctx context.Context, q querier, jobID string) ([]byte, error) {
+	idInt, err := strconv.ParseInt(jobID, 10, 64)
+	if err != nil {
+		return nil, fmt.Errorf("invalid job id %q: %w", jobID, err)
+	}
+	var value []byte
+	err = q.QueryRow(ctx, `SELECT value FROM goncordia_job_results WHERE job_id = $1`, idInt).Scan(&value)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, fmt.Errorf("%w: result for job %q", driver.ErrNotFound, jobID)
+	}
+	return value, err
+}
+
+func jobResultDelete(ctx context.Context, q querier, jobID string) error {
+	idInt, err := strconv.ParseInt(jobID, 10, 64)
+	if err != nil {
+		return fmt.Errorf("invalid job id %q: %w", jobID, err)
+	}
+	_, err = q.Exec(ctx, `DELETE FROM goncordia_job_results WHERE job_id = $1`, idInt)
+	return err
+}
+
 func jobReschedule(ctx context.Context, q querier, params driver.RescheduleParams) error {
 	idInt, err := strconv.ParseInt(params.ID, 10, 64)
 	if err != nil {
@@ -715,3 +773,8 @@ func encodeError(errStr, trace *string, attempt int, clk clock.Clock) []byte {
 func isNoRows(err error) bool {
 	return err != nil && err.Error() == "no rows in result set"
 }
+
+var (
+	_ driver.JobResultStore = (*executor)(nil)
+	_ driver.JobResultStore = (*txExecutor)(nil)
+)

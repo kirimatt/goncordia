@@ -95,6 +95,7 @@ func TestCassandra_EnqueueAndProcess(t *testing.T) {
 		t.Fatal(err)
 	}
 	drivertest.Run(t, d.Executor())
+	drivertest.RunResults(t, d.Executor())
 
 	var processed atomic.Int64
 	registry := core.NewRegistry()
