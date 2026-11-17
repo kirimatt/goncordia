@@ -5,7 +5,7 @@ go 1.26.0
 require (
 	github.com/gocql/gocql v1.7.0
 	github.com/google/uuid v1.6.0
-	github.com/kirimatt/goncordia/v2 v2.0.0
+	github.com/kirimatt/goncordia/v2 v2.0.0-20261117224351-5e304c8536ad
 	github.com/testcontainers/testcontainers-go/modules/cassandra v0.45.0
 )
 
