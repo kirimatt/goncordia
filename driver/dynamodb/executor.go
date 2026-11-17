@@ -63,6 +63,71 @@ func (e *executor) JobCancel(ctx context.Context, id string) error {
 func (e *executor) JobDelete(ctx context.Context, id string) error {
 	return jobDelete(ctx, e.svc, id)
 }
+
+// JobResultPut stores a result in one transaction with a condition that the
+// job item still exists.
+func (e *executor) JobResultPut(ctx context.Context, jobID string, value []byte) error {
+	if value == nil {
+		value = []byte{}
+	}
+	_, err := e.svc.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{
+		TransactItems: []types.TransactWriteItem{
+			{ConditionCheck: &types.ConditionCheck{
+				TableName:                aws.String(tableJobs),
+				Key:                      map[string]types.AttributeValue{"id": &types.AttributeValueMemberS{Value: jobID}},
+				ConditionExpression:      aws.String("attribute_exists(#id)"),
+				ExpressionAttributeNames: map[string]string{"#id": "id"},
+			}},
+			{Put: &types.Put{
+				TableName: aws.String(tableResults),
+				Item: map[string]types.AttributeValue{
+					"id":         &types.AttributeValueMemberS{Value: jobID},
+					"value":      &types.AttributeValueMemberB{Value: value},
+					"updated_at": &types.AttributeValueMemberS{Value: e.clk.Now().UTC().Format(time.RFC3339Nano)},
+				},
+			}},
+		},
+	})
+	var cancelled *types.TransactionCanceledException
+	if errors.As(err, &cancelled) && len(cancelled.CancellationReasons) > 0 &&
+		aws.ToString(cancelled.CancellationReasons[0].Code) == "ConditionalCheckFailed" {
+		return fmt.Errorf("%w: job %q", driver.ErrNotFound, jobID)
+	}
+	return err
+}
+
+// JobResultGet returns a stored result or driver.ErrNotFound.
+func (e *executor) JobResultGet(ctx context.Context, jobID string) ([]byte, error) {
+	out, err := e.svc.GetItem(ctx, &dynamodb.GetItemInput{
+		TableName:      aws.String(tableResults),
+		Key:            map[string]types.AttributeValue{"id": &types.AttributeValueMemberS{Value: jobID}},
+		ConsistentRead: aws.Bool(true),
+	})
+	if err != nil {
+		return nil, err
+	}
+	if out.Item == nil {
+		return nil, fmt.Errorf("%w: result for job %q", driver.ErrNotFound, jobID)
+	}
+	value, ok := out.Item["value"].(*types.AttributeValueMemberB)
+	if !ok {
+		return nil, fmt.Errorf("dynamodb: result for job %q has no binary value", jobID)
+	}
+	return value.Value, nil
+}
+
+// JobResultDelete removes a stored result. Missing results are ignored.
+func (e *executor) JobResultDelete(ctx context.Context, jobID string) error {
+	return deleteResult(ctx, e.svc, jobID)
+}
+
+func deleteResult(ctx context.Context, svc *dynamodb.Client, jobID string) error {
+	_, err := svc.DeleteItem(ctx, &dynamodb.DeleteItemInput{
+		TableName: aws.String(tableResults),
+		Key:       map[string]types.AttributeValue{"id": &types.AttributeValueMemberS{Value: jobID}},
+	})
+	return err
+}
 func (e *executor) JobReschedule(ctx context.Context, params driver.RescheduleParams) error {
 	return jobReschedule(ctx, e.svc, params)
 }
@@ -987,6 +1052,9 @@ func jobDelete(ctx context.Context, svc *dynamodb.Client, id string) error {
 	if j == nil {
 		return fmt.Errorf("%w: job %q", driver.ErrNotFound, id)
 	}
+	if err := deleteResult(ctx, svc, id); err != nil {
+		return err
+	}
 	if _, err := svc.DeleteItem(ctx, &dynamodb.DeleteItemInput{
 		TableName: aws.String(tableJobs),
 		Key: map[string]types.AttributeValue{
@@ -1271,3 +1339,8 @@ func scheduleCursorAdvance(ctx context.Context, svc *dynamodb.Client, params dri
 // compile-time checks
 var _ driver.Executor = (*executor)(nil)
 var _ driver.ExecutorTx = (*txExecutor)(nil)
+
+var (
+	_ driver.JobResultStore = (*executor)(nil)
+	_ driver.JobResultStore = (*txExecutor)(nil)
+)

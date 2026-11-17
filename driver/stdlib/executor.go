@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -60,6 +61,15 @@ func (e *executor) JobCancel(ctx context.Context, id string) error {
 }
 func (e *executor) JobDelete(ctx context.Context, id string) error {
 	return jobDelete(ctx, e.db, e.dialect, id)
+}
+func (e *executor) JobResultPut(ctx context.Context, jobID string, value []byte) error {
+	return jobResultPut(ctx, e.db, e.dialect, e.clk, jobID, value)
+}
+func (e *executor) JobResultGet(ctx context.Context, jobID string) ([]byte, error) {
+	return jobResultGet(ctx, e.db, e.dialect, jobID)
+}
+func (e *executor) JobResultDelete(ctx context.Context, jobID string) error {
+	return jobResultDelete(ctx, e.db, e.dialect, jobID)
 }
 func (e *executor) JobReschedule(ctx context.Context, params driver.RescheduleParams) error {
 	return jobReschedule(ctx, e.db, e.dialect, params)
@@ -129,6 +139,15 @@ func (t *txExecutor) JobCancel(ctx context.Context, id string) error {
 }
 func (t *txExecutor) JobDelete(ctx context.Context, id string) error {
 	return jobDelete(ctx, t.tx, t.dialect, id)
+}
+func (t *txExecutor) JobResultPut(ctx context.Context, jobID string, value []byte) error {
+	return jobResultPut(ctx, t.tx, t.dialect, t.clk, jobID, value)
+}
+func (t *txExecutor) JobResultGet(ctx context.Context, jobID string) ([]byte, error) {
+	return jobResultGet(ctx, t.tx, t.dialect, jobID)
+}
+func (t *txExecutor) JobResultDelete(ctx context.Context, jobID string) error {
+	return jobResultDelete(ctx, t.tx, t.dialect, jobID)
 }
 func (t *txExecutor) JobReschedule(ctx context.Context, params driver.RescheduleParams) error {
 	return jobReschedule(ctx, t.tx, t.dialect, params)
@@ -681,6 +700,9 @@ func jobCancel(ctx context.Context, q querier, d Dialect, clk clock.Clock, id st
 }
 
 func jobDelete(ctx context.Context, q querier, d Dialect, id string) error {
+	if err := jobResultDelete(ctx, q, d, id); err != nil {
+		return err
+	}
 	result, err := q.ExecContext(ctx, d.q(sqlJobDelete), id)
 	if err != nil {
 		return err
@@ -689,6 +711,61 @@ func jobDelete(ctx context.Context, q querier, d Dialect, id string) error {
 		return fmt.Errorf("%w: job %q", driver.ErrNotFound, id)
 	}
 	return nil
+}
+
+const (
+	sqlJobResultUpsertPostgres = `INSERT INTO goncordia_job_results (job_id, value, updated_at)
+SELECT id, ?, ? FROM goncordia_jobs WHERE id = ?
+ON CONFLICT (job_id) DO UPDATE SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at`
+	sqlJobResultUpsertMySQL = `INSERT INTO goncordia_job_results (job_id, value, updated_at)
+SELECT id, ?, ? FROM goncordia_jobs WHERE id = ?
+ON DUPLICATE KEY UPDATE value = VALUES(value), updated_at = VALUES(updated_at)`
+	sqlJobResultUpsertSQLite = `INSERT INTO goncordia_job_results (job_id, value, updated_at)
+SELECT id, ?, ? FROM goncordia_jobs WHERE id = ?
+ON CONFLICT(job_id) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`
+)
+
+// jobResultPut upserts a result for an existing job. jobDelete removes it.
+func jobResultPut(ctx context.Context, q querier, d Dialect, clk clock.Clock, jobID string, value []byte) error {
+	query := sqlJobResultUpsertSQLite
+	switch d {
+	case Postgres:
+		query = sqlJobResultUpsertPostgres
+	case MySQL:
+		query = sqlJobResultUpsertMySQL
+	}
+	if value == nil {
+		value = []byte{}
+	}
+	result, err := q.ExecContext(ctx, d.q(query), value, clk.Now().UTC(), jobID)
+	if err != nil {
+		return err
+	}
+	if rows, _ := result.RowsAffected(); rows > 0 {
+		return nil
+	}
+	// MySQL reports zero affected rows when an upsert rewrites an identical
+	// value, so distinguish that from a missing job.
+	var one int
+	err = q.QueryRowContext(ctx, d.q(`SELECT 1 FROM goncordia_jobs WHERE id = ?`), jobID).Scan(&one)
+	if errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("%w: job %q", driver.ErrNotFound, jobID)
+	}
+	return err
+}
+
+func jobResultGet(ctx context.Context, q querier, d Dialect, jobID string) ([]byte, error) {
+	var value []byte
+	err := q.QueryRowContext(ctx, d.q(`SELECT value FROM goncordia_job_results WHERE job_id = ?`), jobID).Scan(&value)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, fmt.Errorf("%w: result for job %q", driver.ErrNotFound, jobID)
+	}
+	return value, err
+}
+
+func jobResultDelete(ctx context.Context, q querier, d Dialect, jobID string) error {
+	_, err := q.ExecContext(ctx, d.q(`DELETE FROM goncordia_job_results WHERE job_id = ?`), jobID)
+	return err
 }
 
 func jobReschedule(ctx context.Context, q querier, d Dialect, params driver.RescheduleParams) error {
@@ -891,3 +968,8 @@ func scanQueueRow(s rowScanner) (*driver.QueueRow, error) {
 	}
 	return &r, nil
 }
+
+var (
+	_ driver.JobResultStore = (*executor)(nil)
+	_ driver.JobResultStore = (*txExecutor)(nil)
+)

@@ -57,8 +57,8 @@ func TestStdlibSQLite_ConcurrentMigrateAndOwnership(t *testing.T) {
 	if err := db1.QueryRow(`SELECT COUNT(*) FROM goncordia_schema_migrations`).Scan(&migrations); err != nil {
 		t.Fatal(err)
 	}
-	if migrations != 7 {
-		t.Fatalf("migration count=%d, want 7", migrations)
+	if migrations != 8 {
+		t.Fatalf("migration count=%d, want 8", migrations)
 	}
 	if err := drivers[0].Close(); err != nil {
 		t.Fatal(err)
@@ -154,6 +154,7 @@ func (EmailJob) Kind() string { return "email" }
 func TestStdlibSQLite_EnqueueAndProcess(t *testing.T) {
 	d, _ := newSQLiteDriver(t)
 	drivertest.Run(t, d.Executor())
+	drivertest.RunResults(t, d.Executor())
 	ctx := context.Background()
 
 	var processed atomic.Int64

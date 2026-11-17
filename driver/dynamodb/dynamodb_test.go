@@ -93,6 +93,7 @@ func TestDynamoDB_EnqueueAndProcess(t *testing.T) {
 		t.Fatal(err)
 	}
 	drivertest.Run(t, d.Executor())
+	drivertest.RunResults(t, d.Executor())
 
 	registry := core.NewRegistry()
 	var processed atomic.Int64

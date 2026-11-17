@@ -58,7 +58,7 @@ func (e *executor) JobCancel(ctx context.Context, id string) error {
 	return jobCancel(ctx, e.conn, e.clk, id)
 }
 func (e *executor) JobDelete(ctx context.Context, id string) error {
-	return jobDelete(ctx, e.conn, id)
+	return jobDelete(ctx, e.conn, e.clk, id)
 }
 func (e *executor) JobReschedule(ctx context.Context, params driver.RescheduleParams) error {
 	return jobReschedule(ctx, e.conn, params)
@@ -113,7 +113,7 @@ func (t *txExecutor) JobCancel(ctx context.Context, id string) error {
 	return jobCancel(ctx, t.conn, t.clk, id)
 }
 func (t *txExecutor) JobDelete(ctx context.Context, id string) error {
-	return jobDelete(ctx, t.conn, id)
+	return jobDelete(ctx, t.conn, t.clk, id)
 }
 func (t *txExecutor) JobReschedule(ctx context.Context, params driver.RescheduleParams) error {
 	return jobReschedule(ctx, t.conn, params)
@@ -344,7 +344,7 @@ func jobGetByID(ctx context.Context, conn chdriver.Conn, id string) (*driver.Job
 		}
 		return nil, err
 	}
-	if j.ID == "" {
+	if j.ID == "" || j.State == jobStateDeleted {
 		return nil, fmt.Errorf("%w: job %q", driver.ErrNotFound, id)
 	}
 	return j.toRow(), nil
@@ -694,7 +694,7 @@ func jobCancel(ctx context.Context, conn chdriver.Conn, clk clock.Clock, id stri
 
 // ---- JobDelete ----
 
-func jobDelete(ctx context.Context, conn chdriver.Conn, id string) error {
+func jobDelete(ctx context.Context, conn chdriver.Conn, clk clock.Clock, id string) error {
 	// ClickHouse doesn't support row-level deletes on MergeTree tables in the same
 	// way as OLTP databases. We mark the job as deleted by setting a terminal state.
 	// Physical deletion happens via TTL or ALTER TABLE DELETE (async mutation).
@@ -702,13 +702,65 @@ func jobDelete(ctx context.Context, conn chdriver.Conn, id string) error {
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return err
 	}
-	if err != nil || j.ID == "" {
+	if err != nil || j.ID == "" || j.State == jobStateDeleted {
 		return fmt.Errorf("%w: job %q", driver.ErrNotFound, id)
 	}
+	if err := writeResult(ctx, conn, clk.Now(), id, nil, true); err != nil {
+		return err
+	}
 	deleted := j
-	deleted.State = "deleted"
+	deleted.State = jobStateDeleted
 	deleted.Version = j.Version + 1
 	return insertJobRow(ctx, conn, deleted)
+}
+
+// jobStateDeleted marks a logically deleted job row.
+const jobStateDeleted = "deleted"
+
+// writeResult appends a result row (or a tombstone) with the next version.
+// Like the job table, concurrent writers to one result are last-writer-wins.
+func writeResult(ctx context.Context, conn chdriver.Conn, now time.Time, jobID string, value []byte, deleted bool) error {
+	var version int64
+	err := conn.QueryRow(ctx, `SELECT version FROM goncordia_job_results FINAL WHERE job_id = ? LIMIT 1`, jobID).Scan(&version)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	if errors.Is(err, sql.ErrNoRows) && deleted {
+		return nil
+	}
+	var flag uint8
+	if deleted {
+		flag = 1
+	}
+	return conn.Exec(ctx, `INSERT INTO goncordia_job_results (job_id, value, deleted, updated_at, version) VALUES (?,?,?,?,?)`,
+		jobID, string(value), flag, now, version+1)
+}
+
+// JobResultPut stores a result for an existing, not deleted job.
+func (e *executor) JobResultPut(ctx context.Context, jobID string, value []byte) error {
+	if _, err := jobGetByID(ctx, e.conn, jobID); err != nil {
+		return err
+	}
+	return writeResult(ctx, e.conn, e.clk.Now(), jobID, value, false)
+}
+
+// JobResultGet returns a stored result or driver.ErrNotFound.
+func (e *executor) JobResultGet(ctx context.Context, jobID string) ([]byte, error) {
+	var value string
+	var deleted uint8
+	err := e.conn.QueryRow(ctx, `SELECT value, deleted FROM goncordia_job_results FINAL WHERE job_id = ? LIMIT 1`, jobID).Scan(&value, &deleted)
+	if errors.Is(err, sql.ErrNoRows) || (err == nil && deleted == 1) {
+		return nil, fmt.Errorf("%w: result for job %q", driver.ErrNotFound, jobID)
+	}
+	if err != nil {
+		return nil, err
+	}
+	return []byte(value), nil
+}
+
+// JobResultDelete writes a tombstone. Missing results are ignored.
+func (e *executor) JobResultDelete(ctx context.Context, jobID string) error {
+	return writeResult(ctx, e.conn, e.clk.Now(), jobID, nil, true)
 }
 
 // ---- JobReschedule ----
@@ -890,3 +942,5 @@ func scheduleCursorAdvance(ctx context.Context, conn chdriver.Conn, params drive
 // compile-time checks
 var _ driver.Executor = (*executor)(nil)
 var _ driver.ExecutorTx = (*txExecutor)(nil)
+var _ driver.JobResultStore = (*executor)(nil)
+var _ driver.JobResultStore = (*txExecutor)(nil)

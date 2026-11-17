@@ -87,6 +87,7 @@ func newDriver(t *testing.T, opts ...mongodriver.Option) (*mongodriver.Driver, *
 func TestMongo_EnqueueAndProcess(t *testing.T) {
 	d, _ := newDriver(t)
 	drivertest.Run(t, d.Executor())
+	drivertest.RunResults(t, d.Executor())
 	ctx := context.Background()
 
 	var processed atomic.Int64

@@ -3,6 +3,7 @@ package cassandradriver
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"time"
@@ -57,6 +58,45 @@ func (e *executor) JobCancel(ctx context.Context, id string) error {
 }
 func (e *executor) JobDelete(ctx context.Context, id string) error {
 	return jobDelete(ctx, e.session, id)
+}
+
+// JobResultPut stores a result for an existing job. A job deleted
+// concurrently may leave an orphaned result, which jobDelete cannot see.
+func (e *executor) JobResultPut(ctx context.Context, jobID string, value []byte) error {
+	var id string
+	err := e.session.Query(`SELECT id FROM goncordia_jobs WHERE id=?`, jobID).WithContext(ctx).Scan(&id)
+	if errors.Is(err, gocql.ErrNotFound) {
+		return fmt.Errorf("%w: job %q", driver.ErrNotFound, jobID)
+	}
+	if err != nil {
+		return err
+	}
+	if value == nil {
+		value = []byte{}
+	}
+	return e.session.Query(`INSERT INTO goncordia_job_results (job_id, value, updated_at) VALUES (?, ?, ?)`,
+		jobID, value, e.clk.Now()).WithContext(ctx).Exec()
+}
+
+// JobResultGet returns a stored result or driver.ErrNotFound.
+func (e *executor) JobResultGet(ctx context.Context, jobID string) ([]byte, error) {
+	var value []byte
+	err := e.session.Query(`SELECT value FROM goncordia_job_results WHERE job_id=?`, jobID).WithContext(ctx).Scan(&value)
+	if errors.Is(err, gocql.ErrNotFound) {
+		return nil, fmt.Errorf("%w: result for job %q", driver.ErrNotFound, jobID)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if value == nil {
+		value = []byte{}
+	}
+	return value, nil
+}
+
+// JobResultDelete removes a stored result. Missing results are ignored.
+func (e *executor) JobResultDelete(ctx context.Context, jobID string) error {
+	return e.session.Query(`DELETE FROM goncordia_job_results WHERE job_id=?`, jobID).WithContext(ctx).Exec()
 }
 func (e *executor) JobReschedule(ctx context.Context, params driver.RescheduleParams) error {
 	return jobReschedule(ctx, e.session, params)
@@ -807,6 +847,9 @@ func jobDelete(ctx context.Context, session *gocql.Session, id string) error {
 		return err
 	}
 
+	if err := session.Query(`DELETE FROM goncordia_job_results WHERE job_id=?`, id).WithContext(ctx).Exec(); err != nil {
+		return err
+	}
 	if err := session.Query(`DELETE FROM goncordia_jobs WHERE id=?`, id).WithContext(ctx).Exec(); err != nil {
 		return err
 	}
@@ -1001,3 +1044,8 @@ func scheduleCursorAdvance(ctx context.Context, session *gocql.Session, params d
 // compile-time checks
 var _ driver.Executor = (*executor)(nil)
 var _ driver.ExecutorTx = (*txExecutor)(nil)
+
+var (
+	_ driver.JobResultStore = (*executor)(nil)
+	_ driver.JobResultStore = (*txExecutor)(nil)
+)

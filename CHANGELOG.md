@@ -15,8 +15,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   typed `ErrDiscarded`, `ErrCancelled`, and `ErrNoResult` outcomes, `TryGet`,
   and `future.Of` for jobs enqueued elsewhere. Waiters in the worker's process
   wake on completion; others poll on the injected clock.
-- Optional `driver.JobResultStore` executor capability, implemented by the
-  in-memory driver, with the `drivertest.RunResults` conformance suite.
+- Optional `driver.JobResultStore` executor capability with the
+  `drivertest.RunResults` conformance suite, implemented by every driver:
+  memory, pgxv5 and stdlib (migration 008, `goncordia_job_results`), gorm,
+  bun, MongoDB, Redis, Cassandra, ClickHouse, DynamoDB (new
+  `goncordia_job_results` table created by `Migrate`), and Firestore.
+  Deleting a job deletes its result.
+
+### Fixed
+- ClickHouse `JobGetByID` reports logically deleted jobs as `ErrNotFound`
+  instead of returning them with state `deleted`.
 - `goncordia.WorkerObservers` combines several worker observers.
 - `otelgoncordia.NewFutureInstrumentation`: `goncordia.future.await` and
   `goncordia.future.store` spans plus await duration, polls, wakeups, result

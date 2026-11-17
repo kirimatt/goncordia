@@ -89,6 +89,7 @@ func newPostgresDriver(t *testing.T, opts ...stdlibdriver.Option) *stdlibdriver.
 func TestStdlibPostgres_EnqueueAndProcess(t *testing.T) {
 	d := newPostgresDriver(t)
 	drivertest.Run(t, d.Executor())
+	drivertest.RunResults(t, d.Executor())
 	ctx := context.Background()
 
 	var processed atomic.Int64

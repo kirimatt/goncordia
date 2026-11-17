@@ -112,6 +112,15 @@ func (e *executor) JobCancel(ctx context.Context, id string) error {
 func (e *executor) JobDelete(ctx context.Context, id string) error {
 	return jobDelete(ctx, e.client, id)
 }
+func (e *executor) JobResultPut(ctx context.Context, jobID string, value []byte) error {
+	return jobResultPut(ctx, e.client, e.clk, jobID, value)
+}
+func (e *executor) JobResultGet(ctx context.Context, jobID string) ([]byte, error) {
+	return jobResultGet(ctx, e.client, jobID)
+}
+func (e *executor) JobResultDelete(ctx context.Context, jobID string) error {
+	return jobResultDelete(ctx, e.client, jobID)
+}
 func (e *executor) JobReschedule(ctx context.Context, params driver.RescheduleParams) error {
 	return jobReschedule(ctx, e.client, params)
 }
@@ -183,6 +192,15 @@ func (t *txExecutor) JobCancel(ctx context.Context, id string) error {
 }
 func (t *txExecutor) JobDelete(ctx context.Context, id string) error {
 	return jobDelete(ctx, t.client, id)
+}
+func (t *txExecutor) JobResultPut(ctx context.Context, jobID string, value []byte) error {
+	return jobResultPut(ctx, t.client, t.clk, jobID, value)
+}
+func (t *txExecutor) JobResultGet(ctx context.Context, jobID string) ([]byte, error) {
+	return jobResultGet(ctx, t.client, jobID)
+}
+func (t *txExecutor) JobResultDelete(ctx context.Context, jobID string) error {
+	return jobResultDelete(ctx, t.client, jobID)
 }
 func (t *txExecutor) JobReschedule(ctx context.Context, params driver.RescheduleParams) error {
 	return jobReschedule(ctx, t.client, params)
@@ -826,6 +844,9 @@ func jobDelete(ctx context.Context, client *firestore.Client, id string) error {
 	if err := snap.DataTo(&j); err != nil {
 		return err
 	}
+	if err := jobResultDelete(ctx, client, id); err != nil {
+		return err
+	}
 	if _, err := jobRef.Delete(ctx); err != nil {
 		return err
 	}
@@ -833,6 +854,55 @@ func jobDelete(ctx context.Context, client *firestore.Client, id string) error {
 		client.Collection(colUniq).Doc(j.UniqueKey).Delete(ctx) //nolint:errcheck
 	}
 	return nil
+}
+
+// ---- Job results ----
+
+type resultDoc struct {
+	Value     []byte    `firestore:"value"`
+	UpdatedAt time.Time `firestore:"updated_at"`
+}
+
+// jobResultPut stores a result in a transaction that requires the job document.
+func jobResultPut(ctx context.Context, client *firestore.Client, clk clock.Clock, jobID string, value []byte) error {
+	if value == nil {
+		value = []byte{}
+	}
+	jobRef := client.Collection(colJobs).Doc(jobID)
+	resultRef := client.Collection(colResults).Doc(jobID)
+	err := client.RunTransaction(ctx, func(ctx context.Context, tx *firestore.Transaction) error {
+		if _, err := tx.Get(jobRef); err != nil {
+			return err
+		}
+		return tx.Set(resultRef, resultDoc{Value: value, UpdatedAt: clk.Now().UTC()})
+	})
+	if status.Code(err) == codes.NotFound {
+		return fmt.Errorf("%w: job %q", driver.ErrNotFound, jobID)
+	}
+	return err
+}
+
+func jobResultGet(ctx context.Context, client *firestore.Client, jobID string) ([]byte, error) {
+	snap, err := client.Collection(colResults).Doc(jobID).Get(ctx)
+	if status.Code(err) == codes.NotFound {
+		return nil, fmt.Errorf("%w: result for job %q", driver.ErrNotFound, jobID)
+	}
+	if err != nil {
+		return nil, err
+	}
+	var doc resultDoc
+	if err := snap.DataTo(&doc); err != nil {
+		return nil, err
+	}
+	if doc.Value == nil {
+		doc.Value = []byte{}
+	}
+	return doc.Value, nil
+}
+
+func jobResultDelete(ctx context.Context, client *firestore.Client, jobID string) error {
+	_, err := client.Collection(colResults).Doc(jobID).Delete(ctx)
+	return err
 }
 
 // ---- JobReschedule ----
@@ -1094,3 +1164,8 @@ func jobErrorsToRow(errs []jobError) []driver.AttemptError {
 // compile-time checks
 var _ driver.Executor = (*executor)(nil)
 var _ driver.ExecutorTx = (*txExecutor)(nil)
+
+var (
+	_ driver.JobResultStore = (*executor)(nil)
+	_ driver.JobResultStore = (*txExecutor)(nil)
+)

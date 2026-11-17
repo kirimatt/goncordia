@@ -2,6 +2,7 @@ package mongodriver
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -114,6 +115,15 @@ func (e *executor) JobCancel(ctx context.Context, id string) error {
 func (e *executor) JobDelete(ctx context.Context, id string) error {
 	return jobDelete(ctx, e.db, id)
 }
+func (e *executor) JobResultPut(ctx context.Context, jobID string, value []byte) error {
+	return jobResultPut(ctx, e.db, e.clk, jobID, value)
+}
+func (e *executor) JobResultGet(ctx context.Context, jobID string) ([]byte, error) {
+	return jobResultGet(ctx, e.db, jobID)
+}
+func (e *executor) JobResultDelete(ctx context.Context, jobID string) error {
+	return jobResultDelete(ctx, e.db, jobID)
+}
 func (e *executor) JobReschedule(ctx context.Context, params driver.RescheduleParams) error {
 	return jobReschedule(ctx, e.db, params)
 }
@@ -187,6 +197,15 @@ func (t *txExecutor) JobCancel(ctx context.Context, id string) error {
 }
 func (t *txExecutor) JobDelete(ctx context.Context, id string) error {
 	return jobDelete(t.sc, t.db, id)
+}
+func (t *txExecutor) JobResultPut(ctx context.Context, jobID string, value []byte) error {
+	return jobResultPut(t.sc, t.db, t.clk, jobID, value)
+}
+func (t *txExecutor) JobResultGet(ctx context.Context, jobID string) ([]byte, error) {
+	return jobResultGet(t.sc, t.db, jobID)
+}
+func (t *txExecutor) JobResultDelete(ctx context.Context, jobID string) error {
+	return jobResultDelete(t.sc, t.db, jobID)
 }
 func (t *txExecutor) JobReschedule(ctx context.Context, params driver.RescheduleParams) error {
 	return jobReschedule(t.sc, t.db, params)
@@ -594,10 +613,66 @@ func jobDelete(ctx context.Context, db *mongo.Database, id string) error {
 	if err != nil {
 		return fmt.Errorf("invalid job id %q: %w", id, err)
 	}
+	if _, err := db.Collection(resultsCollection).DeleteOne(ctx, bson.M{"_id": oid}); err != nil {
+		return err
+	}
 	result, err := db.Collection(jobsCollection).DeleteOne(ctx, bson.M{"_id": oid})
 	if err == nil && result.DeletedCount == 0 {
 		return fmt.Errorf("%w: job %q", driver.ErrNotFound, id)
 	}
+	return err
+}
+
+type resultDoc struct {
+	ID        primitive.ObjectID `bson:"_id"`
+	Value     []byte             `bson:"value"`
+	UpdatedAt time.Time          `bson:"updated_at"`
+}
+
+// jobResultPut upserts a result for an existing job. Results share the job's
+// ObjectID and are removed by jobDelete.
+func jobResultPut(ctx context.Context, db *mongo.Database, clk clock.Clock, jobID string, value []byte) error {
+	oid, err := primitive.ObjectIDFromHex(jobID)
+	if err != nil {
+		return fmt.Errorf("invalid job id %q: %w", jobID, err)
+	}
+	n, err := db.Collection(jobsCollection).CountDocuments(ctx, bson.M{"_id": oid}, options.Count().SetLimit(1))
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return fmt.Errorf("%w: job %q", driver.ErrNotFound, jobID)
+	}
+	if value == nil {
+		value = []byte{}
+	}
+	_, err = db.Collection(resultsCollection).ReplaceOne(ctx, bson.M{"_id": oid},
+		resultDoc{ID: oid, Value: value, UpdatedAt: clk.Now()}, options.Replace().SetUpsert(true))
+	return err
+}
+
+func jobResultGet(ctx context.Context, db *mongo.Database, jobID string) ([]byte, error) {
+	oid, err := primitive.ObjectIDFromHex(jobID)
+	if err != nil {
+		return nil, fmt.Errorf("invalid job id %q: %w", jobID, err)
+	}
+	var doc resultDoc
+	err = db.Collection(resultsCollection).FindOne(ctx, bson.M{"_id": oid}).Decode(&doc)
+	if errors.Is(err, mongo.ErrNoDocuments) {
+		return nil, fmt.Errorf("%w: result for job %q", driver.ErrNotFound, jobID)
+	}
+	if err != nil {
+		return nil, err
+	}
+	return doc.Value, nil
+}
+
+func jobResultDelete(ctx context.Context, db *mongo.Database, jobID string) error {
+	oid, err := primitive.ObjectIDFromHex(jobID)
+	if err != nil {
+		return fmt.Errorf("invalid job id %q: %w", jobID, err)
+	}
+	_, err = db.Collection(resultsCollection).DeleteOne(ctx, bson.M{"_id": oid})
 	return err
 }
 
@@ -815,3 +890,8 @@ func docToRow(doc jobDoc) *driver.JobRow {
 		PipelineID:     doc.PipelineID,
 	}
 }
+
+var (
+	_ driver.JobResultStore = (*executor)(nil)
+	_ driver.JobResultStore = (*txExecutor)(nil)
+)
