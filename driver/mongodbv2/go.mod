@@ -3,7 +3,7 @@ module github.com/kirimatt/goncordia/driver/mongodbv2/v2
 go 1.26.0
 
 require (
-	github.com/kirimatt/goncordia/v2 v2.5.0
+	github.com/kirimatt/goncordia/v2 v2.5.1
 	github.com/testcontainers/testcontainers-go/modules/mongodb v0.45.0
 	go.mongodb.org/mongo-driver/v2 v2.10.0
 )

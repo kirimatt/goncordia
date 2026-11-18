@@ -483,3 +483,17 @@ func TestAwaitReportsLostResult(t *testing.T) {
 		t.Fatalf("outcome = %s", fx.obs.lastAwait(t).Outcome)
 	}
 }
+
+// nilRowStore mimics drivers that reported a missing job as (nil, nil).
+type nilRowStore struct{ jobReader }
+
+func (nilRowStore) JobGetByID(context.Context, string) (*driver.JobRow, error) { return nil, nil }
+
+func TestAwaitTreatsNilRowAsNotFound(t *testing.T) {
+	fx := newFixture(t)
+	fx.m.jobs = nilRowStore{fx.m.jobs}
+	_, err := Of[int](fx.m, "gone").Await(t.Context())
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("err = %v, want ErrNotFound", err)
+	}
+}

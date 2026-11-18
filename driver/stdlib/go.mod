@@ -5,7 +5,7 @@ go 1.26.0
 require (
 	github.com/go-sql-driver/mysql v1.10.1
 	github.com/jackc/pgx/v5 v5.13.0
-	github.com/kirimatt/goncordia/v2 v2.5.0
+	github.com/kirimatt/goncordia/v2 v2.5.1
 	github.com/testcontainers/testcontainers-go v0.45.0
 	github.com/testcontainers/testcontainers-go/modules/mysql v0.45.0
 	github.com/testcontainers/testcontainers-go/modules/postgres v0.45.0

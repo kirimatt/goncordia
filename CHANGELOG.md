@@ -11,6 +11,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [v2.5.1] — 2026-11-18
+
+### Fixed
+- `future.Await` no longer panics when a driver reports a missing job as
+  `(nil, nil)`; it returns `future.ErrNotFound`. On Firestore this happened
+  when awaiting a job that retention had deleted.
+- The `Executor` contract now states that `JobGetByID` reports a missing job
+  with `driver.ErrNotFound`, and `drivertest.Run` checks it.
+
+### Added (driver/redis v2.5.1)
+- Retention indexes (terminal jobs by finalization time, results by write
+  time) and `driver.JobPruner`, so retention reads only expired entries
+  instead of every job. `Migrate` backfills them; run it again after a
+  rolling upgrade.
+
+### Fixed (driver/firestore v2.5.1)
+- `JobGetByID` returns `driver.ErrNotFound` for a missing job instead of
+  `(nil, nil)`.
+
+---
+
 ## [v2.5.0] — 2026-11-18
 
 ### Changed
@@ -32,12 +53,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   delete expired jobs and results from an index instead of listing all jobs.
 - `drivertest.RunRetention` checks retention against a driver; every built-in
   driver runs it.
-
-### Added (driver/redis v2.5.0)
-- Retention indexes (terminal jobs by finalization time, results by write
-  time) and `driver.JobPruner`, so retention reads only expired entries
-  instead of every job. `Migrate` backfills them; run it again after a
-  rolling upgrade.
 
 ---
 

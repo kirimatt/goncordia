@@ -283,6 +283,10 @@ func (f *Future[R]) check(ctx context.Context, stats *AwaitFinish) (R, bool, err
 	var zero R
 	stats.Polls++
 	row, err := f.m.jobs.JobGetByID(ctx, f.id)
+	if err == nil && row == nil {
+		// Drivers before v2.5.1 could report a missing job as (nil, nil).
+		err = fmt.Errorf("%w: job %q", driver.ErrNotFound, f.id)
+	}
 	if err != nil {
 		if errors.Is(err, driver.ErrNotFound) {
 			stats.Outcome = OutcomeNotFound
