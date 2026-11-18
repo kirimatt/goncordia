@@ -407,7 +407,7 @@ func jobGetByID(ctx context.Context, client *firestore.Client, id string) (*driv
 	snap, err := client.Collection(colJobs).Doc(id).Get(ctx)
 	if err != nil {
 		if status.Code(err) == codes.NotFound {
-			return nil, fmt.Errorf("%w: job %q", driver.ErrNotFound, id)
+			return nil, nil
 		}
 		return nil, err
 	}
