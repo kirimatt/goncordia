@@ -1,6 +1,7 @@
 # goncordia
 
 [![CI](https://github.com/kirimatt/goncordia/actions/workflows/ci.yml/badge.svg)](https://github.com/kirimatt/goncordia/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/kirimatt/goncordia/graph/badge.svg)](https://codecov.io/gh/kirimatt/goncordia)
 [![Go Reference](https://pkg.go.dev/badge/github.com/kirimatt/goncordia/v2.svg)](https://pkg.go.dev/github.com/kirimatt/goncordia/v2)
 [![GitHub release](https://img.shields.io/github/v/tag/kirimatt/goncordia?label=version)](https://github.com/kirimatt/goncordia/releases)
 [![Go version](https://img.shields.io/github/go-mod/go-version/kirimatt/goncordia)](go.mod)
