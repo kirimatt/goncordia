@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+---
+
+## [v2.3.0] — 2026-11-18
+
+### Added
+- `future.NewMetrics` aggregates futures metrics in memory and renders them in
+  the Prometheus text format: in-flight awaits, await duration by kind and
+  outcome, polls, wakeups, store duration, and result size.
+- `admin.WithMetrics` appends any `WritePrometheus` writer, such as
+  `future.Metrics`, to the admin `/metrics` endpoint.
+- `future.Observers` combines futures observers, for example
+  `future.Metrics` with OpenTelemetry instrumentation.
+
 ### Dependencies
 - Driver, otel, gontest, gorm, bun, and bench modules require v2.2.0.
 - AWS SDK v2 1.48.0 (config 1.33.18, credentials 1.21.0, DynamoDB 1.74.0,

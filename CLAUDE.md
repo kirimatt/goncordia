@@ -208,6 +208,9 @@ client, worker/scheduler config, and driver `WithClock` option in tests. Calling
 ## Operations
 
 Mount `admin.New(driver)` behind application authentication for the dashboard,
-JSON job/queue actions, health/readiness probes, and Prometheus metrics. Workers
+JSON job/queue actions, health/readiness probes, and Prometheus metrics. Add
+futures metrics with `admin.WithMetrics(futureMetrics)`, where
+`futureMetrics := future.NewMetrics(nil)` is also the Manager's
+`future.Config.Observer` (combine observers with `future.Observers`). Workers
 automatically rescue stale running jobs; tune `StuckJobTimeout` and
 `RescueInterval` in `WorkerConfig`.

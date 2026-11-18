@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -51,12 +52,19 @@ type AuthorizeFunc func(*http.Request, Operation) error
 // JobRedactor returns the representation exposed by the JSON API.
 type JobRedactor func(driver.JobRow) driver.JobRow
 
+// MetricsWriter renders additional metrics in the Prometheus text format,
+// for example *future.Metrics.
+type MetricsWriter interface {
+	WritePrometheus(io.Writer) error
+}
+
 type handler[TTx any] struct {
 	driver    driver.Driver[TTx]
 	clock     gonclock.Clock
 	readOnly  bool
 	authorize AuthorizeFunc
 	redact    JobRedactor
+	extra     []MetricsWriter
 }
 
 type config struct {
@@ -64,6 +72,7 @@ type config struct {
 	readOnly  bool
 	authorize AuthorizeFunc
 	redact    JobRedactor
+	extra     []MetricsWriter
 }
 
 // Option configures the admin handler.
@@ -90,6 +99,22 @@ func WithJobRedactor(redact JobRedactor) Option {
 	return func(cfg *config) { cfg.redact = redact }
 }
 
+// WithMetrics appends the output of each writer to the /metrics endpoint,
+// after the queue gauges. Use it to expose futures metrics:
+//
+//	futureMetrics := future.NewMetrics(nil)
+//	m, _ := future.New(d, future.Config{Observer: futureMetrics})
+//	mux.Handle("/admin/", http.StripPrefix("/admin", admin.New(d, admin.WithMetrics(futureMetrics))))
+func WithMetrics(writers ...MetricsWriter) Option {
+	return func(cfg *config) {
+		for _, w := range writers {
+			if w != nil {
+				cfg.extra = append(cfg.extra, w)
+			}
+		}
+	}
+}
+
 // New returns an HTTP handler exposing the dashboard, JSON admin API,
 // health/readiness probes, and Prometheus-compatible queue metrics.
 func New[TTx any](d driver.Driver[TTx], opts ...Option) http.Handler {
@@ -103,7 +128,7 @@ func New[TTx any](d driver.Driver[TTx], opts ...Option) http.Handler {
 	if cfg.redact == nil {
 		cfg.redact = defaultJobRedactor
 	}
-	return &handler[TTx]{driver: d, clock: cfg.clock, readOnly: cfg.readOnly, authorize: cfg.authorize, redact: cfg.redact}
+	return &handler[TTx]{driver: d, clock: cfg.clock, readOnly: cfg.readOnly, authorize: cfg.authorize, redact: cfg.redact, extra: cfg.extra}
 }
 
 func (h *handler[TTx]) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -387,6 +412,9 @@ func (h *handler[TTx]) metrics(w http.ResponseWriter, r *http.Request) {
 		for state, count := range row.stats.States {
 			_, _ = fmt.Fprintf(w, "goncordia_queue_jobs{queue=%q,state=%q} %d\n", row.queue, state, count)
 		}
+	}
+	for _, extra := range h.extra {
+		_ = extra.WritePrometheus(w)
 	}
 }
 
