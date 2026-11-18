@@ -56,8 +56,8 @@ github.com/jackc/puddle/v2 v2.2.3 h1:f8HoREISb3l5eO9coPgK7U3hKLhWGokOFVcThl5jrao
 github.com/jackc/puddle/v2 v2.2.3/go.mod h1:vriiEXHvEE654aYKXXjOvZM39qJ0q+azkZFrfEOc3H4=
 github.com/jinzhu/inflection v1.0.0 h1:K317FqzuhWc8YvSVlFMCCUb36O/S9MCKRDI7QkRKD/E=
 github.com/jinzhu/inflection v1.0.0/go.mod h1:h+uFLlag+Qp1Va5pdKtLDYj+kHp5pxUVkryuEj+Srlc=
-github.com/kirimatt/goncordia/driver/stdlib/v2 v2.7.1 h1:IrqYGlHGacikvo0rb5ao9ZpHcsPpBnjdmLucxuNv+EI=
-github.com/kirimatt/goncordia/driver/stdlib/v2 v2.7.1/go.mod h1:sx8bnuO9Y8V3vjfVC6KnwvQArskdU6PmwG6okwtxBwg=
+github.com/kirimatt/goncordia/driver/stdlib/v2 v2.7.2 h1:Gxz2mu/N3atjdbhzM1VMjwZIK3/Sf85NEDfJkEKxN10=
+github.com/kirimatt/goncordia/driver/stdlib/v2 v2.7.2/go.mod h1:sx8bnuO9Y8V3vjfVC6KnwvQArskdU6PmwG6okwtxBwg=
 github.com/kirimatt/goncordia/v2 v2.7.1 h1:ZIyGOuG3WrXqDxoq+ryAIO6IiP0rsGGuGTH1RSV0szo=
 github.com/kirimatt/goncordia/v2 v2.7.1/go.mod h1:9DGFKBiqNXbjvUB4SmCxZZOyBZ5gvFx1BvOT6ETkTRs=
 github.com/klauspost/compress v1.20.4 h1:dD0v/bvxtjCBqQu6sx1TNWkalEY5lNTIe+HY9w8TeNI=

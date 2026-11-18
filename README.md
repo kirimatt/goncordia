@@ -119,13 +119,13 @@ Pick a driver:
 go get github.com/kirimatt/goncordia/driver/pgxv5/v2@v2.7.1
 
 # PostgreSQL / MySQL / MariaDB / SQLite via database/sql
-go get github.com/kirimatt/goncordia/driver/stdlib/v2@v2.7.1
+go get github.com/kirimatt/goncordia/driver/stdlib/v2@v2.7.2
 
 # gorm adapter
-go get github.com/kirimatt/goncordia/driver/gorm/v2@v2.7.1
+go get github.com/kirimatt/goncordia/driver/gorm/v2@v2.7.2
 
 # bun adapter
-go get github.com/kirimatt/goncordia/driver/bun/v2@v2.7.1
+go get github.com/kirimatt/goncordia/driver/bun/v2@v2.7.2
 
 # MongoDB (replica set required)
 go get github.com/kirimatt/goncordia/driver/mongodbv2/v2@v2.6.0
