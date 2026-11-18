@@ -1,6 +1,6 @@
 ---
 title: "Drivers"
-description: "Setup for MongoDB, gorm, bun, Redis, Cassandra, ClickHouse, DynamoDB, Firestore, and SQLite"
+description: "Setup for MongoDB, gorm, bun, Redis, Cassandra, ClickHouse, DynamoDB, Firestore, MariaDB, and SQLite"
 ---
 
 ## MongoDB
@@ -203,6 +203,20 @@ fsClient.RunTransaction(ctx, func(ctx context.Context, tx *firestore.Transaction
     return err
 })
 ```
+
+## MariaDB
+
+MariaDB uses the MySQL dialect, through `database/sql` or gorm:
+
+```go
+db, _ := sql.Open("mysql", "user:pass@tcp(localhost:3306)/app?parseTime=true")
+d := stdlibdriver.New(db, stdlibdriver.MySQL)
+d.Migrate(ctx)
+```
+
+CI runs the MySQL test suite on MariaDB 11.4; 10.11 passes it too. Use
+MariaDB 10.6 or newer, which added `SKIP LOCKED`, and stdlib v2.7.2 or newer:
+earlier versions fail to record a job error on MariaDB.
 
 ## SQLite (no Docker, good for tests)
 

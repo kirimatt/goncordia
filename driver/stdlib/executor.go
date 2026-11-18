@@ -241,8 +241,10 @@ WHERE id = ? AND state = 'running'
   AND (? = '' OR worker_id = ?)
   AND (? = 0 OR attempt_num = ?)`
 
+// JSON_EXTRACT(?, '$') parses the error document on both MySQL and MariaDB;
+// MariaDB has no CAST(... AS JSON).
 const sqlAppendErrorMySQL = `UPDATE goncordia_jobs
-SET errors = JSON_ARRAY_APPEND(errors, '$', CAST(? AS JSON))
+SET errors = JSON_ARRAY_APPEND(errors, '$', JSON_EXTRACT(?, '$'))
 WHERE id = ? AND state = 'running'
   AND (? = '' OR worker_id = ?)
   AND (? = 0 OR attempt_num = ?)`
