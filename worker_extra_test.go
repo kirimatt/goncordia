@@ -39,7 +39,7 @@ func TestWorkerMiddlewareWrapsHandlersInOrder(t *testing.T) {
 		PollInterval: time.Hour, RetentionInterval: -1, Observer: observer,
 		Middleware: []goncordia.JobMiddleware{layer("outer"), layer("inner")},
 	})
-	go pool.Start(context.Background()) //nolint:errcheck
+	go pool.Start(context.Background())       //nolint:errcheck
 	defer pool.Shutdown(context.Background()) //nolint:errcheck
 	if _, err := client.Enqueue(context.Background(), featureArgs{N: 1}, nil); err != nil {
 		t.Fatal(err)
@@ -127,7 +127,7 @@ func TestHeartbeatErrorThenLostLeaseCancelsHandler(t *testing.T) {
 		StuckJobTimeout: 30 * time.Second, HeartbeatInterval: time.Second, RescueInterval: time.Hour,
 		Observer: recorder, ErrorHandler: func(err error) { reported <- err },
 	})
-	go pool.Start(context.Background()) //nolint:errcheck
+	go pool.Start(context.Background())       //nolint:errcheck
 	defer pool.Shutdown(context.Background()) //nolint:errcheck
 	client := goncordia.NewClient[memory.NoTx](d, goncordia.ClientConfig{Clock: clk})
 	if _, err := client.Enqueue(context.Background(), featureArgs{N: 1}, nil); err != nil {
@@ -198,7 +198,7 @@ func TestGlobalRefusalRollsBackLocalReservation(t *testing.T) {
 			{Limit: 1, Period: time.Minute, Scope: goncordia.RateLimitScopeGlobal},
 		}}},
 	})
-	go pool.Start(context.Background()) //nolint:errcheck
+	go pool.Start(context.Background())       //nolint:errcheck
 	defer pool.Shutdown(context.Background()) //nolint:errcheck
 
 	expectStarts(t, started, 1, "12:00")

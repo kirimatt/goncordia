@@ -110,8 +110,11 @@ func TestEnqueueRejectsBadArgs(t *testing.T) {
 		t.Fatalf("channel args: %v", err)
 	}
 	for name, call := range map[string]func() error{
-		"EnqueueMany":  func() error { _, err := client.EnqueueMany(ctx, []core.JobArgs{badVersionArgs{}}, nil); return err },
-		"EnqueueBatch": func() error { _, err := client.EnqueueBatch(ctx, []goncordia.InsertRequest{{Args: badVersionArgs{}}}); return err },
+		"EnqueueMany": func() error { _, err := client.EnqueueMany(ctx, []core.JobArgs{badVersionArgs{}}, nil); return err },
+		"EnqueueBatch": func() error {
+			_, err := client.EnqueueBatch(ctx, []goncordia.InsertRequest{{Args: badVersionArgs{}}})
+			return err
+		},
 	} {
 		if err := call(); err == nil {
 			t.Errorf("%s accepted invalid args", name)
