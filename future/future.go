@@ -174,8 +174,11 @@ func (f *Future[R]) ID() string { return f.id }
 // It returns the handler value for a completed job, a *JobError matching
 // ErrDiscarded or ErrCancelled for a failed job, ErrNoResult for a job that
 // completed without a stored value, and an error matching driver.ErrNotFound
-// when the job does not exist (yet). Context and storage errors are returned
-// as-is and are not cached.
+// when the job does not exist. Await does not wait for a missing job to
+// appear: a job enqueued in a transaction that rolled back, or that has not
+// committed yet, or that was deleted, returns ErrNotFound immediately; the
+// three cases look the same in storage. Not-found, context, and storage
+// errors are not cached, so a later Await reads storage again.
 func (f *Future[R]) Await(ctx context.Context) (R, error) {
 	if value, err, ok := f.cached(); ok {
 		return value, err

@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Documentation
+- `Await` on a job whose transaction rolled back (or has not committed)
+  returns `driver.ErrNotFound` immediately; documented and covered by a pgx v5
+  test.
+
 ---
 
 ## [v2.1.0] — 2026-11-18

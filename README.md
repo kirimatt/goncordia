@@ -634,7 +634,10 @@ later := g.resize.Of(f.ID())      // follow a job enqueued elsewhere
 
 To enqueue inside a transaction, bind with `future.BindTx`; the result also
 has `EnqueueTx(ctx, tx, args)`. Call `Await` only after the transaction
-commits. The handler can live in the same package as the calling code when
+commits. If the transaction rolls back, the job never exists, and `Await`
+returns an error matching `driver.ErrNotFound` immediately instead of waiting.
+Awaiting before the commit, or after the job was deleted, gives the same
+error, because storage cannot tell these cases apart. The handler can live in the same package as the calling code when
 API and workers run in one binary; when they are separate binaries, keep the
 contract in a shared package and the handler in the worker. The lower-level
 `future.Enqueue[R]`, `EnqueueTx[R]`, `RegisterWorker`, and `Of[R]` remain
