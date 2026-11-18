@@ -6,7 +6,7 @@ description: "What each backend supports and which transaction guarantee it give
 | Driver | Package | Tx type | Atomic insert | Notes |
 |---|---|---|---|---|
 | PostgreSQL (pgx v5) | `driver/pgxv5` | `pgx.Tx` | ✅ | LISTEN/NOTIFY, lease leadership, SKIP LOCKED |
-| PostgreSQL / MySQL / SQLite | `driver/stdlib` | `*sql.Tx` | ✅ | pgx stdlib, go-sql-driver/mysql, modernc sqlite |
+| PostgreSQL / MySQL / MariaDB / SQLite | `driver/stdlib` | `*sql.Tx` | ✅ | pgx stdlib, go-sql-driver/mysql (MySQL 8, MariaDB 10.6+), modernc sqlite |
 | gorm | `driver/gorm` | `*gorm.DB` | ✅ | thin adapter over stdlib |
 | bun | `driver/bun` | `bun.Tx` | ✅ | thin adapter over stdlib |
 | MongoDB 4.0+ | `driver/mongodbv2` | `*mongo.Session` (mongo-driver v2) | ✅ | replica set required |
