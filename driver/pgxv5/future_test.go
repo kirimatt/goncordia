@@ -134,6 +134,12 @@ func TestPgxv5_BindTxCommitAndRollback(t *testing.T) {
 	if _, err := d.Executor().JobGetByID(ctx, lost.ID()); !errors.Is(err, driver.ErrNotFound) {
 		t.Fatalf("rolled-back job lookup err = %v, want ErrNotFound", err)
 	}
+	// Await returns at once with ErrNotFound instead of waiting forever.
+	awaitCtx, awaitCancel := context.WithTimeout(ctx, 5*time.Second)
+	defer awaitCancel()
+	if _, err := lost.Await(awaitCtx); !errors.Is(err, driver.ErrNotFound) {
+		t.Fatalf("Await of a rolled-back job err = %v, want ErrNotFound", err)
+	}
 
 	tx, err := pool.Begin(ctx)
 	if err != nil {
