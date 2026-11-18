@@ -42,13 +42,11 @@ const (
 	attrPipeline = "goncordia.job.pipeline_id"
 	attrWorker   = "goncordia.worker.id"
 	attrStatus   = "status"
-	// attrRetentionWhat separates deleted jobs from deleted results.
-	attrRetentionWhat = "what"
-	attrDriver        = "goncordia.driver"
-	attrCount         = "goncordia.job.batch_size"
-	attrTx            = "goncordia.enqueue.transactional"
-	statusOK          = "ok"
-	statusError       = "error"
+	attrDriver   = "goncordia.driver"
+	attrCount    = "goncordia.job.batch_size"
+	attrTx       = "goncordia.enqueue.transactional"
+	statusOK     = "ok"
+	statusError  = "error"
 )
 
 // Option configures the OTel middleware.
@@ -90,10 +88,6 @@ type Instrumentation struct {
 	jobFinished  metric.Int64Counter
 	heartbeats   metric.Int64Counter
 	leaseRescues metric.Int64Counter
-
-	retentionPasses   metric.Int64Counter
-	retentionDeleted  metric.Int64Counter
-	retentionDuration metric.Float64Histogram
 }
 
 // NewInstrumentation creates enqueue tracing plus claim, heartbeat, and lease
@@ -132,14 +126,7 @@ func NewInstrumentation(opts ...Option) *Instrumentation {
 		metric.WithDescription("Number of claim heartbeat attempts"))
 	leaseRescues, _ := meter.Int64Counter("goncordia.job.lease_rescued",
 		metric.WithDescription("Number of expired claims returned to the queue"))
-	retentionPasses, _ := meter.Int64Counter("goncordia.retention.passes",
-		metric.WithDescription("Retention passes run by this instance as leader"))
-	retentionDeleted, _ := meter.Int64Counter("goncordia.retention.deleted",
-		metric.WithDescription("Jobs and future results deleted by retention"))
-	retentionDuration, _ := meter.Float64Histogram("goncordia.retention.duration",
-		metric.WithDescription("Retention pass duration in seconds"), metric.WithUnit("s"))
 	return &Instrumentation{
-		retentionPasses: retentionPasses, retentionDeleted: retentionDeleted, retentionDuration: retentionDuration,
 		tracer: tp.Tracer(instrName), clock: clk, enqueueTime: enqueueTime,
 		scheduleLag: scheduleLag, claimWait: claimWait, rateWait: rateWait,
 		jobStarted: jobStarted, jobFinished: jobFinished,
@@ -218,21 +205,6 @@ func (i *Instrumentation) JobsRescued(ctx context.Context, event goncordia.Rescu
 	))
 }
 
-// RetentionPassed records a retention pass this instance ran as leader:
-// goncordia.retention.passes and .duration by status, and
-// goncordia.retention.deleted by what ("jobs" or "results").
-func (i *Instrumentation) RetentionPassed(ctx context.Context, event goncordia.RetentionPassEvent) {
-	status := statusOK
-	if event.Err != nil {
-		status = statusError
-	}
-	byStatus := metric.WithAttributes(attribute.String(attrStatus, status))
-	i.retentionPasses.Add(ctx, 1, byStatus)
-	i.retentionDuration.Record(ctx, nonNegativeSeconds(event.FinishedAt.Sub(event.StartedAt)), byStatus)
-	i.retentionDeleted.Add(ctx, int64(event.Result.Deleted), metric.WithAttributes(attribute.String(attrRetentionWhat, "jobs")))
-	i.retentionDeleted.Add(ctx, int64(event.Result.ResultsDeleted), metric.WithAttributes(attribute.String(attrRetentionWhat, "results")))
-}
-
 // JobStarted records the time a claimed job spent waiting for execution
 // capacity and execution rate permits.
 func (i *Instrumentation) JobStarted(ctx context.Context, event goncordia.JobStartedEvent) {
@@ -283,7 +255,6 @@ func nonNegativeSeconds(duration time.Duration) float64 {
 
 var _ goncordia.ClientObserver = (*Instrumentation)(nil)
 var _ goncordia.WorkerObserver = (*Instrumentation)(nil)
-var _ goncordia.RetentionObserver = (*Instrumentation)(nil)
 
 // NewMiddleware returns a JobMiddleware that:
 //   - creates a span for each job execution named "goncordia.process"

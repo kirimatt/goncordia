@@ -915,7 +915,8 @@ How a pass finds expired jobs depends on the driver:
 | Driver | How retention finds expired jobs |
 |---|---|
 | pgxv5, stdlib (Postgres, MySQL, SQLite), gorm, bun, MongoDB, Redis | index on state and finalization time, batched deletes (`driver.JobPruner`) |
-| Cassandra, ClickHouse, DynamoDB, Firestore, memory | lists terminal jobs page by page; cost grows with retained jobs |
+| Cassandra, ClickHouse, DynamoDB, Firestore | lists terminal jobs page by page; each page currently reads all retained jobs, so a pass grows quadratically. Indexed pruning for these drivers is planned for the next release |
+| memory | scans in process memory |
 
 On SQL and MongoDB, `Migrate` creates the retention indexes
 (`idx_goncordia_jobs_finalized`, `idx_goncordia_job_results_updated`). Building
