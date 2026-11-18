@@ -9,12 +9,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Added (driver/redis)
-- Retention indexes (terminal jobs by finalization time, results by write
-  time) and `driver.JobPruner`, so retention reads only expired entries
-  instead of every job. `Migrate` backfills them; run it again after a
-  rolling upgrade.
-
 ---
 
 ## [v2.5.0] — 2026-11-18
@@ -38,6 +32,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   delete expired jobs and results from an index instead of listing all jobs.
 - `drivertest.RunRetention` checks retention against a driver; every built-in
   driver runs it.
+
+### Added (driver/redis v2.5.0)
+- Retention indexes (terminal jobs by finalization time, results by write
+  time) and `driver.JobPruner`, so retention reads only expired entries
+  instead of every job. `Migrate` backfills them; run it again after a
+  rolling upgrade.
 
 ---
 

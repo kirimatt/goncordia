@@ -5,7 +5,7 @@ go 1.26.0
 require (
 	github.com/ClickHouse/clickhouse-go/v2 v2.51.0
 	github.com/google/uuid v1.6.0
-	github.com/kirimatt/goncordia/v2 v2.2.0
+	github.com/kirimatt/goncordia/v2 v2.5.0
 	github.com/testcontainers/testcontainers-go/modules/clickhouse v0.45.0
 )
 

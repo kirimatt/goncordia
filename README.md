@@ -117,7 +117,7 @@ go get github.com/kirimatt/goncordia/driver/bun/v2@v2.2.0
 go get github.com/kirimatt/goncordia/driver/mongodbv2/v2@v2.3.0
 
 # Redis
-go get github.com/kirimatt/goncordia/driver/redis/v2@v2.4.0
+go get github.com/kirimatt/goncordia/driver/redis/v2@v2.5.0
 
 # Cassandra / ScyllaDB
 go get github.com/kirimatt/goncordia/driver/cassandra/v2@v2.2.0
