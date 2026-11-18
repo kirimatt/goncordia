@@ -23,9 +23,6 @@ package redisdriver
 import (
 	"context"
 	"encoding/json"
-	"errors"
-	"fmt"
-	"strings"
 
 	"github.com/redis/go-redis/v9"
 
@@ -41,25 +38,15 @@ type NoTx struct{}
 
 // Driver implements driver.Driver[NoTx] backed by Redis.
 type Driver struct {
-	rdb           *redis.Client
-	clk           clock.Clock
-	allowEviction bool
+	rdb *redis.Client
+	clk clock.Clock
 }
-
-// ErrEvictionPolicy is returned by Migrate when Redis may evict keys that have
-// no TTL. Jobs and results are such keys, so an allkeys-* maxmemory-policy
-// can silently drop pending jobs and stored results.
-var ErrEvictionPolicy = errors.New("redisdriver: maxmemory-policy can evict job keys")
 
 // Option configures the Driver.
 type Option func(*Driver)
 
 // WithClock injects a custom clock (useful for tests).
 func WithClock(c clock.Clock) Option { return func(d *Driver) { d.clk = c } }
-
-// WithAllowEviction skips the maxmemory-policy check in Migrate. Use it only
-// when losing jobs and results under memory pressure is acceptable.
-func WithAllowEviction() Option { return func(d *Driver) { d.allowEviction = true } }
 
 // New creates a Driver wrapping the given *redis.Client. The caller retains
 // ownership of rdb and must close it after the driver is no longer in use.
@@ -72,15 +59,10 @@ func New(rdb *redis.Client, opts ...Option) *Driver {
 	return d
 }
 
-// Migrate verifies connectivity, rejects an allkeys-* maxmemory-policy with
-// ErrEvictionPolicy (see WithAllowEviction), and backfills the created-at
-// administrative index for jobs written by releases before v0.17. Safe to
-// call multiple times.
+// Migrate verifies connectivity and backfills the created-at administrative
+// index for jobs written by releases before v0.17. Safe to call multiple times.
 func (d *Driver) Migrate(ctx context.Context) error {
 	if err := d.rdb.Ping(ctx).Err(); err != nil {
-		return err
-	}
-	if err := d.checkEvictionPolicy(ctx); err != nil {
 		return err
 	}
 	var cursor uint64
@@ -160,24 +142,6 @@ func NewWorkerPool(d *Driver, r *core.Registry, cfg goncordia.WorkerConfig) *Wor
 // FetchParams is a convenience constructor for driver.FetchParams used in tests.
 func FetchParams(queue string, limit int) driver.FetchParams {
 	return driver.FetchParams{Queue: queue, Limit: limit}
-}
-
-// checkEvictionPolicy rejects allkeys-* policies, which may evict keys
-// without a TTL. noeviction and volatile-* never touch goncordia keys. When
-// CONFIG is disabled, as on some managed services, the check is skipped.
-func (d *Driver) checkEvictionPolicy(ctx context.Context) error {
-	if d.allowEviction {
-		return nil
-	}
-	values, err := d.rdb.ConfigGet(ctx, "maxmemory-policy").Result()
-	if err != nil {
-		return nil
-	}
-	if policy := values["maxmemory-policy"]; strings.HasPrefix(policy, "allkeys-") {
-		return fmt.Errorf("%w: %q; set maxmemory-policy to noeviction (or volatile-*), "+
-			"or pass WithAllowEviction to accept job loss", ErrEvictionPolicy, policy)
-	}
-	return nil
 }
 
 // compile-time check

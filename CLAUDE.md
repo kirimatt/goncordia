@@ -196,6 +196,8 @@ Workers on these backends must be **idempotent** — a job may be executed more 
 - **Import paths**: v2 uses `github.com/kirimatt/goncordia/v2/...` for the root module and `github.com/kirimatt/goncordia/driver/<name>/v2` for drivers. `WorkerPool.Stop`, `ClientConfig.Now`, and `QueuePolicy.RateLimit` no longer exist; see `MIGRATING_TO_V2.md`.
 
 - **Redis / Cassandra / ClickHouse / DynamoDB**: `EnqueueTx` is rejected. Use the post-commit enqueue pattern for at-least-once delivery.
+- **Redis eviction**: `Migrate` fails with `redisdriver.ErrEvictionPolicy` under an `allkeys-*` `maxmemory-policy`, which could drop jobs and results. Use `noeviction` (or `volatile-*`); `WithAllowEviction()` opts out. An evicted result surfaces as `future.ErrResultLost`.
+- **Retention**: nothing is pruned automatically. Run `maintenance.RunRetention(ctx, goncordia.RetentionRunConfig{Policy: ...})` in every instance (leader-elected); `RetentionPolicy.Results` expires future results before job rows.
 - **MongoDB**: requires a replica set; standalone MongoDB will fail at `New()`.
 - **SQLite**: set `db.SetMaxOpenConns(1)` — SQLite allows only one writer.
 - **Firestore**: `Migrate` is a no-op; create the composite index manually in Firebase console: collection `goncordia_jobs`, fields `queue ASC, state ASC, run_at ASC`.

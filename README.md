@@ -92,7 +92,7 @@ tx.Commit(ctx)  // job and order appear atomically
 Requires Go 1.26 or newer.
 
 ```bash
-go get github.com/kirimatt/goncordia/v2@v2.3.0
+go get github.com/kirimatt/goncordia/v2@v2.4.0
 ```
 
 Pick a driver:
@@ -270,7 +270,7 @@ import (
 rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379"})
 defer rdb.Close()
 d := redisdriver.New(rdb)
-d.Migrate(ctx)  // verifies connectivity and backfills the admin index
+d.Migrate(ctx)  // verifies connectivity, rejects allkeys-* eviction, backfills the admin index
 
 client := redisdriver.NewClient(d, goncordia.ClientConfig{})
 client.Enqueue(ctx, SendEmailArgs{To: "user@example.com", Subject: "Welcome"}, nil)
@@ -278,6 +278,16 @@ client.Enqueue(ctx, SendEmailArgs{To: "user@example.com", Subject: "Welcome"}, n
 // EnqueueTx is not supported on the Redis driver:
 // there is no rollback guarantee. Use Enqueue (post-commit pattern) instead.
 ```
+
+Jobs and results are Redis keys without a TTL. Under an `allkeys-*`
+`maxmemory-policy`, Redis may evict them under memory pressure, silently
+dropping pending jobs and stored results, so `Migrate` fails with
+`redisdriver.ErrEvictionPolicy`. Use `noeviction` (writes fail loudly when
+memory is full) or a `volatile-*` policy, which never touches keys without a
+TTL. `redisdriver.WithAllowEviction()` disables the check; when `CONFIG` is
+blocked, as on some managed services, the check is skipped. If a result is
+evicted anyway, `Await` returns `future.ErrResultLost` rather than the
+misleading `future.ErrNoResult`.
 
 ### Cassandra / ScyllaDB
 
@@ -645,7 +655,9 @@ has `EnqueueTx(ctx, tx, args)`. Call `Await` only after the transaction
 commits. If the transaction rolls back, the job never exists, and `Await`
 returns `future.ErrNotFound` immediately instead of waiting.
 Awaiting before the commit, or after the job was deleted, gives the same
-error, because storage cannot tell these cases apart. The handler can live in the same package as the calling code when
+error, because storage cannot tell these cases apart.
+
+The handler can live in the same package as the calling code when
 API and workers run in one binary; when they are separate binaries, keep the
 contract in a shared package and the handler in the worker. The lower-level
 `future.Enqueue[R]`, `EnqueueTx[R]`, `RegisterWorker`, and `Of[R]` remain
@@ -654,7 +666,8 @@ available.
 `Await` returns the handler value, or an error you can classify with
 `errors.Is`: `future.ErrDiscarded` and `future.ErrCancelled` (both carry a
 `*future.JobError` with the last handler error), `future.ErrNoResult` for a job
-completed by a plain worker, and `future.ErrNotFound` (also matches
+completed by a plain worker, `future.ErrResultLost` for a completed job whose
+stored value disappeared without being deleted (Redis eviction), and `future.ErrNotFound` (also matches
 `driver.ErrNotFound`) for a job that does not exist. Use
 `EnqueueTx` the same way, and call `Await` only after the transaction commits.
 
@@ -820,6 +833,36 @@ Bulk operations preserve partial progress in `BulkResult`; their returned error
 joins per-job failures, so `errors.Is` still recognizes typed driver errors.
 Dead-letter replay first verifies that each job is still discarded. Retention
 durations of zero disable that state, and negative durations are rejected.
+
+`RetentionPolicy.Results` deletes the stored future results of completed jobs
+earlier than the jobs themselves, which also cleans up results nobody awaited.
+Storage cannot know whether some process will still call `Await` (waiters
+live in other processes' memory, and `future.Of` can follow a job later), so
+results expire by age, not by waiter count. After that, `Await` on such a job
+returns `future.ErrNoResult`. Use `Manager.Forget` to drop a result right after
+reading it.
+
+Nothing is pruned automatically unless you run retention. `RunRetention` does
+it on a schedule; start it in every instance, and a leader lease makes sure
+only one instance prunes at a time, with another taking over if it stops:
+
+```go
+go maintenance.RunRetention(ctx, goncordia.RetentionRunConfig{
+    Policy: goncordia.RetentionPolicy{
+        Completed: 7 * 24 * time.Hour,
+        Discarded: 30 * 24 * time.Hour,
+        Cancelled: 7 * 24 * time.Hour,
+        Results:   time.Hour, // results live an hour; job history stays a week
+    },
+    Interval: 10 * time.Minute,
+    OnPrune: func(r goncordia.PruneResult, err error) {
+        slog.Info("retention", "deleted", r.Deleted, "results", r.ResultsDeleted, "err", err)
+    },
+})
+```
+
+Each pass lists terminal jobs page by page, so its cost grows with the number
+of retained jobs; pick an interval that fits your volume.
 
 ---
 
