@@ -14,11 +14,11 @@ require (
 	github.com/kirimatt/goncordia/driver/cassandra/v2 v2.2.0
 	github.com/kirimatt/goncordia/driver/clickhouse/v2 v2.2.0
 	github.com/kirimatt/goncordia/driver/dynamodb/v2 v2.2.0
-	github.com/kirimatt/goncordia/driver/firestore/v2 v2.2.0
+	github.com/kirimatt/goncordia/driver/firestore/v2 v2.5.1
 	github.com/kirimatt/goncordia/driver/pgxv5/v2 v2.2.0
-	github.com/kirimatt/goncordia/driver/redis/v2 v2.4.0
+	github.com/kirimatt/goncordia/driver/redis/v2 v2.5.1
 	github.com/kirimatt/goncordia/driver/stdlib/v2 v2.2.0
-	github.com/kirimatt/goncordia/v2 v2.4.0
+	github.com/kirimatt/goncordia/v2 v2.5.1
 	github.com/redis/go-redis/v9 v9.23.0
 	github.com/testcontainers/testcontainers-go v0.45.0
 	github.com/testcontainers/testcontainers-go/modules/cassandra v0.45.0
