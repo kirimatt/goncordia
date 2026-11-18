@@ -13,7 +13,7 @@ Job queue engine for Go. One `Driver[TTx]` interface works across Postgres, MySQ
 | You use | Driver package | Import |
 |---|---|---|
 | pgx v5 | `driver/pgxv5` | `pgxdriver "github.com/kirimatt/goncordia/driver/pgxv5/v2"` |
-| `database/sql` (Postgres, MySQL, SQLite) | `driver/stdlib` | `stdlibdriver "github.com/kirimatt/goncordia/driver/stdlib/v2"` |
+| `database/sql` (Postgres, MySQL, MariaDB, SQLite) | `driver/stdlib` | `stdlibdriver "github.com/kirimatt/goncordia/driver/stdlib/v2"` |
 | gorm | `driver/gorm` | `gormdriver "github.com/kirimatt/goncordia/driver/gorm/v2"` |
 | bun | `driver/bun` | `bundriver "github.com/kirimatt/goncordia/driver/bun/v2"` |
 | MongoDB (mongo-driver v2) | `driver/mongodbv2` | `mongodriver "github.com/kirimatt/goncordia/driver/mongodbv2/v2"` |

@@ -118,7 +118,7 @@ Pick a driver:
 # PostgreSQL via pgx v5
 go get github.com/kirimatt/goncordia/driver/pgxv5/v2@v2.7.1
 
-# PostgreSQL / MySQL / SQLite via database/sql
+# PostgreSQL / MySQL / MariaDB / SQLite via database/sql
 go get github.com/kirimatt/goncordia/driver/stdlib/v2@v2.7.1
 
 # gorm adapter

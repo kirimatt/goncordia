@@ -25,13 +25,20 @@ func TestMain(m *testing.M) {
 	defer func() { os.Exit(code) }()
 
 	// --- MySQL ---
+	// GONCORDIA_MYSQL_IMAGE runs the MySQL dialect against another server,
+	// e.g. mariadb:11.4.
+	mysqlImage := os.Getenv("GONCORDIA_MYSQL_IMAGE")
+	if mysqlImage == "" {
+		mysqlImage = "mysql:8.0"
+	}
 	mysqlCtr, err := tcmysql.Run(ctx,
-		"mysql:8.0",
+		mysqlImage,
 		tcmysql.WithDatabase("goncordia_test"),
 		tcmysql.WithUsername("goncordia"),
 		tcmysql.WithPassword("goncordia"),
 		testcontainers.WithWaitStrategy(
-			wait.ForLog("port: 3306  MySQL Community Server").
+			// Both servers log the public port only once init is done.
+			wait.ForLog("port: 3306").
 				WithStartupTimeout(90*time.Second),
 		),
 	)
