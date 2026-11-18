@@ -1,0 +1,101 @@
+---
+title: "Futures"
+description: "Wait for a job and get its handler's typed result"
+---
+
+The `future` package lets a producer enqueue a job and wait for the value its
+handler returns. Declare a `Task` once to tie the job arguments to the result
+type; workers register a handler for it, and application code gets a bound
+`Func` that it calls without type parameters. The value is JSON-encoded and
+stored before the job is marked completed.
+
+**Contract** — shared by producers and workers:
+
+```go
+import "github.com/kirimatt/goncordia/v2/future"
+
+type ResizeArgs struct{ ImageID string }
+
+func (ResizeArgs) Kind() string { return "resize" }
+
+var Resize = future.Define[ResizeArgs, Thumbnail]()
+```
+
+**`main`** — wiring only:
+
+```go
+m, err := future.New(d, future.Config{PollInterval: 500 * time.Millisecond})
+
+registry := core.NewRegistry()
+Resize.Register(registry, m, resizeHandler, core.WorkerOpts{}) // func(ctx, *core.Job[ResizeArgs]) (Thumbnail, error)
+
+wp := pgxdriver.NewWorkerPool(d, registry, goncordia.WorkerConfig{
+    // Wakes local Await calls the moment a job finishes.
+    Observer: goncordia.WorkerObservers(instrumentation, m),
+})
+go wp.Start(ctx)
+
+client := pgxdriver.NewClient(d, goncordia.ClientConfig{})
+gallery := &Gallery{resize: future.Bind(m, client, Resize)}
+```
+
+**Application code** — knows only the bound task:
+
+```go
+type Gallery struct {
+    resize *future.Func[ResizeArgs, Thumbnail]
+}
+
+func (g *Gallery) Thumbnail(ctx context.Context, id string) (Thumbnail, error) {
+    return g.resize.Call(ctx, ResizeArgs{ImageID: id}) // enqueue, wait, delete the job
+}
+
+f, err := g.resize.Enqueue(ctx, args)                        // *Future[Thumbnail], wait later
+f, err := g.resize.With(&core.InsertOpts{Queue: "images"}).Enqueue(ctx, args)
+thumb, err := f.Await(ctx)        // blocks until completed, discarded, or cancelled
+thumb, done, err := f.TryGet(ctx) // one non-blocking check
+later := g.resize.Of(f.ID())      // follow a job enqueued elsewhere
+```
+
+`Call` is for one-shot calls: after it returns a value, it deletes the job and
+its result, since nobody else knows the job ID. Unique jobs (other callers may
+share them) and failed jobs stay for [retention](/retention); set
+`future.Config.KeepCalledJobs` to keep every job. Jobs from `Enqueue` stay
+until retention removes them.
+
+To enqueue inside a transaction, bind with `future.BindTx`; the result also
+has `EnqueueTx(ctx, tx, args)`. Call `Await` only after the transaction
+commits. If the transaction rolls back, the job never exists, and `Await`
+returns `future.ErrNotFound` immediately instead of waiting.
+Awaiting before the commit, or after the job was deleted, gives the same
+error, because storage cannot tell these cases apart.
+
+The handler can live in the same package as the calling code when
+API and workers run in one binary; when they are separate binaries, keep the
+contract in a shared package and the handler in the worker. The lower-level
+`future.Enqueue[R]`, `EnqueueTx[R]`, `RegisterWorker`, and `Of[R]` remain
+available.
+
+`Await` returns the handler value, or an error you can classify with
+`errors.Is`: `future.ErrDiscarded` and `future.ErrCancelled` (both carry a
+`*future.JobError` with the last handler error), `future.ErrNoResult` for a job
+completed by a plain worker, `future.ErrResultLost` for a completed job whose
+stored value disappeared without being deleted (Redis eviction), and `future.ErrNotFound` (also matches
+`driver.ErrNotFound`) for a job that does not exist. Use
+`EnqueueTx` the same way, and call `Await` only after the transaction commits.
+
+Futures work with every driver. Job state is read through the portable
+`JobGetByID`, and every built-in driver implements `driver.JobResultStore`, so
+results live next to the jobs: a `goncordia_job_results` table (SQL, Cassandra,
+ClickHouse, DynamoDB — run `Migrate` after upgrading), collection (MongoDB,
+Firestore), or key (Redis). Deleting a job deletes its result. Set
+`future.Config.Store` to keep results elsewhere, for example jobs in Postgres
+and results in your own Redis-backed `JobResultStore`. When producer
+and worker pool share a `Manager` in one process, `Await` wakes immediately.
+Across processes it polls every `PollInterval` on the injected clock. Delivery
+stays at-least-once: the last stored value wins if a handler runs twice.
+
+Runnable examples: [`future/example_test.go`](https://github.com/kirimatt/goncordia/blob/main/future/example_test.go) runs the
+whole flow on the in-memory driver with a `clock.Manual`, and
+[`driver/pgxv5/example_future_test.go`](https://github.com/kirimatt/goncordia/blob/main/driver/pgxv5/example_future_test.go)
+enqueues with `BindTx` inside a Postgres transaction and awaits the result.

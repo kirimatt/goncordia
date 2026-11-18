@@ -1,0 +1,55 @@
+---
+title: "Quick start"
+description: "Enqueue and process a job on PostgreSQL"
+---
+
+## PostgreSQL (pgx v5)
+
+```go
+import (
+    "github.com/kirimatt/goncordia/v2"
+    "github.com/kirimatt/goncordia/v2/core"
+    pgxdriver "github.com/kirimatt/goncordia/driver/pgxv5/v2"
+    "github.com/jackc/pgx/v5/pgxpool"
+)
+
+pool, _ := pgxpool.New(ctx, os.Getenv("DATABASE_URL"))
+defer pool.Close()
+d := pgxdriver.New(pool)
+d.Migrate(ctx)
+
+type SendEmailArgs struct {
+    To      string `json:"to"`
+    Subject string `json:"subject"`
+}
+func (SendEmailArgs) Kind() string { return "send_email" }
+
+registry := core.NewRegistry()
+core.RegisterWorker(registry, core.WorkerFunc[SendEmailArgs](
+    func(ctx context.Context, job *core.Job[SendEmailArgs]) error {
+        return sendEmail(job.Args.To, job.Args.Subject)
+    },
+), core.WorkerOpts{MaxRetry: 5})
+
+client := pgxdriver.NewClient(d, goncordia.ClientConfig{})
+client.Enqueue(ctx, SendEmailArgs{To: "user@example.com", Subject: "Welcome"}, nil)
+
+wp := pgxdriver.NewWorkerPool(d, registry, goncordia.WorkerConfig{
+    Queues:      []string{"default"},
+    Concurrency: 10,
+})
+wp.Start(ctx)  // blocks
+
+shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+defer cancel()
+_ = wp.Shutdown(shutdownCtx) // reports an incomplete drain
+```
+
+## Transactional insert (PostgreSQL)
+
+```go
+tx, _ := pool.Begin(ctx)
+_, _ = queries.CreateOrder(ctx, tx, orderParams)
+_, _ = client.EnqueueTx(ctx, tx, SendConfirmationArgs{OrderID: id}, nil)
+tx.Commit(ctx)  // job and order are atomic
+```

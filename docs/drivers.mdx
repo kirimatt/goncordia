@@ -1,0 +1,232 @@
+---
+title: "Drivers"
+description: "Setup for MongoDB, gorm, bun, Redis, Cassandra, ClickHouse, DynamoDB, Firestore, and SQLite"
+---
+
+## MongoDB
+
+```go
+import (
+    mongodriver "github.com/kirimatt/goncordia/driver/mongodbv2/v2"
+    "go.mongodb.org/mongo-driver/v2/mongo"
+    "go.mongodb.org/mongo-driver/v2/mongo/options"
+)
+
+client, _ := mongo.Connect(options.Client().ApplyURI(os.Getenv("MONGO_URI")))
+defer client.Disconnect(ctx)
+d, err := mongodriver.New(ctx, client, "myapp")  // fails if not a replica set
+d.Migrate(ctx)
+
+mqClient := mongodriver.NewClient(d, goncordia.ClientConfig{})
+
+// Transactional insert: the transaction type is *mongo.Session
+session, _ := client.StartSession()
+defer session.EndSession(ctx)
+_, err = session.WithTransaction(ctx, func(ctx context.Context) (any, error) {
+    if _, err := db.Collection("orders").InsertOne(ctx, order); err != nil {
+        return nil, err
+    }
+    return mqClient.EnqueueTx(ctx, session, SendConfirmationArgs{OrderID: order.ID}, nil)
+})
+```
+
+`driver/mongodb` is the same driver on the deprecated mongo-driver v1, with
+`mongo.SessionContext` as the transaction type. Both use the same collections
+and document format, so you can switch processes one by one: replace the
+import, connect with mongo-driver v2, and pass the session to `EnqueueTx`.
+
+## gorm
+
+```go
+import (
+    gormdriver "github.com/kirimatt/goncordia/driver/gorm/v2"
+    "gorm.io/gorm"
+)
+
+d, _ := gormdriver.New(db)  // db is *gorm.DB
+d.Migrate(ctx)
+
+client := gormdriver.NewClient(d, goncordia.ClientConfig{})
+
+db.Transaction(func(tx *gorm.DB) error {
+    tx.Create(&order)
+    client.EnqueueTx(ctx, tx, SendConfirmationArgs{OrderID: order.ID}, nil)
+    return nil  // commit — job appears atomically with the order
+})
+```
+
+## bun
+
+```go
+import (
+    bundriver "github.com/kirimatt/goncordia/driver/bun/v2"
+    "github.com/uptrace/bun"
+)
+
+d := bundriver.New(db)  // db is *bun.DB
+d.Migrate(ctx)
+
+client := bundriver.NewClient(d, goncordia.ClientConfig{})
+
+tx, _ := db.BeginTx(ctx, nil)
+tx.NewInsert().Model(&order).Exec(ctx)
+client.EnqueueTx(ctx, tx, SendConfirmationArgs{OrderID: order.ID}, nil)
+tx.Commit()
+```
+
+## Redis
+
+```go
+import (
+    redisdriver "github.com/kirimatt/goncordia/driver/redis/v2"
+    "github.com/redis/go-redis/v9"
+)
+
+rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379"})
+defer rdb.Close()
+d := redisdriver.New(rdb)
+d.Migrate(ctx)  // verifies connectivity, rejects allkeys-* eviction, backfills the admin index
+
+client := redisdriver.NewClient(d, goncordia.ClientConfig{})
+client.Enqueue(ctx, SendEmailArgs{To: "user@example.com", Subject: "Welcome"}, nil)
+
+// EnqueueTx is not supported on the Redis driver:
+// there is no rollback guarantee. Use Enqueue (post-commit pattern) instead.
+```
+
+Jobs and results are Redis keys without a TTL. Under an `allkeys-*`
+`maxmemory-policy`, Redis may evict them under memory pressure, silently
+dropping pending jobs and stored results, so `Migrate` fails with
+`redisdriver.ErrEvictionPolicy`. Use `noeviction` (writes fail loudly when
+memory is full) or a `volatile-*` policy, which never touches keys without a
+TTL. `redisdriver.WithAllowEviction()` disables the check; when `CONFIG` is
+blocked, as on some managed services, the check is skipped. If a result is
+evicted anyway, `Await` returns `future.ErrResultLost` rather than the
+misleading `future.ErrNoResult`.
+
+`Migrate` also builds the retention indexes for jobs written before v2.5.0.
+During a rolling upgrade, older instances keep finalizing jobs without
+indexing them, so run `Migrate` once more after every instance is upgraded.
+
+## Cassandra / ScyllaDB
+
+```go
+import (
+    cassandradriver "github.com/kirimatt/goncordia/driver/cassandra/v2"
+    "github.com/gocql/gocql"
+)
+
+cluster := gocql.NewCluster("localhost")
+cluster.Keyspace = "myapp"  // keyspace must already exist
+session, _ := cluster.CreateSession()
+defer session.Close()
+
+d := cassandradriver.New(session)
+d.Migrate(ctx)  // creates tables and runs idempotent lookup backfills
+
+client := cassandradriver.NewClient(d, goncordia.ClientConfig{})
+client.Enqueue(ctx, SendEmailArgs{To: "user@example.com", Subject: "Welcome"}, nil)
+
+// EnqueueTx returns an unsupported-operation error on Cassandra.
+// Enqueue after the business transaction commits and keep workers idempotent.
+```
+
+## ClickHouse
+
+```go
+import (
+    clickhousedriver "github.com/kirimatt/goncordia/driver/clickhouse/v2"
+    "github.com/ClickHouse/clickhouse-go/v2"
+)
+
+conn, _ := clickhouse.Open(&clickhouse.Options{
+    Addr: []string{"localhost:9000"},
+    Auth: clickhouse.Auth{Database: "myapp"},
+})
+defer conn.Close()
+
+d := clickhousedriver.New(conn)
+d.Migrate(ctx)  // creates ReplacingMergeTree tables (idempotent)
+
+client := clickhousedriver.NewClient(d, goncordia.ClientConfig{})
+client.Enqueue(ctx, SendEmailArgs{To: "user@example.com", Subject: "Welcome"}, nil)
+
+// ClickHouse has no transactions. Jobs use at-least-once delivery — workers
+// should be idempotent. Best suited for high-throughput analytics pipelines.
+```
+
+## Amazon DynamoDB
+
+```go
+import (
+    "github.com/aws/aws-sdk-go-v2/config"
+    "github.com/aws/aws-sdk-go-v2/service/dynamodb"
+    dynamodbdriver "github.com/kirimatt/goncordia/driver/dynamodb/v2"
+)
+
+cfg, _ := config.LoadDefaultConfig(ctx)
+svc := dynamodb.NewFromConfig(cfg)
+
+d := dynamodbdriver.New(svc)
+d.Migrate(ctx)  // creates goncordia_jobs, _uniq, _queues, _leaders, _schedule_cursors, _job_results (idempotent)
+
+client := dynamodbdriver.NewClient(d, goncordia.ClientConfig{})
+client.Enqueue(ctx, SendEmailArgs{To: "user@example.com", Subject: "Welcome"}, nil)
+
+// DynamoDB has no cross-table transactions. EnqueueTx returns an error.
+// Unique-key deduplication uses PutItem with attribute_not_exists condition.
+// Jobs are claimed with conditional UpdateItem — safe for concurrent workers.
+```
+
+## Cloud Firestore
+
+```go
+import (
+    "cloud.google.com/go/firestore"
+    firestoredriver "github.com/kirimatt/goncordia/driver/firestore/v2"
+)
+
+fsClient, _ := firestore.NewClient(ctx, "my-gcp-project")
+defer fsClient.Close()
+d := firestoredriver.New(fsClient)
+// Migrate is a no-op; create two composite indexes in Firebase console:
+//   collection: goncordia_jobs, fields: queue (ASC), state (ASC), run_at (ASC)
+//   collection: goncordia_jobs, fields: state (ASC), finalized_at (ASC)   // retention
+d.Migrate(ctx)
+
+client := firestoredriver.NewClient(d, goncordia.ClientConfig{})
+
+// Transactional — job is enqueued atomically with business writes:
+fsClient.RunTransaction(ctx, func(ctx context.Context, tx *firestore.Transaction) error {
+    tx.Create(orders.Doc(id), orderData)
+    _, err := client.EnqueueTx(ctx, tx, SendConfirmationArgs{OrderID: id}, nil)
+    return err
+})
+```
+
+## SQLite (no Docker, good for tests)
+
+```go
+import (
+    _ "modernc.org/sqlite"
+    stdlibdriver "github.com/kirimatt/goncordia/driver/stdlib/v2"
+)
+
+db, _ := sql.Open("sqlite", "./jobs.db")
+defer db.Close()
+db.SetMaxOpenConns(1)  // SQLite: single writer
+
+d := stdlibdriver.New(db, stdlibdriver.SQLite)
+d.Migrate(ctx)
+```
+
+All driver constructors are non-owning: a client, pool, connection, database,
+or session passed to `New` remains the caller's responsibility. `Driver.Close`
+only releases resources created internally by a driver and never closes the
+supplied resource.
+
+`Migrate` may be called concurrently during a rolling deployment. PostgreSQL
+and MySQL use database advisory locks, while SQLite holds an immediate write
+transaction across the complete migration set. Cassandra, ClickHouse, MongoDB,
+DynamoDB, Redis, and Firestore use idempotent server-side schema operations;
+DynamoDB also waits for tables created by another instance to become active.

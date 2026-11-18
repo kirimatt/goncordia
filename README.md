@@ -7,7 +7,7 @@
 [![Go version](https://img.shields.io/github/go-mod/go-version/kirimatt/goncordia)](go.mod)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-[Changelog](CHANGELOG.md) · [API reference](https://pkg.go.dev/github.com/kirimatt/goncordia/v2) · [Migrating to v2](MIGRATING_TO_V2.md)
+[Documentation](https://goncordia.docs7.io) · [Changelog](CHANGELOG.md) · [API reference](https://pkg.go.dev/github.com/kirimatt/goncordia/v2) · [Migrating to v2](MIGRATING_TO_V2.md)
 
 **A background job queue for Go that runs on the database you already have.**
 Enqueue jobs in the same transaction as your data, process them with retries,

@@ -1,0 +1,93 @@
+---
+title: "Admin dashboard and metrics"
+description: "Dashboard, JSON API, health probes, and Prometheus metrics"
+---
+
+```go
+import "github.com/kirimatt/goncordia/v2/admin"
+
+handler := admin.New(d,
+    admin.WithReadOnly(false),
+    admin.WithAuthorizer(func(r *http.Request, operation admin.Operation) error {
+        if !validSession(r) {
+            return admin.ErrUnauthenticated
+        }
+        if operation == admin.OperationMutate && !canOperateJobs(r) {
+            return errors.New("forbidden")
+        }
+        return nil
+    }),
+)
+http.Handle("/jobs/", http.StripPrefix("/jobs", handler))
+```
+
+The handler exposes the embedded dashboard, `/healthz`, `/readyz`, `/metrics`,
+and JSON routes under `/api`. It supports job filtering, cancel/delete/retry/
+reschedule, queue pause/resume, and per-state queue counts. Redis uses a migrated
+created-at index and DynamoDB uses its queue/state GSI for scoped reads. Unscoped
+DynamoDB reads and Cassandra/Firestore administrative paths still scan records
+and are intended for moderate operational use rather than high-frequency scraping.
+
+The default JSON representation removes job arguments, unique keys, and panic
+stack traces. Use `admin.WithJobRedactor` only when an application has a safe,
+explicit policy for exposing or replacing those fields. `admin.WithReadOnly(true)`
+disables every mutation while retaining inspection and metrics. The authorization
+hook receives separate dashboard, read, mutate, metrics, and health operations;
+return `admin.ErrUnauthenticated` for HTTP 401 and any other error for HTTP 403.
+
+`/healthz` is a process liveness probe and does not touch storage. `/readyz`
+checks that the backing driver can answer a query and returns HTTP 503 when it
+cannot. Metrics are buffered until all queue statistics have been collected, so
+a collection failure returns 503 without a misleading partial Prometheus body.
+
+To serve futures metrics from the same endpoint, aggregate them with
+`future.NewMetrics` and pass it to `admin.WithMetrics` (any value with
+`WritePrometheus(io.Writer) error` works):
+
+```go
+futureMetrics := future.NewMetrics(nil) // or the clock.Manual used in tests
+m, err := future.New(d, future.Config{
+    Observer: future.Observers(futureMetrics, otelgoncordia.NewFutureInstrumentation()),
+})
+handler := admin.New(d, admin.WithMetrics(futureMetrics))
+```
+
+| Metric | Type | Labels |
+|---|---|---|
+| `goncordia_future_awaits_in_flight` | gauge | — |
+| `goncordia_future_await_duration_seconds` | histogram | `kind`, `outcome` |
+| `goncordia_future_await_polls_total` | counter | `kind` |
+| `goncordia_future_await_wakeups_total` | counter | `kind` |
+| `goncordia_future_store_duration_seconds` | histogram | `kind`, `status` |
+| `goncordia_future_result_size_bytes` | histogram | `kind` |
+
+These values describe the process that runs the `Manager`: awaits are counted
+where producers wait, stores where workers run. Expose the admin handler in
+each instance and let Prometheus aggregate. Queue gauges, by contrast, come
+from storage and are the same in every instance.
+The embedded dashboard serves script and style assets separately under a strict
+Content Security Policy.
+
+Every mutation requires `X-Goncordia-Confirm` to exactly match the action name
+(`pause`, `resume`, `cancel`, `delete`, `retry`, or `reschedule`). This is an
+additional guard against accidental requests, not a substitute for authorization:
+
+```text
+POST /jobs/api/jobs/01J.../delete
+X-Goncordia-Confirm: delete
+```
+
+`GET /api/jobs` and `GET /api/queues` return a page envelope:
+
+```json
+{"items": [], "next_cursor": "opaque-value", "has_more": true}
+```
+
+Pass `next_cursor` back as the `cursor` query parameter. Cursors are opaque and
+versioned; callers must not parse or construct them. Job cursors preserve the
+stable `created_at DESC, id DESC` order, including ties, and queue cursors use
+queue-name order. Invalid cursors return HTTP 400. Driver errors map consistently:
+not found to 404, conflict or stale claim to 409, and unsupported operations to
+501. Applications can classify the same errors with `errors.Is` and
+`driver.ErrNotFound`, `driver.ErrConflict`, `driver.ErrStaleClaim`,
+`driver.ErrUnsupported`, or `driver.ErrInvalidCursor`.

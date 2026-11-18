@@ -1,0 +1,94 @@
+---
+title: "Jobs and InsertOpts"
+description: "Job lifecycle, insert options, batches, pipelines, and versioned payloads"
+---
+
+## Job lifecycle
+
+```
+available ──► running ──► completed
+                │
+                ├──► retryable ──► available  (scheduled retry)
+                └──► discarded               (max retries exhausted)
+
+available ──► cancelled   (via JobCancel)
+scheduled ──► running     (claimed once run_at is reached)
+```
+
+## InsertOpts
+
+```go
+maxRetry := 3
+client.Enqueue(ctx, SendEmailArgs{To: "user@example.com", Subject: "Welcome"}, &core.InsertOpts{
+    Queue:    "critical",                    // override default queue
+    Priority: 10,                            // higher = processed first
+    RunAt:    time.Now().Add(time.Hour),     // schedule for later
+
+    UniqueOpts: &core.UniqueOpts{            // deduplicate
+        ByArgs:  true,
+        ByQueue: true,
+        Key:     "welcome-email",           // optional caller-defined dimension
+        ByPeriod: 24 * time.Hour,            // fixed UTC-aligned windows
+        Forever:  false,                     // true keeps the key after finalization
+    },
+
+    MaxRetry: &maxRetry,
+    Tags:     []string{"user:42"},
+})
+```
+
+Unique jobs are global by default: the same canonical key is rejected even if
+the second enqueue targets another queue. Set `ByQueue` to include the queue in
+the key and allow one active job per queue. `ByArgs`, `Key`, and `ByPeriod` add
+the serialized arguments, a caller-defined value, and the start of a fixed UTC
+window respectively. The stored key is a bounded SHA-256 digest, so large job
+arguments or caller keys do not expand database indexes. Completed, discarded,
+and cancelled jobs release their key.
+
+Set `Forever` for durable idempotency keys that must survive completion,
+discard, or cancellation. An explicit job deletion still releases the key.
+
+ClickHouse uniqueness is best-effort because concurrent inserts cannot be
+serialized by `ReplacingMergeTree`. Cassandra uses an LWT reservation followed
+by job writes; failed writes are compensated, but a process crash between them
+can leave an orphaned reservation that must be removed operationally.
+
+## Batch enqueue and pipelines
+
+Use `EnqueueBatch` when each job needs independent options; `EnqueueBatchTx`
+keeps the whole batch inside the caller's native transaction.
+
+```go
+client.EnqueueBatch(ctx, []goncordia.InsertRequest{
+    {Args: ResizeImageArgs{ID: "cover"}, Opts: &core.InsertOpts{Priority: 10}},
+    {Args: IndexBookArgs{ID: "book-42"}, Opts: &core.InsertOpts{PipelineID: "book-42"}},
+})
+```
+
+Jobs with the same non-empty `PipelineID` run sequentially in claim order inside
+one `WorkerPool`. Set `DistributedPipelines: true` to extend the guarantee across
+worker processes sharing the same driver. The pool renews an ownership-fenced
+lease while the handler runs and cancels the handler context if renewal is lost.
+
+### Versioned payloads
+
+Version 1 remains plain legacy JSON. A type may declare a newer version and the
+worker registers each adjacent upcast step:
+
+```go
+func (SendEmailArgs) PayloadVersion() int { return 2 }
+
+core.RegisterWorker(registry, emailWorker, core.WorkerOpts{
+    PayloadVersion: 2,
+    Upcasters: map[int]core.PayloadUpcaster{
+        1: func(old json.RawMessage) (json.RawMessage, error) {
+            // Decode v1 and return v2 JSON.
+            return upgradeEmailV1ToV2(old)
+        },
+    },
+})
+```
+
+Malformed payloads, future versions, and missing/failed upcasters are permanent
+decode failures and go directly to `discarded`; they do not consume the retry
+schedule. `InsertOpts.PayloadVersion` can override the type-provided version.

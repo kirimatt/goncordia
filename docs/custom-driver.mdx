@@ -1,0 +1,52 @@
+---
+title: "Custom drivers"
+description: "Implement Driver[TTx] for another store"
+---
+
+Implement `driver.Driver[TTx]` where `TTx` is your transaction type:
+
+```go
+type MyDriver struct{}
+
+func (d *MyDriver) Name() string                        { return "mydb" }
+func (d *MyDriver) Capabilities() driver.Capabilities  { return driver.Capabilities{NativeTx: true} }
+func (d *MyDriver) Executor() driver.Executor          { return &myExecutor{} }
+func (d *MyDriver) UnwrapTx(tx MyTx) driver.ExecutorTx { return &myTxExecutor{tx: tx} }
+func (d *MyDriver) Listener() driver.Listener          { return nil } // nil = polling fallback
+func (d *MyDriver) Close() error                       { return nil }
+```
+
+See [`driver/driver.go`](https://github.com/kirimatt/goncordia/blob/main/driver/driver.go) for the full core interface and optional rescue/admin capabilities, and [`driver/memory/memory.go`](https://github.com/kirimatt/goncordia/blob/main/driver/memory/memory.go) for a reference implementation. Every `Executor` also implements `driver.JobResultStore` (`JobResultPut`, `JobResultGet`, `JobResultDelete`; `JobDelete` removes the result too), which `driver/drivertest.RunResults` verifies. Driver authors can reuse `driver/drivertest.Run` for the base contract and `driver/drivertest.RunScheduled` with an injected `clock.Manual` for scheduled-job conformance. The base contract includes opaque job/queue pagination, deterministic ordering, invalid-cursor classification, fencing, and typed stale-claim behavior.
+
+## Project layout
+
+```
+goncordia/
+├── client.go              # Client[TTx] — Enqueue, EnqueueTx, Cancel
+├── worker.go              # WorkerPool[TTx] — Start, Shutdown, queue policies, middleware
+├── cron.go                # CronScheduler[TTx] — periodic/cron job scheduling
+├── admin/                 # dashboard, JSON API, probes, Prometheus metrics
+├── clock/                 # injectable Real and Manual clocks
+├── core/
+│   ├── job.go             # JobArgs, Worker, InsertOpts, WorkerOpts
+│   ├── registry.go        # type-erased worker dispatch
+│   ├── retry.go           # RetryPolicy, ExponentialRetry, FixedRetry, NoRetry
+│   └── schedule.go        # Schedule interface, Every, ScheduleFunc
+├── driver/
+│   ├── driver.go          # Driver[TTx], Executor, ExecutorTx, Listener interfaces
+│   ├── memory/            # in-memory (no persistence; for tests)
+│   ├── pgxv5/             # PostgreSQL via pgx v5 (LISTEN/NOTIFY, lease leadership)
+│   ├── stdlib/            # PostgreSQL + MySQL + SQLite via database/sql
+│   ├── gorm/              # gorm adapter (wraps stdlib)
+│   ├── bun/               # bun adapter (wraps stdlib)
+│   ├── mongodbv2/         # MongoDB 4.0+ replica set (mongo-driver v2)
+│   ├── mongodb/           # same, on the deprecated mongo-driver v1
+│   ├── redis/             # Redis (at-least-once; Pub/Sub notifications)
+│   ├── cassandra/         # Cassandra 3.11+ / ScyllaDB (LWT claiming; at-least-once)
+│   ├── clickhouse/        # ClickHouse 23+ (ReplacingMergeTree; at-least-once)
+│   ├── dynamodb/          # Amazon DynamoDB (conditional writes; at-least-once)
+│   └── firestore/         # Cloud Firestore (RunTransaction; ACID inserts)
+├── future/                # Future[R]: enqueue a job and Await its handler's value
+├── gontest/               # test helpers (Tracker, WorkerHelper, MockClock)
+└── otel/                  # OpenTelemetry middleware, worker and future instrumentation
+```

@@ -1,0 +1,99 @@
+---
+title: "Testing"
+description: "In-memory driver, gontest helpers, and injected clocks"
+---
+
+`gontest` makes it easy to test workers and enqueue assertions without a real database.
+
+```bash
+go get github.com/kirimatt/goncordia/gontest/v2@v2.2.0
+```
+
+**Assert that business logic enqueues the right jobs:**
+
+```go
+func TestPlaceOrder_EnqueuesConfirmationEmail(t *testing.T) {
+    ctx := context.Background()
+    client, tracker := gontest.NewClient(t)
+
+    _ = PlaceOrder(ctx, client, "order-123") // calls client.Enqueue internally
+
+    jobs := gontest.RequireEnqueued[SendEmailArgs](t, tracker, 1)
+    if jobs[0].Args.OrderID != "order-123" {
+        t.Errorf("unexpected order ID: %s", jobs[0].Args.OrderID)
+    }
+}
+```
+
+`gontest.Jobs[T]` returns every enqueued job of kind T and an error for the
+first payload that cannot be decoded.
+
+**Unit-test a worker function without a database or pool:**
+
+```go
+func TestEmailWorker_SendsEmail(t *testing.T) {
+    h := gontest.NewWorkerHelper[SendEmailArgs](emailWorker)
+    if err := h.Work(ctx, SendEmailArgs{To: "user@example.com"}); err != nil {
+        t.Fatal(err)
+    }
+}
+
+// Or with a one-liner:
+gontest.RequireWork(t, ctx, emailWorker, SendEmailArgs{To: "user@example.com"})
+```
+
+**Test scheduled jobs with a controllable clock:**
+
+```go
+clk := gontest.NewMockClock()
+client, tracker := gontest.NewClientWithClock(t, clk)
+
+client.Enqueue(ctx, ReminderArgs{UserID: "u1"}, &core.InsertOpts{
+    RunAt: clk.Now().Add(24 * time.Hour),
+})
+
+// Job exists but is not yet available:
+gontest.RequireEnqueued[ReminderArgs](t, tracker, 1)
+
+// Advance past the scheduled time:
+clk.Advance(25 * time.Hour)
+// now start the pool — the job will be picked up immediately
+```
+
+**Drive the in-memory driver directly** — no database, no Docker, deterministic time:
+
+```go
+import (
+    "github.com/kirimatt/goncordia/v2/clock"
+    "github.com/kirimatt/goncordia/v2/driver/memory"
+)
+
+clk := clock.NewManual(time.Now())
+d   := memory.New(memory.WithClock(clk))
+
+client := goncordia.NewClient[memory.NoTx](d, goncordia.ClientConfig{Clock: clk})
+wp     := goncordia.NewWorkerPool[memory.NoTx](d, registry, goncordia.WorkerConfig{Clock: clk})
+
+go wp.Start(ctx)
+clk.Advance(time.Hour)  // trigger scheduled jobs instantly
+
+jobs := d.AllJobs()  // inspect state without a real database
+```
+
+**Run an end-to-end flow in memory:**
+
+```go
+registry := core.NewRegistry()
+core.RegisterWorker(registry, emailWorker, core.WorkerOpts{})
+
+client, tracker := gontest.NewClient(t)
+pool := tracker.NewWorkerPool(registry, goncordia.WorkerConfig{
+    Queues: []string{"default"}, Concurrency: 2,
+})
+
+runCtx, cancel := context.WithCancel(ctx)
+defer cancel()
+go pool.Start(runCtx)
+// enqueue and wait for processed.Load() >= 1 ...
+_ = pool.Shutdown(context.Background())
+```

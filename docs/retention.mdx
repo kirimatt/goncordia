@@ -1,0 +1,131 @@
+---
+title: "Retention and bulk actions"
+description: "Automatic pruning of old jobs, bulk actions, and dead letters"
+---
+
+The portable maintenance service works with every built-in driver and uses the
+same injected-clock model as clients, workers, and schedulers:
+
+```go
+maintenance := goncordia.NewMaintenance(d, goncordia.MaintenanceConfig{
+    Clock: appClock,
+})
+
+cancelled, err := maintenance.BulkCancel(ctx, jobIDs)
+retried, err := maintenance.BulkRetry(ctx, jobIDs, time.Time{}) // now via Clock
+deleted, err := maintenance.BulkDelete(ctx, jobIDs)
+
+page, err := maintenance.DeadLetterList(ctx, driver.JobListParams{Limit: 100})
+replayed, err := maintenance.DeadLetterReplay(ctx, jobIDs, time.Time{})
+```
+
+Bulk operations preserve partial progress in `BulkResult`; their returned error
+joins per-job failures, so `errors.Is` still recognizes typed driver errors.
+Dead-letter replay first verifies that each job is still discarded.
+
+## Retention
+
+Every worker pool prunes old jobs by default, on every driver. Pools share a
+leader lease, so only one instance prunes at a time, and another takes over
+if it stops. The default `goncordia.DefaultRetentionPolicy` keeps:
+
+| What | Kept for |
+|---|---|
+| completed jobs | 24 hours |
+| cancelled jobs | 24 hours |
+| discarded jobs (dead letters) | 7 days |
+| future results of completed jobs | 1 hour |
+
+Override any field in `WorkerConfig`; zero fields keep the default, and
+`goncordia.KeepForever` turns a state off. A negative `RetentionInterval`
+disables retention in that pool:
+
+```go
+wp := goncordia.NewWorkerPool(d, registry, goncordia.WorkerConfig{
+    Retention: goncordia.RetentionPolicy{
+        Completed: 7 * 24 * time.Hour,
+        Discarded: goncordia.KeepForever,
+    },
+    RetentionInterval: 10 * time.Minute, // default 5 minutes
+})
+```
+
+Futures results expire earlier than the jobs. Storage cannot know whether
+some process will still call `Await` (waiters live in other processes'
+memory, and `future.Of` can follow a job later), so results expire by age, not
+by waiter count; after that, `Await` returns `future.ErrNoResult`. `Func.Call`
+does not wait for retention: its job ID never leaves the call, so it deletes
+the job and result as soon as it returns a value (see
+[Futures](/futures)). `Manager.Forget` drops a result
+you have read.
+
+Without a worker pool, for example in a separate maintenance process, run the
+same loop yourself, or call `Prune` once:
+
+```go
+go maintenance.RunRetention(ctx, goncordia.RetentionRunConfig{
+    Policy:   goncordia.DefaultRetentionPolicy,
+    Interval: 10 * time.Minute,
+    OnPrune: func(r goncordia.PruneResult, err error) {
+        slog.Info("retention", "deleted", r.Deleted, "results", r.ResultsDeleted, "err", err)
+    },
+})
+
+result, err := maintenance.Prune(ctx, goncordia.RetentionPolicy{
+    Completed: 30 * 24 * time.Hour,
+    Results:   time.Hour,
+})
+```
+
+Zero durations in `Prune` and `RunRetention` skip that state; negative ones
+other than `KeepForever` are rejected.
+
+How a pass finds expired jobs depends on the driver:
+
+| Driver | How retention finds expired jobs |
+|---|---|
+| pgxv5, stdlib (Postgres, MySQL, SQLite), gorm, bun, MongoDB, Redis | index on state and finalization time, batched deletes (`driver.JobPruner`) |
+| DynamoDB | sparse GSI `gsi_retention` on terminal jobs, sharded 16 ways; created by `Migrate` |
+| Firestore | composite index `state ASC, finalized_at ASC` on `goncordia_jobs` (create it yourself, like the fetch index); results use the automatic `updated_at` index |
+| Cassandra | lookup tables `goncordia_jobs_finalized` and `goncordia_results_written`, read from a stored watermark so deleted rows' tombstones are not rescanned |
+| ClickHouse | data-skipping indexes on `state`, `finalized_at`, `id`, and result `updated_at`; expired rows are removed physically with lightweight `DELETE`, including rows that `JobDelete` only marked deleted |
+| memory | scans in process memory |
+
+On SQL and MongoDB, `Migrate` creates the retention indexes
+(`idx_goncordia_jobs_finalized`, `idx_goncordia_job_results_updated`). Building
+an index on a large Postgres table blocks writes to it while the index is
+built. To avoid that, create the indexes yourself before upgrading; `Migrate`
+then skips them:
+
+```sql
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_goncordia_jobs_finalized ON goncordia_jobs (state, finalized_at);
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_goncordia_job_results_updated ON goncordia_job_results (updated_at);
+```
+
+### Retention metrics
+
+`goncordia.NewRetentionMetrics()` counts passes and deletions. Use it as the
+pool's observer and serve it from the admin `/metrics` endpoint:
+
+```go
+retention := goncordia.NewRetentionMetrics()
+wp := goncordia.NewWorkerPool(d, registry, goncordia.WorkerConfig{
+    Observer: goncordia.WorkerObservers(futureManager, retention),
+})
+handler := admin.New(d, admin.WithMetrics(futureMetrics, retention))
+```
+
+| Metric | Type | Labels |
+|---|---|---|
+| `goncordia_retention_passes_total` | counter | `status` (`ok`, `error`) |
+| `goncordia_retention_jobs_deleted_total` | counter | — |
+| `goncordia_retention_results_deleted_total` | counter | — |
+| `goncordia_retention_last_success_timestamp_seconds` | gauge | — |
+| `goncordia_retention_last_pass_duration_seconds` | gauge | — |
+
+Only the instance holding the lease runs passes, so sum across instances.
+Alert on `time() - max(goncordia_retention_last_success_timestamp_seconds)`
+growing past a few intervals. `otelgoncordia.NewInstrumentation` records the
+same data as `goncordia.retention.passes`, `goncordia.retention.deleted`, and
+`goncordia.retention.duration`. A custom `WorkerObserver` receives passes by
+implementing `goncordia.RetentionObserver`.

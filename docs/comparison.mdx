@@ -1,0 +1,26 @@
+---
+title: "How it compares"
+description: "goncordia next to other Go job queues"
+---
+
+| | goncordia | [River](https://github.com/riverqueue/river) | [Asynq](https://github.com/hibiken/asynq) | [Machinery](https://github.com/RichardKnop/machinery) |
+|---|---|---|---|---|
+| Backends | Postgres, MySQL, SQLite, MongoDB, Redis, Cassandra, ClickHouse, DynamoDB, Firestore, memory | **PostgreSQL only** | **Redis only** | Redis, RabbitMQ, SQS, MongoDB |
+| Transactional insert (outbox pattern) | ✅ where backend supports tx | ✅ Postgres only | ❌ | ❌ |
+| Generic `Driver[TTx]` interface | ✅ | ✅ (Postgres only) | — | — |
+| Scheduled / cron jobs | ✅ | ✅ | ✅ | ✅ |
+| Unique jobs | ✅ | ✅ | ✅ | ❌ |
+| Priority queues | ✅ | ✅ | ✅ | ❌ |
+| Push notifications | ✅ LISTEN/NOTIFY, Change Streams, Pub/Sub | ✅ LISTEN/NOTIFY | ✅ Pub/Sub | ❌ polling |
+| Web UI | ✅ embeddable | ✅ (River UI, Pro) | ✅ (asynqmon) | ❌ |
+| Await a job's typed result | ✅ `future.Func.Call` / `Await` | ❌ | stores results, no await | ✅ `AsyncResult.Get` |
+| Unit tests without Docker | ✅ in-memory driver + `gontest` | needs Postgres | needs Redis | needs a broker |
+| Workflow primitives (chains, chords) | ❌ | ❌ | ❌ | ✅ |
+
+**Choose goncordia** when you want the transactional outbox pattern and don't want to introduce Redis or a dedicated Postgres instance — it works with whatever database your application already uses. It also fits when a caller needs the value a background job returns (`future.Func.Call`), or when you want unit tests of enqueue and worker code without Docker.
+
+**Choose River** if you're on Postgres and want a mature, battle-tested library with a polished UI and a professional support tier.
+
+**Choose Asynq** if Redis is already in your stack, you don't need transactional inserts, and you want a built-in web dashboard.
+
+**Choose Machinery** if you need Celery-style workflow primitives (chains, chords, groups) across RabbitMQ or SQS.
