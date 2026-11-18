@@ -11,6 +11,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [v2.7.1] — 2026-11-18
+
+### Fixed
+- Rate-limited workers wait until an absolute time. The wait used to be a
+  duration computed from an earlier `Now`, so time that passed before the
+  timer was created extended the wait instead of shortening it.
+
+### Security (drivers v2.7.1)
+- pgxv5, stdlib, mongodb, redis, cassandra, dynamodb, and firestore require
+  `github.com/klauspost/compress` v1.20.4, which fixes GO-2026-6865. gorm and
+  bun pick it up through stdlib v2.7.1. All of them require root v2.7.1.
+
+### Added
+- Documentation site at https://goncordia.docs7.io, built from `docs/`.
+
+---
+
 ## [v2.7.0] — 2026-11-18
 
 ### Added
