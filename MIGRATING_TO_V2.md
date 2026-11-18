@@ -23,8 +23,8 @@ The same rule applies to `driver/stdlib`, `driver/mongodb`, `driver/redis`,
 `driver/firestore`, `driver/gorm`, and `driver/bun`.
 
 ```bash
-go get github.com/kirimatt/goncordia/v2@v2.0.0
-go get github.com/kirimatt/goncordia/driver/pgxv5/v2@v2.0.0
+go get github.com/kirimatt/goncordia/v2@v2.2.0
+go get github.com/kirimatt/goncordia/driver/pgxv5/v2@v2.2.0
 go mod tidy
 ```
 
