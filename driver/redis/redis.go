@@ -73,11 +73,9 @@ func New(rdb *redis.Client, opts ...Option) *Driver {
 }
 
 // Migrate verifies connectivity, rejects an allkeys-* maxmemory-policy with
-// ErrEvictionPolicy (see WithAllowEviction), and backfills the indexes that
-// older releases did not write: created-at (v0.17) and retention (v2.5.0).
-// Run it again once every instance runs v2.5.0, so jobs finalized by older
-// instances during a rolling upgrade are indexed too. Safe to call multiple
-// times.
+// ErrEvictionPolicy (see WithAllowEviction), and backfills the created-at
+// administrative index for jobs written by releases before v0.17. Safe to
+// call multiple times.
 func (d *Driver) Migrate(ctx context.Context) error {
 	if err := d.rdb.Ping(ctx).Err(); err != nil {
 		return err
@@ -98,7 +96,7 @@ func (d *Driver) Migrate(ctx context.Context) error {
 			}
 			var job redisJob
 			if json.Unmarshal(raw, &job) == nil {
-				if err := d.backfillIndexes(ctx, job); err != nil {
+				if err := d.rdb.ZAdd(ctx, jobsIndexKey, redis.Z{Score: float64(job.CreatedAtMs), Member: job.ID}).Err(); err != nil {
 					return err
 				}
 			}
@@ -108,28 +106,6 @@ func (d *Driver) Migrate(ctx context.Context) error {
 			return nil
 		}
 	}
-}
-
-// backfillIndexes adds job to the created-at index and, for terminal jobs and
-// stored results written before v2.5.0, to the retention indexes.
-func (d *Driver) backfillIndexes(ctx context.Context, job redisJob) error {
-	pipe := d.rdb.Pipeline()
-	pipe.ZAdd(ctx, jobsIndexKey, redis.Z{Score: float64(job.CreatedAtMs), Member: job.ID})
-	if isTerminal(job.State) && job.FinalizedAtMs != 0 {
-		pipe.ZAdd(ctx, finalKey(driver.JobState(job.State)), redis.Z{Score: float64(job.FinalizedAtMs), Member: job.ID})
-	}
-	hasResult := pipe.Exists(ctx, resultKey(job.ID))
-	if _, err := pipe.Exec(ctx); err != nil {
-		return err
-	}
-	if hasResult.Val() == 0 {
-		return nil
-	}
-	at := job.FinalizedAtMs
-	if at == 0 {
-		at = job.CreatedAtMs
-	}
-	return d.rdb.ZAddNX(ctx, resultsIndexKey, redis.Z{Score: float64(at), Member: job.ID}).Err()
 }
 
 func (d *Driver) Name() string { return "redis" }

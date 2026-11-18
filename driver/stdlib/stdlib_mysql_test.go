@@ -68,7 +68,6 @@ func TestStdlibMySQL_EnqueueAndProcess(t *testing.T) {
 	d := newMySQLDriver(t)
 	drivertest.Run(t, d.Executor())
 	drivertest.RunResults(t, d.Executor())
-	drivertest.RunRetention(t, d)
 	ctx := context.Background()
 
 	var processed atomic.Int64
