@@ -12,8 +12,8 @@
 **A background job queue for Go that runs on the database you already have.**
 Enqueue jobs in the same transaction as your data, process them with retries,
 schedules, and priorities, and await a job's typed result when you need it —
-on Postgres, MySQL, SQLite, MongoDB, Redis, Cassandra, ClickHouse, DynamoDB,
-Firestore, or in memory. No new broker to run.
+on Postgres, MySQL, MariaDB, SQLite, MongoDB, Redis, Cassandra, ClickHouse,
+DynamoDB, Firestore, or in memory. No new broker to run.
 
 Use it for the jobs a Go service sends to the background: emails and
 notifications, webhooks, report and thumbnail generation, syncing with
@@ -64,7 +64,7 @@ tx.Commit(ctx)  // job and order appear atomically
 | Driver | Package | Tx type | Atomic insert | Notes |
 |---|---|---|---|---|
 | PostgreSQL (pgx v5) | `driver/pgxv5` | `pgx.Tx` | ✅ | LISTEN/NOTIFY, lease leadership, SKIP LOCKED |
-| PostgreSQL / MySQL / SQLite | `driver/stdlib` | `*sql.Tx` | ✅ | pgx stdlib, go-sql-driver/mysql, modernc sqlite |
+| PostgreSQL / MySQL / MariaDB / SQLite | `driver/stdlib` | `*sql.Tx` | ✅ | pgx stdlib, go-sql-driver/mysql (MySQL 8, MariaDB 10.6+), modernc sqlite |
 | gorm | `driver/gorm` | `*gorm.DB` | ✅ | thin adapter over stdlib |
 | bun | `driver/bun` | `bun.Tx` | ✅ | thin adapter over stdlib |
 | MongoDB 4.0+ | `driver/mongodbv2` | `*mongo.Session` (mongo-driver v2) | ✅ | replica set required |
