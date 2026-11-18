@@ -3,6 +3,7 @@ package future
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -453,3 +454,32 @@ func (s *failingStore) JobResultGet(context.Context, string) ([]byte, error) {
 	return nil, s.err
 }
 func (s *failingStore) JobResultDelete(context.Context, string) error { return s.err }
+
+// lostStore reports every result as lost, as the Redis driver does after
+// eviction.
+type lostStore struct{ driver.JobResultStore }
+
+func (lostStore) JobResultGet(context.Context, string) ([]byte, error) {
+	return nil, fmt.Errorf("%w: %w", driver.ErrResultLost, driver.ErrNotFound)
+}
+
+func TestAwaitReportsLostResult(t *testing.T) {
+	fx := newFixture(t)
+	m, err := New(fx.d, Config{Clock: fx.clk, Store: lostStore{fx.d.Executor()}, Observer: fx.obs})
+	if err != nil {
+		t.Fatal(err)
+	}
+	f, err := Enqueue[int](t.Context(), m, fx.client, sumArgs{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fx.claim(t)
+	fx.finish(t, f.ID(), driver.JobStateCompleted, "")
+	_, err = f.Await(t.Context())
+	if !errors.Is(err, ErrResultLost) || errors.Is(err, ErrNoResult) {
+		t.Fatalf("err = %v, want ErrResultLost only", err)
+	}
+	if fx.obs.lastAwait(t).Outcome != OutcomeResultLost {
+		t.Fatalf("outcome = %s", fx.obs.lastAwait(t).Outcome)
+	}
+}

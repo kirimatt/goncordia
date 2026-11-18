@@ -22,6 +22,10 @@ var (
 	// back or has not committed yet, or it was deleted. Storage cannot tell
 	// these apart. Errors matching ErrNotFound also match driver.ErrNotFound.
 	ErrNotFound = errors.New("goncordia/future: job not found")
+	// ErrResultLost reports a completed job whose stored result disappeared
+	// without being deleted, for example evicted from Redis under an
+	// allkeys-* maxmemory policy. Unlike ErrNoResult, a value did exist.
+	ErrResultLost = errors.New("goncordia/future: stored result lost")
 )
 
 // JobError describes a job that ended without a value.
@@ -71,6 +75,8 @@ const (
 	OutcomeCancelled Outcome = "cancelled"
 	OutcomeNoResult  Outcome = "no_result"
 	OutcomeNotFound  Outcome = "not_found"
+	// OutcomeResultLost is a completed job whose stored result disappeared.
+	OutcomeResultLost Outcome = "result_lost"
 	// OutcomePending is reported by TryGet while the job is still running.
 	OutcomePending Outcome = "pending"
 	// OutcomeAbandoned means the caller's context ended before the job did.
