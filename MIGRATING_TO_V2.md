@@ -69,7 +69,26 @@ func (metrics) JobFinished(ctx context.Context, e goncordia.JobFinishedEvent) { 
   `drivertest.RunResults` checks the contract.
 - `clock.Clock` now requires `NewTimer(time.Duration) clock.Timer`.
 
-## 6. Unchanged
+## 6. MongoDB on mongo-driver v2
+
+`driver/mongodb` stays on the deprecated mongo-driver v1. The new
+`driver/mongodbv2` module uses mongo-driver v2 and the same collections, so
+processes can switch one at a time:
+
+```go
+import mongodriver "github.com/kirimatt/goncordia/driver/mongodbv2/v2"
+
+client, _ := mongo.Connect(options.Client().ApplyURI(uri)) // go.mongodb.org/mongo-driver/v2
+d, _ := mongodriver.New(ctx, client, "myapp")
+
+session, _ := client.StartSession()
+defer session.EndSession(ctx)
+_, err := session.WithTransaction(ctx, func(ctx context.Context) (any, error) {
+    return mqClient.EnqueueTx(ctx, session, args, nil) // TTx is *mongo.Session
+})
+```
+
+## 7. Unchanged
 
 Database schemas other than the new results table, job payloads, metric and
 span names, and the OpenTelemetry instrumentation scope

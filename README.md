@@ -52,7 +52,8 @@ tx.Commit(ctx)  // job and order appear atomically
 | PostgreSQL / MySQL / SQLite | `driver/stdlib` | `*sql.Tx` | ✅ | pgx stdlib, go-sql-driver/mysql, modernc sqlite |
 | gorm | `driver/gorm` | `*gorm.DB` | ✅ | thin adapter over stdlib |
 | bun | `driver/bun` | `bun.Tx` | ✅ | thin adapter over stdlib |
-| MongoDB 4.0+ | `driver/mongodb` | `mongo.SessionContext` | ✅ | replica set required |
+| MongoDB 4.0+ | `driver/mongodbv2` | `*mongo.Session` (mongo-driver v2) | ✅ | replica set required |
+| MongoDB 4.0+ (deprecated) | `driver/mongodb` | `mongo.SessionContext` (mongo-driver v1) | ✅ | use `driver/mongodbv2` |
 | Redis | `driver/redis` | `NoTx` | ❌ | at-least-once; Pub/Sub notifications |
 | Cassandra 3.11+ | `driver/cassandra` | `NoTx` | ❌ | LWT claiming; ScyllaDB / DSE compatible |
 | ClickHouse 23+ | `driver/clickhouse` | `NoTx` | ❌ | ReplacingMergeTree; at-least-once |
@@ -110,7 +111,7 @@ go get github.com/kirimatt/goncordia/driver/gorm/v2@v2.2.0
 go get github.com/kirimatt/goncordia/driver/bun/v2@v2.2.0
 
 # MongoDB (replica set required)
-go get github.com/kirimatt/goncordia/driver/mongodb/v2@v2.2.0
+go get github.com/kirimatt/goncordia/driver/mongodbv2/v2@v2.3.0
 
 # Redis
 go get github.com/kirimatt/goncordia/driver/redis/v2@v2.2.0
@@ -191,26 +192,33 @@ tx.Commit(ctx)  // job and order are atomic
 
 ```go
 import (
-    mongodriver "github.com/kirimatt/goncordia/driver/mongodb/v2"
-    "go.mongodb.org/mongo-driver/mongo"
-    "go.mongodb.org/mongo-driver/mongo/options"
+    mongodriver "github.com/kirimatt/goncordia/driver/mongodbv2/v2"
+    "go.mongodb.org/mongo-driver/v2/mongo"
+    "go.mongodb.org/mongo-driver/v2/mongo/options"
 )
 
-client, _ := mongo.Connect(ctx, options.Client().ApplyURI(os.Getenv("MONGO_URI")))
+client, _ := mongo.Connect(options.Client().ApplyURI(os.Getenv("MONGO_URI")))
 defer client.Disconnect(ctx)
 d, err := mongodriver.New(ctx, client, "myapp")  // fails if not a replica set
 d.Migrate(ctx)
 
 mqClient := mongodriver.NewClient(d, goncordia.ClientConfig{})
 
-// Transactional insert via mongo.SessionContext
-mongoClient.UseSession(ctx, func(sc mongo.SessionContext) error {
-    sc.StartTransaction()
-    db.Collection("orders").InsertOne(sc, order)
-    mqClient.EnqueueTx(sc, sc, SendConfirmationArgs{OrderID: order.ID}, nil)
-    return sc.CommitTransaction(sc)
+// Transactional insert: the transaction type is *mongo.Session
+session, _ := client.StartSession()
+defer session.EndSession(ctx)
+_, err = session.WithTransaction(ctx, func(ctx context.Context) (any, error) {
+    if _, err := db.Collection("orders").InsertOne(ctx, order); err != nil {
+        return nil, err
+    }
+    return mqClient.EnqueueTx(ctx, session, SendConfirmationArgs{OrderID: order.ID}, nil)
 })
 ```
+
+`driver/mongodb` is the same driver on the deprecated mongo-driver v1, with
+`mongo.SessionContext` as the transaction type. Both use the same collections
+and document format, so you can switch processes one by one: replace the
+import, connect with mongo-driver v2, and pass the session to `EnqueueTx`.
 
 ### gorm
 
@@ -1264,7 +1272,8 @@ goncordia/
 │   ├── stdlib/            # PostgreSQL + MySQL + SQLite via database/sql
 │   ├── gorm/              # gorm adapter (wraps stdlib)
 │   ├── bun/               # bun adapter (wraps stdlib)
-│   ├── mongodb/           # MongoDB 4.0+ replica set
+│   ├── mongodbv2/         # MongoDB 4.0+ replica set (mongo-driver v2)
+│   ├── mongodb/           # same, on the deprecated mongo-driver v1
 │   ├── redis/             # Redis (at-least-once; Pub/Sub notifications)
 │   ├── cassandra/         # Cassandra 3.11+ / ScyllaDB (LWT claiming; at-least-once)
 │   ├── clickhouse/        # ClickHouse 23+ (ReplacingMergeTree; at-least-once)

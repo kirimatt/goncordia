@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `driver/mongodbv2`: the MongoDB driver on the official Go driver v2
+  (`go.mongodb.org/mongo-driver/v2` v2.10.0). `New` takes a v2
+  `*mongo.Client`, and the transaction type is `*mongo.Session`. It uses the
+  same collections as `driver/mongodb`, so processes can migrate one by one.
+
+### Deprecated
+- `driver/mongodb`, which uses the deprecated mongo-driver v1. Use
+  `driver/mongodbv2`.
+
 ---
 
 ## [v2.3.0] — 2026-11-18

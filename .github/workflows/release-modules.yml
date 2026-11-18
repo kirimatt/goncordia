@@ -49,7 +49,7 @@ jobs:
           MODULE_GROUP: ${{ inputs.group }}
         run: |
           if [[ "$MODULE_GROUP" == "base" ]]; then
-            modules=(driver/stdlib driver/pgxv5 driver/mongodb driver/redis driver/cassandra driver/clickhouse driver/dynamodb driver/firestore otel gontest)
+            modules=(driver/stdlib driver/pgxv5 driver/mongodb driver/mongodbv2 driver/redis driver/cassandra driver/clickhouse driver/dynamodb driver/firestore otel gontest)
           else
             modules=(driver/gorm driver/bun bench)
           fi
@@ -72,7 +72,7 @@ jobs:
           MODULE_GROUP: ${{ inputs.group }}
         run: |
           if [[ "$MODULE_GROUP" == "base" ]]; then
-            modules=(driver/stdlib driver/pgxv5 driver/mongodb driver/redis driver/cassandra driver/clickhouse driver/dynamodb driver/firestore otel gontest)
+            modules=(driver/stdlib driver/pgxv5 driver/mongodb driver/mongodbv2 driver/redis driver/cassandra driver/clickhouse driver/dynamodb driver/firestore otel gontest)
           else
             modules=(driver/gorm driver/bun bench)
           fi

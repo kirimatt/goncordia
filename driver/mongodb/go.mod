@@ -1,3 +1,4 @@
+// Deprecated: use github.com/kirimatt/goncordia/driver/mongodbv2/v2, built on mongo-driver v2.
 module github.com/kirimatt/goncordia/driver/mongodb/v2
 
 go 1.26.0

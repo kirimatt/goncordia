@@ -1,4 +1,9 @@
-// Package mongodriver provides a goncordia driver backed by MongoDB.
+// Package mongodriver provides a goncordia driver backed by MongoDB through the
+// mongo-driver v1, which is deprecated upstream.
+//
+// Deprecated: use github.com/kirimatt/goncordia/driver/mongodbv2/v2, which
+// uses mongo-driver v2 and the same collections, so both can run against one
+// database while you migrate.
 //
 // Requires MongoDB 4.0+ with a replica set (or sharded cluster).
 // Standalone deployments do not support multi-document transactions and will
