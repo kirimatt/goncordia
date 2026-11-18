@@ -15,6 +15,9 @@ on:
 jobs:
   quality:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # Codecov OIDC upload, no token secret
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
@@ -34,12 +37,20 @@ jobs:
         run: ./scripts/for-each-module.sh go run "honnef.co/go/tools/cmd/staticcheck@${STATICCHECK_VERSION}" ./...
       - name: Release metadata
         run: ./scripts/check-release.sh
-      - name: Core coverage threshold
+      - name: Coverage
         run: |
-          go test ./admin ./clock ./core ./driver ./driver/memory ./future \
-            -covermode=atomic -coverprofile=coverage.out
+          go test ./... -coverpkg=./... -covermode=atomic -coverprofile=coverage.out
           total=$(go tool cover -func=coverage.out | awk '/^total:/ {gsub("%", "", $3); print $3}')
-          awk -v total="$total" 'BEGIN { if (total < 68.0) { printf "coverage %.1f%% is below 68.0%%\n", total; exit 1 } }'
+          echo "root module coverage: ${total}%"
+          awk -v total="$total" 'BEGIN { if (total < 80.0) { printf "coverage %.1f%% is below 80.0%%\n", total; exit 1 } }'
+      - name: Upload coverage to Codecov
+        if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+        with:
+          files: coverage.out
+          disable_search: true
+          use_oidc: true
+          fail_ci_if_error: false
 
   test:
     name: test (Go ${{ matrix.go }})

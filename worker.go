@@ -1173,7 +1173,7 @@ func (p *WorkerPool[TTx]) waitForRatePermit(ctx context.Context, exec driver.Exe
 					Job: row, Scope: RateLimitScopeLocal, RetryAt: now.Add(delay),
 				})
 			}
-			if !p.waitForRateDelay(ctx, delay) {
+			if !p.waitForRateDelay(ctx, now.Add(delay)) {
 				return false
 			}
 			continue
@@ -1189,25 +1189,28 @@ func (p *WorkerPool[TTx]) waitForRatePermit(ctx context.Context, exec driver.Exe
 			return true
 		}
 		rollbackLocal()
-		delay := p.config.RateLimitPollInterval
+		waitUntil := p.config.Clock.Now().Add(p.config.RateLimitPollInterval)
 		if err != nil {
 			p.reportError(fmt.Errorf("acquire global rate permit for queue %q: %w", row.Queue, err))
 		} else if retryAt.After(p.config.Clock.Now()) {
-			delay = retryAt.Sub(p.config.Clock.Now())
+			waitUntil = retryAt
 		}
 		if observer := p.config.Observer; observer != nil {
 			observer.JobRateLimited(ctx, RateLimitWaitEvent{
-				Job: row, Scope: RateLimitScopeGlobal, RetryAt: p.config.Clock.Now().Add(delay), Err: err,
+				Job: row, Scope: RateLimitScopeGlobal, RetryAt: waitUntil, Err: err,
 			})
 		}
-		if !p.waitForRateDelay(ctx, delay) {
+		if !p.waitForRateDelay(ctx, waitUntil) {
 			return false
 		}
 	}
 }
 
-func (p *WorkerPool[TTx]) waitForRateDelay(ctx context.Context, delay time.Duration) bool {
-	timer := p.config.Clock.NewTimer(delay)
+// waitForRateDelay waits until the absolute time until. The delay is taken
+// from the clock when the timer is created, so time that passed since until
+// was computed shortens the wait instead of extending it.
+func (p *WorkerPool[TTx]) waitForRateDelay(ctx context.Context, until time.Time) bool {
+	timer := p.config.Clock.NewTimer(until.Sub(p.config.Clock.Now()))
 	defer timer.Stop()
 	select {
 	case <-timer.C():
