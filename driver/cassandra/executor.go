@@ -885,21 +885,26 @@ func jobReschedule(ctx context.Context, session *gocql.Session, params driver.Re
 		return err
 	}
 
-	oldState := j.State
-	oldRunAt := j.RunAt
-
-	if err := session.Query(
-		`UPDATE goncordia_jobs SET state=?, run_at=?, version=version+1 WHERE id=?`,
-		string(driver.JobStateScheduled), params.RunAt, params.ID,
-	).WithContext(ctx).Exec(); err != nil {
+	applied, err := session.Query(
+		`UPDATE goncordia_jobs SET state=?, run_at=?, version=? WHERE id=? IF version=?`,
+		string(driver.JobStateScheduled), params.RunAt, j.Version+1, params.ID, j.Version,
+	).WithContext(ctx).MapScanCAS(map[string]interface{}{})
+	if err != nil {
 		return err
 	}
-
-	if oldState == string(driver.JobStateAvailable) {
-		_ = session.Query(`DELETE FROM goncordia_jobs_avail WHERE queue=? AND run_at=? AND priority=? AND id=?`,
-			j.Queue, oldRunAt, j.Priority, params.ID).WithContext(ctx).Exec()
+	if !applied {
+		return fmt.Errorf("%w: job %q changed before rescheduling", driver.ErrConflict, params.ID)
 	}
-	return nil
+
+	// The run_at lookup holds available and scheduled jobs; move the entry.
+	if j.State == string(driver.JobStateAvailable) || j.State == string(driver.JobStateScheduled) {
+		if err := session.Query(`DELETE FROM goncordia_jobs_avail WHERE queue=? AND run_at=? AND priority=? AND id=?`,
+			j.Queue, j.RunAt, j.Priority, params.ID).WithContext(ctx).Exec(); err != nil {
+			return err
+		}
+	}
+	return session.Query(`INSERT INTO goncordia_jobs_avail (queue, run_at, priority, id) VALUES (?, ?, ?, ?)`,
+		j.Queue, params.RunAt, j.Priority, params.ID).WithContext(ctx).Exec()
 }
 
 // ---- Queue ----
