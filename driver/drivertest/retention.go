@@ -62,12 +62,13 @@ func RunRetention[TTx any](t *testing.T, d driver.Driver[TTx]) {
 	}
 	clk := clock.NewManual(latest.Add(2 * time.Hour))
 	maintenance := goncordia.NewMaintenance(d, goncordia.MaintenanceConfig{Clock: clk})
+	// Some drivers report a missing job as (nil, nil) rather than ErrNotFound.
 	exists := func(id string) bool {
-		_, err := exec.JobGetByID(ctx, id)
+		row, err := exec.JobGetByID(ctx, id)
 		if err != nil && !errors.Is(err, driver.ErrNotFound) {
 			t.Fatalf("get %s: %v", id, err)
 		}
-		return err == nil
+		return err == nil && row != nil
 	}
 
 	result, err := maintenance.Prune(ctx, goncordia.RetentionPolicy{
