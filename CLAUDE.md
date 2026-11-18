@@ -133,7 +133,7 @@ total, err := b.sum.Call(ctx, SumArgs{A: 2, B: 3}) // errors.Is(err, future.ErrD
 f, err := b.sum.With(&core.InsertOpts{Queue: "critical"}).Enqueue(ctx, args) // wait later with f.Await
 ```
 
-Use `future.BindTx` for `EnqueueTx(ctx, tx, args)`; await only after commit.
+Use `future.BindTx` for `EnqueueTx(ctx, tx, args)`; await only after commit. After a rollback (or before commit) the job does not exist and `Await` returns `driver.ErrNotFound` immediately.
 
 Full runnable examples: `future/example_test.go` (memory) and
 `driver/pgxv5/example_future_test.go` (Postgres with `EnqueueTx`).
