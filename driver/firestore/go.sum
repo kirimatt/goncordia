@@ -71,8 +71,8 @@ github.com/googleapis/enterprise-certificate-proxy v0.3.23 h1:J+VGF1wjAM2dU2kKUX
 github.com/googleapis/enterprise-certificate-proxy v0.3.23/go.mod h1:Y8NO/15GNLkrXI3OR5xOFmeU3XLX1sLSdtlXgJ0zmIw=
 github.com/googleapis/gax-go/v2 v2.27.0 h1:qe2iQOUzxb3fd6x6ewpIEixPQhJ+0Ihc/RRZhKA/2g0=
 github.com/googleapis/gax-go/v2 v2.27.0/go.mod h1:RofiqDw3ehcG4L0H1zO3D2Itpwd3/uS/7wdmbNDF1DE=
-github.com/kirimatt/goncordia/v2 v2.7.0 h1:sH05AU0CQzJqqamENswAsfYQDiW2deGaOlu1gok0S/g=
-github.com/kirimatt/goncordia/v2 v2.7.0/go.mod h1:9DGFKBiqNXbjvUB4SmCxZZOyBZ5gvFx1BvOT6ETkTRs=
+github.com/kirimatt/goncordia/v2 v2.7.1 h1:ZIyGOuG3WrXqDxoq+ryAIO6IiP0rsGGuGTH1RSV0szo=
+github.com/kirimatt/goncordia/v2 v2.7.1/go.mod h1:9DGFKBiqNXbjvUB4SmCxZZOyBZ5gvFx1BvOT6ETkTRs=
 github.com/klauspost/compress v1.20.4 h1:dD0v/bvxtjCBqQu6sx1TNWkalEY5lNTIe+HY9w8TeNI=
 github.com/klauspost/compress v1.20.4/go.mod h1:LUdAzn7YLVvxLpc7y3V1m40wESHTgc1422pwwBSKYuI=
 github.com/lufia/plan9stats v0.0.0-20260330125221-c963978e514e h1:Q6MvJtQK/iRcRtzAscm/zF23XxJlbECiGPyRicsX+Ak=

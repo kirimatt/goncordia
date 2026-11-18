@@ -5,7 +5,7 @@ go 1.26.0
 require (
 	cloud.google.com/go/firestore v1.29.2
 	github.com/google/uuid v1.6.0
-	github.com/kirimatt/goncordia/v2 v2.7.0
+	github.com/kirimatt/goncordia/v2 v2.7.1
 	github.com/testcontainers/testcontainers-go v0.45.0
 	google.golang.org/grpc v1.85.0
 )
