@@ -208,3 +208,42 @@ func TestFutureInstrumentationMarksFailures(t *testing.T) {
 		}
 	}
 }
+
+func TestInstrumentationRecordsRetentionPasses(t *testing.T) {
+	start := time.Date(2026, 8, 16, 8, 0, 0, 0, time.UTC)
+	tm := newTelemetry(clock.NewManual(start))
+	instrumentation := otelgoncordia.NewInstrumentation(tm.opts...)
+	ctx := context.Background()
+	instrumentation.RetentionPassed(ctx, goncordia.RetentionPassEvent{
+		Result:    goncordia.PruneResult{Deleted: 3, ResultsDeleted: 2},
+		StartedAt: start, FinishedAt: start.Add(2 * time.Second),
+	})
+	instrumentation.RetentionPassed(ctx, goncordia.RetentionPassEvent{
+		Result: goncordia.PruneResult{Deleted: 1}, Err: errors.New("boom"),
+		StartedAt: start, FinishedAt: start,
+	})
+
+	passes := tm.metric(t, "goncordia.retention.passes").(metricdata.Sum[int64])
+	byStatus := map[string]int64{}
+	for _, p := range passes.DataPoints {
+		status, _ := p.Attributes.Value("status")
+		byStatus[status.AsString()] += p.Value
+	}
+	deleted := tm.metric(t, "goncordia.retention.deleted").(metricdata.Sum[int64])
+	byWhat := map[string]int64{}
+	for _, p := range deleted.DataPoints {
+		what, _ := p.Attributes.Value("what")
+		byWhat[what.AsString()] += p.Value
+	}
+	if len(byStatus) != 2 || byWhat["jobs"] != 4 || byWhat["results"] != 2 {
+		t.Fatalf("passes=%v deleted=%v", byStatus, byWhat)
+	}
+	duration := tm.metric(t, "goncordia.retention.duration").(metricdata.Histogram[float64])
+	var sum float64
+	for _, p := range duration.DataPoints {
+		sum += p.Sum
+	}
+	if sum != 2 {
+		t.Fatalf("duration sum = %v, want 2", sum)
+	}
+}
