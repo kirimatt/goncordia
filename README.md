@@ -98,7 +98,7 @@ Pick a driver:
 
 ```bash
 # PostgreSQL via pgx v5
-go get github.com/kirimatt/goncordia/driver/pgxv5/v2@v2.0.0
+go get github.com/kirimatt/goncordia/driver/pgxv5/v2@v2.1.0
 
 # PostgreSQL / MySQL / SQLite via database/sql
 go get github.com/kirimatt/goncordia/driver/stdlib/v2@v2.0.0
