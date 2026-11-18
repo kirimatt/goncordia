@@ -9,6 +9,7 @@ import (
 	pgxdriver "github.com/kirimatt/goncordia/driver/pgxv5/v2"
 	"github.com/kirimatt/goncordia/v2"
 	"github.com/kirimatt/goncordia/v2/core"
+	"github.com/kirimatt/goncordia/v2/driver"
 	"github.com/kirimatt/goncordia/v2/future"
 )
 
@@ -78,5 +79,77 @@ func TestPgxv5_FutureAcrossManagers(t *testing.T) {
 	}
 	if _, err := future.Of[int](producerSide, ok.ID()).Await(ctx); err == nil {
 		t.Fatal("Await of a deleted job succeeded")
+	}
+}
+
+var doubleTask = future.Define[doubleArgs, int]()
+
+// TestPgxv5_BindTxCommitAndRollback checks that a bound task enqueued inside a
+// transaction runs only after commit and disappears on rollback.
+func TestPgxv5_BindTxCommitAndRollback(t *testing.T) {
+	skipIfNoDocker(t)
+	pool, cleanup := newTestPool(t)
+	defer cleanup()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+
+	d := pgxdriver.New(pool)
+	if err := d.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	m, err := future.New(d, future.Config{PollInterval: 20 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry := core.NewRegistry()
+	doubleTask.Register(registry, m, func(_ context.Context, job *core.Job[doubleArgs]) (int, error) {
+		return job.Args.N * 2, nil
+	}, core.WorkerOpts{})
+	wp := pgxdriver.NewWorkerPool(d, registry, goncordia.WorkerConfig{
+		Queues: []string{"default"}, PollInterval: 20 * time.Millisecond, Observer: m,
+	})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = wp.Start(ctx)
+	}()
+	defer func() {
+		cancel()
+		<-done
+	}()
+
+	double := future.BindTx(m, pgxdriver.NewClient(d, goncordia.ClientConfig{}), doubleTask)
+
+	rolledBack, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lost, err := double.EnqueueTx(ctx, rolledBack, doubleArgs{N: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rolledBack.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.Executor().JobGetByID(ctx, lost.ID()); !errors.Is(err, driver.ErrNotFound) {
+		t.Fatalf("rolled-back job lookup err = %v, want ErrNotFound", err)
+	}
+
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f, err := double.EnqueueTx(ctx, tx, doubleArgs{N: 21})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := f.Await(ctx); err != nil || got != 42 {
+		t.Fatalf("Await = %d, %v", got, err)
+	}
+	if got, err := double.Call(ctx, doubleArgs{N: 5}); err != nil || got != 10 {
+		t.Fatalf("Call = %d, %v", got, err)
 	}
 }
