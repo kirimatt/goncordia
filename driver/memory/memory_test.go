@@ -15,3 +15,7 @@ func TestConformance(t *testing.T) {
 func TestResultStoreConformance(t *testing.T) {
 	drivertest.RunResults(t, memory.New().Executor())
 }
+
+func TestRetentionConformance(t *testing.T) {
+	drivertest.RunRetention(t, memory.New())
+}

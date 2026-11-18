@@ -152,6 +152,14 @@ type WorkerConfig struct {
 	StuckJobTimeout time.Duration
 	// RescueInterval controls how often abandoned jobs are checked. Default: 1 minute.
 	RescueInterval time.Duration
+	// Retention prunes old terminal jobs and future results while the pool
+	// runs. Every pool takes part under a shared leader lease, so only one
+	// instance prunes at a time. Zero fields use DefaultRetentionPolicy;
+	// KeepForever keeps a state forever.
+	Retention RetentionPolicy
+	// RetentionInterval is the time between retention passes. Default:
+	// 5 minutes. A negative value disables retention in this pool.
+	RetentionInterval time.Duration
 	// HeartbeatInterval controls how often active claims renew their lease. It
 	// defaults to one third of StuckJobTimeout. A negative value disables it.
 	HeartbeatInterval time.Duration
@@ -375,6 +383,10 @@ func newWorkerPool[TTx any](d driver.Driver[TTx], registry *core.Registry, cfg W
 	if cfg.RateLimitPollInterval <= 0 {
 		cfg.RateLimitPollInterval = time.Second
 	}
+	if cfg.RetentionInterval == 0 {
+		cfg.RetentionInterval = 5 * time.Minute
+	}
+	cfg.Retention = cfg.Retention.withDefaults(DefaultRetentionPolicy)
 	if cfg.StuckJobTimeout == 0 {
 		cfg.StuckJobTimeout = time.Hour
 	}
@@ -597,10 +609,48 @@ func (p *WorkerPool[TTx]) Start(ctx context.Context) error {
 	if p.isShuttingDown.Load() {
 		return fmt.Errorf("worker pool is shutting down")
 	}
+	if stop := p.startRetention(ctx); stop != nil {
+		defer stop()
+	}
 	if listener := p.driver.Listener(); listener != nil {
 		return p.runWithNotifications(ctx, listener)
 	}
 	return p.runWithPolling(ctx)
+}
+
+// startRetention runs RunRetention beside the pool and returns a function
+// that stops it. It returns nil when retention is disabled or the driver
+// cannot list jobs.
+func (p *WorkerPool[TTx]) startRetention(ctx context.Context) func() {
+	if p.config.RetentionInterval < 0 {
+		return nil
+	}
+	exec := p.driver.Executor()
+	_, lists := exec.(driver.AdminExecutor)
+	_, prunes := exec.(driver.JobPruner)
+	if !lists && !prunes {
+		return nil
+	}
+	retentionCtx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	maintenance := NewMaintenance(p.driver, MaintenanceConfig{Clock: p.config.Clock})
+	go func() {
+		defer close(done)
+		_ = maintenance.RunRetention(retentionCtx, RetentionRunConfig{
+			Policy:   p.config.Retention,
+			Interval: p.config.RetentionInterval,
+			WorkerID: p.config.WorkerID,
+			OnPrune: func(_ PruneResult, err error) {
+				if err != nil {
+					p.reportError(fmt.Errorf("retention: %w", err))
+				}
+			},
+		})
+	}()
+	return func() {
+		cancel()
+		<-done
+	}
 }
 
 // drainOnCancel shuts the pool down after Start's context ends, waiting up to

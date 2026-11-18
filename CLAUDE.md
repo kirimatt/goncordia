@@ -130,7 +130,7 @@ wp := goncordia.NewWorkerPool(d, registry, goncordia.WorkerConfig{Observer: m}) 
 billing := &Billing{sum: future.Bind(m, client, Sum)} // *future.Func[SumArgs, int]
 
 // application code: no type parameters, no queue client
-total, err := b.sum.Call(ctx, SumArgs{A: 2, B: 3}) // errors.Is(err, future.ErrDiscarded / ErrCancelled / ErrNoResult / ErrNotFound)
+total, err := b.sum.Call(ctx, SumArgs{A: 2, B: 3}) // deletes the job after a value; errors.Is(err, future.ErrDiscarded / ErrCancelled / ErrNoResult / ErrNotFound)
 f, err := b.sum.With(&core.InsertOpts{Queue: "critical"}).Enqueue(ctx, args) // wait later with f.Await
 ```
 
@@ -197,7 +197,8 @@ Workers on these backends must be **idempotent** — a job may be executed more 
 
 - **Redis / Cassandra / ClickHouse / DynamoDB**: `EnqueueTx` is rejected. Use the post-commit enqueue pattern for at-least-once delivery.
 - **Redis eviction**: `Migrate` fails with `redisdriver.ErrEvictionPolicy` under an `allkeys-*` `maxmemory-policy`, which could drop jobs and results. Use `noeviction` (or `volatile-*`); `WithAllowEviction()` opts out. An evicted result surfaces as `future.ErrResultLost`.
-- **Retention**: nothing is pruned automatically. Run `maintenance.RunRetention(ctx, goncordia.RetentionRunConfig{Policy: ...})` in every instance (leader-elected); `RetentionPolicy.Results` expires future results before job rows.
+- **Retention**: worker pools prune by default (`goncordia.DefaultRetentionPolicy`: completed/cancelled 24h, discarded 7d, future results 1h) under a shared leader lease. Override with `WorkerConfig.Retention` (zero = default, `goncordia.KeepForever` = keep), disable with `RetentionInterval: -1`. Without a pool, run `maintenance.RunRetention`.
+- **Futures cleanup**: `Func.Call` deletes its job and result after returning a value (not unique or failed jobs); `future.Config.KeepCalledJobs` keeps them.
 - **MongoDB**: requires a replica set; standalone MongoDB will fail at `New()`.
 - **SQLite**: set `db.SetMaxOpenConns(1)` — SQLite allows only one writer.
 - **Firestore**: `Migrate` is a no-op; create the composite index manually in Firebase console: collection `goncordia_jobs`, fields `queue ASC, state ASC, run_at ASC`.

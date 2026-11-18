@@ -25,8 +25,23 @@ type MaintenanceConfig struct {
 	Clock clock.Clock
 }
 
+// KeepForever as a RetentionPolicy duration keeps that state forever. In
+// WorkerConfig.Retention, where zero means the default, it is the way to turn
+// a state off.
+const KeepForever time.Duration = -1
+
+// DefaultRetentionPolicy is what worker pools apply unless WorkerConfig
+// overrides it: a day of completed and cancelled jobs, a week of discarded
+// ones for dead-letter inspection, and an hour of future results.
+var DefaultRetentionPolicy = RetentionPolicy{
+	Completed: 24 * time.Hour,
+	Discarded: 7 * 24 * time.Hour,
+	Cancelled: 24 * time.Hour,
+	Results:   time.Hour,
+}
+
 // RetentionPolicy configures how long terminal jobs remain available. A zero
-// duration disables pruning for that state.
+// duration or KeepForever disables pruning for that state.
 type RetentionPolicy struct {
 	Completed time.Duration
 	Discarded time.Duration
@@ -36,6 +51,33 @@ type RetentionPolicy struct {
 	// result storage early, including results nobody awaited. It has no
 	// effect when it is not shorter than Completed.
 	Results time.Duration
+}
+
+// withDefaults fills zero fields from defaults.
+func (p RetentionPolicy) withDefaults(defaults RetentionPolicy) RetentionPolicy {
+	fill := func(v *time.Duration, d time.Duration) {
+		if *v == 0 {
+			*v = d
+		}
+	}
+	fill(&p.Completed, defaults.Completed)
+	fill(&p.Discarded, defaults.Discarded)
+	fill(&p.Cancelled, defaults.Cancelled)
+	fill(&p.Results, defaults.Results)
+	return p
+}
+
+// normalize validates the policy and maps KeepForever to zero.
+func (p RetentionPolicy) normalize() (RetentionPolicy, error) {
+	for _, v := range []*time.Duration{&p.Completed, &p.Discarded, &p.Cancelled, &p.Results} {
+		switch {
+		case *v == KeepForever:
+			*v = 0
+		case *v < 0:
+			return p, fmt.Errorf("retention duration must not be negative (use KeepForever)")
+		}
+	}
+	return p, nil
 }
 
 // PruneResult summarizes a retention pass.
@@ -69,10 +111,12 @@ func NewMaintenance[TTx any](d driver.Driver[TTx], cfg MaintenanceConfig) *Maint
 // Prune deletes terminal jobs finalized on or before each configured cutoff,
 // and the stored results of completed jobs older than policy.Results.
 func (m *Maintenance[TTx]) Prune(ctx context.Context, policy RetentionPolicy) (PruneResult, error) {
-	for _, duration := range []time.Duration{policy.Completed, policy.Discarded, policy.Cancelled, policy.Results} {
-		if duration < 0 {
-			return PruneResult{}, fmt.Errorf("retention duration must not be negative")
-		}
+	policy, err := policy.normalize()
+	if err != nil {
+		return PruneResult{}, err
+	}
+	if pruner, ok := m.driver.Executor().(driver.JobPruner); ok {
+		return m.pruneIndexed(ctx, pruner, policy)
 	}
 	admin, ok := m.driver.Executor().(driver.AdminExecutor)
 	if !ok {
@@ -137,6 +181,50 @@ func (m *Maintenance[TTx]) Prune(ctx context.Context, policy RetentionPolicy) (P
 	return result, errors.Join(errs...)
 }
 
+// pruneIndexed applies policy through a driver index, page by page, so the
+// cost follows the number of expired jobs rather than all retained ones.
+func (m *Maintenance[TTx]) pruneIndexed(ctx context.Context, pruner driver.JobPruner, policy RetentionPolicy) (PruneResult, error) {
+	now := m.clock.Now()
+	var result PruneResult
+	drain := func(prune func(context.Context, driver.JobPruneParams) (int, error), params driver.JobPruneParams, counter *int) error {
+		params.Limit = maintenancePageSize
+		for {
+			n, err := prune(ctx, params)
+			*counter += n
+			result.Scanned += n
+			if err != nil {
+				return err
+			}
+			if n < params.Limit {
+				return nil
+			}
+		}
+	}
+	for _, item := range []struct {
+		state    driver.JobState
+		duration time.Duration
+	}{
+		{driver.JobStateCompleted, policy.Completed},
+		{driver.JobStateDiscarded, policy.Discarded},
+		{driver.JobStateCancelled, policy.Cancelled},
+	} {
+		if item.duration == 0 {
+			continue
+		}
+		params := driver.JobPruneParams{State: item.state, Before: now.Add(-item.duration)}
+		if err := drain(pruner.JobPruneFinalized, params, &result.Deleted); err != nil {
+			return result, fmt.Errorf("prune %s jobs: %w", item.state, err)
+		}
+	}
+	if policy.Results > 0 {
+		params := driver.JobPruneParams{State: driver.JobStateCompleted, Before: now.Add(-policy.Results)}
+		if err := drain(pruner.JobResultPrune, params, &result.ResultsDeleted); err != nil {
+			return result, fmt.Errorf("prune results: %w", err)
+		}
+	}
+	return result, nil
+}
+
 // deleteResult removes a stored result and reports whether one existed, so
 // repeated passes do not count results that are already gone.
 func deleteResult(ctx context.Context, store driver.JobResultStore, jobID string) (bool, error) {
@@ -172,10 +260,11 @@ type RetentionRunConfig struct {
 // time, and another takes over if the leader stops. The first pass runs
 // immediately. It returns ctx's error, or a configuration error at once.
 func (m *Maintenance[TTx]) RunRetention(ctx context.Context, cfg RetentionRunConfig) error {
-	for _, duration := range []time.Duration{cfg.Policy.Completed, cfg.Policy.Discarded, cfg.Policy.Cancelled, cfg.Policy.Results, cfg.Interval, cfg.LeaderTTL} {
-		if duration < 0 {
-			return fmt.Errorf("retention durations must not be negative")
-		}
+	if _, err := cfg.Policy.normalize(); err != nil {
+		return err
+	}
+	if cfg.Interval < 0 || cfg.LeaderTTL < 0 {
+		return fmt.Errorf("retention interval and leader TTL must not be negative")
 	}
 	if cfg.Interval == 0 {
 		cfg.Interval = time.Hour

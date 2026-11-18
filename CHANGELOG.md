@@ -10,12 +10,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added (driver/redis)
-- `Migrate` rejects an `allkeys-*` `maxmemory-policy` with
-  `redisdriver.ErrEvictionPolicy`, since eviction can drop jobs and results;
-  `WithAllowEviction()` opts out, and the check is skipped when `CONFIG` is
-  blocked.
-- A stored result that was evicted is reported as `driver.ErrResultLost`
-  (still matching `driver.ErrNotFound`); `Forget` clears the marker.
+- Retention indexes (terminal jobs by finalization time, results by write
+  time) and `driver.JobPruner`, so retention reads only expired entries
+  instead of every job. `Migrate` backfills them; run it again after a
+  rolling upgrade.
+
+---
+
+## [v2.5.0] — 2026-11-18
+
+### Changed
+- **Worker pools now prune old jobs by default**, on every driver, under a
+  shared leader lease (`goncordia.DefaultRetentionPolicy`): completed and
+  cancelled jobs after 24 hours, discarded jobs after 7 days, future results
+  after 1 hour. Set `WorkerConfig.Retention` to change it
+  (`goncordia.KeepForever` keeps a state) or `RetentionInterval: -1` to
+  disable it. Before upgrading, check that nothing relies on keeping
+  terminal jobs longer.
+- `future.Func.Call` deletes its job and result after returning a value, since
+  the job ID never leaves the call. Unique and failed jobs stay;
+  `future.Config.KeepCalledJobs` keeps all.
+
+### Added
+- `goncordia.KeepForever`, `goncordia.DefaultRetentionPolicy`,
+  `WorkerConfig.Retention`, and `WorkerConfig.RetentionInterval`.
+- `driver.JobPruner`: an optional executor capability that lets retention
+  delete expired jobs and results from an index instead of listing all jobs.
+- `drivertest.RunRetention` checks retention against a driver; every built-in
+  driver runs it.
 
 ---
 
@@ -32,6 +54,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`go.mongodb.org/mongo-driver/v2` v2.10.0). `New` takes a v2
   `*mongo.Client`, and the transaction type is `*mongo.Session`. It uses the
   same collections as `driver/mongodb`, so processes can migrate one by one.
+
+### Added (driver/redis v2.4.0)
+- `Migrate` rejects an `allkeys-*` `maxmemory-policy` with
+  `redisdriver.ErrEvictionPolicy`; `WithAllowEviction()` opts out, and the
+  check is skipped when `CONFIG` is blocked.
+- An evicted result is reported as `driver.ErrResultLost`.
 
 ### Deprecated
 - `driver/mongodb`, which uses the deprecated mongo-driver v1. Use

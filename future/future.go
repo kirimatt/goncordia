@@ -61,11 +61,16 @@ type Config struct {
 	Clock clock.Clock
 	// Observer receives await and result-store events for metrics and traces.
 	Observer Observer
+	// KeepCalledJobs keeps the job and result after Func.Call returns a
+	// value. By default Call deletes them: its job ID never reaches the
+	// caller, so nobody can await it again.
+	KeepCalledJobs bool
 }
 
 // jobReader is the part of driver.Executor that futures need.
 type jobReader interface {
 	JobGetByID(ctx context.Context, id string) (*driver.JobRow, error)
+	JobDelete(ctx context.Context, id string) error
 }
 
 // Manager connects futures, result storage, and local completion signals. One
@@ -79,6 +84,7 @@ type Manager struct {
 	clock    clock.Clock
 	poll     time.Duration
 	observer Observer
+	keepCall bool
 
 	mu      sync.Mutex
 	waiters map[string]map[chan struct{}]struct{}
@@ -110,6 +116,7 @@ func New[TTx any](d driver.Driver[TTx], cfg Config) (*Manager, error) {
 		clock:    cfg.Clock,
 		poll:     cfg.PollInterval,
 		observer: cfg.Observer,
+		keepCall: cfg.KeepCalledJobs,
 		waiters:  make(map[string]map[chan struct{}]struct{}),
 	}, nil
 }
@@ -118,6 +125,17 @@ func New[TTx any](d driver.Driver[TTx], cfg Config) (*Manager, error) {
 // consumed if the job row itself is retained.
 func (m *Manager) Forget(ctx context.Context, jobID string) error {
 	return m.store.JobResultDelete(ctx, jobID)
+}
+
+// release deletes the job and result behind a consumed Call. A unique job may
+// be followed by other callers, so it stays for retention. Failures are
+// ignored: retention removes the job later.
+func (m *Manager) release(ctx context.Context, jobID string, unique bool) {
+	if m.keepCall || unique {
+		return
+	}
+	_ = m.store.JobResultDelete(ctx, jobID)
+	_ = m.jobs.JobDelete(ctx, jobID)
 }
 
 // Enqueue inserts args through client and returns a Future for its result.
@@ -150,7 +168,7 @@ func attach[R any](m *Manager, result *driver.JobInsertResult, args core.JobArgs
 	if result == nil || result.Job == nil || result.Job.ID == "" {
 		return nil, errors.New("goncordia/future: driver returned no job for the insert")
 	}
-	return &Future[R]{m: m, id: result.Job.ID, kind: args.Kind()}, nil
+	return &Future[R]{m: m, id: result.Job.ID, kind: args.Kind(), unique: result.Job.UniqueKey != ""}, nil
 }
 
 // Future is the pending result of one job. Terminal outcomes are cached, so
@@ -159,6 +177,8 @@ type Future[R any] struct {
 	m    *Manager
 	id   string
 	kind string
+	// unique jobs may be shared with other callers, so Call keeps them.
+	unique bool
 
 	mu       sync.Mutex
 	resolved bool

@@ -21,8 +21,12 @@ Declare `future.Define[Args, Result]()` once; workers `Register` a handler, appl
 var Sum = future.Define[SumArgs, int]()
 Sum.Register(registry, m, sumHandler, core.WorkerOpts{})
 sum := future.Bind(m, client, Sum)
-total, err := sum.Call(ctx, SumArgs{A: 2, B: 3})
+total, err := sum.Call(ctx, SumArgs{A: 2, B: 3}) // deletes its job after returning a value
 ```
+
+## Retention
+
+Worker pools prune by default on every driver, under a shared leader lease: completed and cancelled jobs after 24h, discarded after 7 days, future results after 1h. Tune with `WorkerConfig.Retention` (`goncordia.KeepForever` keeps a state) or disable with a negative `RetentionInterval`.
 
 ## Supported backends
 
