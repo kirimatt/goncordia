@@ -9,16 +9,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Added (driver/redis)
-- Retention indexes (terminal jobs by finalization time, results by write
-  time) and `driver.JobPruner`, so retention reads only expired entries
-  instead of every job. `Migrate` backfills them; run it again after a
-  rolling upgrade.
-
-### Fixed (driver/firestore)
-- `JobGetByID` returns `driver.ErrNotFound` for a missing job instead of
-  `(nil, nil)`.
-
 ---
 
 ## [v2.5.1] — 2026-11-18
@@ -29,6 +19,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   when awaiting a job that retention had deleted.
 - The `Executor` contract now states that `JobGetByID` reports a missing job
   with `driver.ErrNotFound`, and `drivertest.Run` checks it.
+
+### Added (driver/redis v2.5.1)
+- Retention indexes (terminal jobs by finalization time, results by write
+  time) and `driver.JobPruner`, so retention reads only expired entries
+  instead of every job. `Migrate` backfills them; run it again after a
+  rolling upgrade.
+
+### Fixed (driver/firestore v2.5.1)
+- `JobGetByID` returns `driver.ErrNotFound` for a missing job instead of
+  `(nil, nil)`.
 
 ---
 
