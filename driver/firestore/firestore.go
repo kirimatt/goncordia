@@ -73,9 +73,14 @@ func New(client *firestore.Client, opts ...Option) *Driver {
 }
 
 // Migrate is a no-op for Firestore — collections are created automatically on first write.
-// For production, create a composite index on goncordia_jobs:
+// For production, create two composite indexes on goncordia_jobs:
 //
-//	fields: queue (ASC), state (ASC), run_at (ASC)
+//	fields: queue (ASC), state (ASC), run_at (ASC)   // fetching jobs
+//	fields: state (ASC), finalized_at (ASC)          // retention
+//
+// For example:
+//
+//	gcloud firestore indexes composite create --collection-group=goncordia_jobs //	  --field-config=field-path=state,order=ascending //	  --field-config=field-path=finalized_at,order=ascending
 func (d *Driver) Migrate(_ context.Context) error { return nil }
 
 func (d *Driver) Name() string { return "firestore" }
