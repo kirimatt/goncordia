@@ -408,6 +408,32 @@ func RunScheduled(t *testing.T, exec driver.Executor, clk *clock.Manual) {
 	if claimed.ID != id || claimed.State != driver.JobStateRunning || claimed.RunAt.After(clk.Now()) {
 		t.Fatalf("claim due scheduled job: %+v", claimed)
 	}
+
+	// JobReschedule moves a scheduled job: it is not claimable at its old
+	// run_at and is claimable at the new one.
+	moved, err := exec.JobInsertMany(ctx, []driver.JobInsertParams{{
+		Queue: queue, Kind: "scheduled-conformance", Args: []byte(`{"value":2}`),
+		RunAt: clk.Now().Add(time.Hour),
+	}})
+	if err != nil || len(moved) != 1 || moved[0].Job == nil {
+		t.Fatalf("insert job to reschedule: results=%+v err=%v", moved, err)
+	}
+	movedID := moved[0].Job.ID
+	t.Cleanup(func() { _ = exec.JobDelete(context.Background(), movedID) })
+	if err := exec.JobReschedule(ctx, driver.RescheduleParams{ID: movedID, RunAt: clk.Now().Add(2 * time.Hour)}); err != nil {
+		t.Fatalf("reschedule: %v", err)
+	}
+	clk.Advance(time.Hour)
+	rows, err = exec.JobFetchBatch(ctx, driver.FetchParams{
+		Queue: queue, Limit: 1, WorkerID: "scheduled-conformance-worker", LeaseDuration: time.Minute,
+	})
+	if err != nil || len(rows) != 0 {
+		t.Fatalf("rescheduled job claimable at its old run_at: %+v, %v", rows, err)
+	}
+	clk.Advance(time.Hour)
+	if claimed := fetchEventually(t, ctx, exec, queue); claimed.ID != movedID {
+		t.Fatalf("claimed %s after reschedule, want %s", claimed.ID, movedID)
+	}
 }
 
 func waitUntil(t *testing.T, condition func() bool, label string) {

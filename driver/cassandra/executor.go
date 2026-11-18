@@ -74,8 +74,12 @@ func (e *executor) JobResultPut(ctx context.Context, jobID string, value []byte)
 	if value == nil {
 		value = []byte{}
 	}
-	return e.session.Query(`INSERT INTO goncordia_job_results (job_id, value, updated_at) VALUES (?, ?, ?)`,
-		jobID, value, e.clk.Now()).WithContext(ctx).Exec()
+	now := e.clk.Now()
+	if err := e.session.Query(`INSERT INTO goncordia_job_results (job_id, value, updated_at) VALUES (?, ?, ?)`,
+		jobID, value, now).WithContext(ctx).Exec(); err != nil {
+		return err
+	}
+	return recordResult(ctx, e.session, now, jobID)
 }
 
 // JobResultGet returns a stored result or driver.ErrNotFound.
@@ -775,6 +779,9 @@ func jobSetStateIfRunning(ctx context.Context, session *gocql.Session, clk clock
 	if err := deleteRunningLookup(ctx, session, j); err != nil {
 		return err
 	}
+	if err := recordFinalized(ctx, session, params.State, now, params.ID); err != nil {
+		return err
+	}
 	if j.UniqueKey != "" && !driver.IsPermanentUniqueKey(j.UniqueKey) {
 		return session.Query(`DELETE FROM goncordia_uniq_v2 WHERE ukey=?`,
 			j.UniqueKey).WithContext(ctx).Exec()
@@ -821,6 +828,9 @@ func jobCancel(ctx context.Context, session *gocql.Session, clk clock.Clock, id 
 	}
 	if !applied {
 		return fmt.Errorf("%w: job %q changed before cancellation", driver.ErrConflict, id)
+	}
+	if err := recordFinalized(ctx, session, driver.JobStateCancelled, now, id); err != nil {
+		return err
 	}
 
 	// Clean up avail lookup if it was available (not scheduled).
@@ -875,21 +885,26 @@ func jobReschedule(ctx context.Context, session *gocql.Session, params driver.Re
 		return err
 	}
 
-	oldState := j.State
-	oldRunAt := j.RunAt
-
-	if err := session.Query(
-		`UPDATE goncordia_jobs SET state=?, run_at=?, version=version+1 WHERE id=?`,
-		string(driver.JobStateScheduled), params.RunAt, params.ID,
-	).WithContext(ctx).Exec(); err != nil {
+	applied, err := session.Query(
+		`UPDATE goncordia_jobs SET state=?, run_at=?, version=? WHERE id=? IF version=?`,
+		string(driver.JobStateScheduled), params.RunAt, j.Version+1, params.ID, j.Version,
+	).WithContext(ctx).MapScanCAS(map[string]interface{}{})
+	if err != nil {
 		return err
 	}
-
-	if oldState == string(driver.JobStateAvailable) {
-		_ = session.Query(`DELETE FROM goncordia_jobs_avail WHERE queue=? AND run_at=? AND priority=? AND id=?`,
-			j.Queue, oldRunAt, j.Priority, params.ID).WithContext(ctx).Exec()
+	if !applied {
+		return fmt.Errorf("%w: job %q changed before rescheduling", driver.ErrConflict, params.ID)
 	}
-	return nil
+
+	// The run_at lookup holds available and scheduled jobs; move the entry.
+	if j.State == string(driver.JobStateAvailable) || j.State == string(driver.JobStateScheduled) {
+		if err := session.Query(`DELETE FROM goncordia_jobs_avail WHERE queue=? AND run_at=? AND priority=? AND id=?`,
+			j.Queue, j.RunAt, j.Priority, params.ID).WithContext(ctx).Exec(); err != nil {
+			return err
+		}
+	}
+	return session.Query(`INSERT INTO goncordia_jobs_avail (queue, run_at, priority, id) VALUES (?, ?, ?, ?)`,
+		j.Queue, params.RunAt, j.Priority, params.ID).WithContext(ctx).Exec()
 }
 
 // ---- Queue ----

@@ -108,7 +108,7 @@ tx.Commit(ctx)  // job and order appear atomically
 Requires Go 1.26 or newer.
 
 ```bash
-go get github.com/kirimatt/goncordia/v2@v2.6.0
+go get github.com/kirimatt/goncordia/v2@v2.7.0
 ```
 
 Pick a driver:
@@ -133,16 +133,16 @@ go get github.com/kirimatt/goncordia/driver/mongodbv2/v2@v2.6.0
 go get github.com/kirimatt/goncordia/driver/redis/v2@v2.5.1
 
 # Cassandra / ScyllaDB
-go get github.com/kirimatt/goncordia/driver/cassandra/v2@v2.2.0
+go get github.com/kirimatt/goncordia/driver/cassandra/v2@v2.7.0
 
 # ClickHouse
-go get github.com/kirimatt/goncordia/driver/clickhouse/v2@v2.2.0
+go get github.com/kirimatt/goncordia/driver/clickhouse/v2@v2.7.0
 
 # Amazon DynamoDB
-go get github.com/kirimatt/goncordia/driver/dynamodb/v2@v2.2.0
+go get github.com/kirimatt/goncordia/driver/dynamodb/v2@v2.7.0
 
 # Cloud Firestore
-go get github.com/kirimatt/goncordia/driver/firestore/v2@v2.5.1
+go get github.com/kirimatt/goncordia/driver/firestore/v2@v2.7.0
 ```
 
 The root v1 module intentionally does not download every database SDK. Driver,
@@ -390,8 +390,9 @@ import (
 fsClient, _ := firestore.NewClient(ctx, "my-gcp-project")
 defer fsClient.Close()
 d := firestoredriver.New(fsClient)
-// Migrate is a no-op; create composite index in Firebase console:
+// Migrate is a no-op; create two composite indexes in Firebase console:
 //   collection: goncordia_jobs, fields: queue (ASC), state (ASC), run_at (ASC)
+//   collection: goncordia_jobs, fields: state (ASC), finalized_at (ASC)   // retention
 d.Migrate(ctx)
 
 client := firestoredriver.NewClient(d, goncordia.ClientConfig{})
@@ -915,7 +916,10 @@ How a pass finds expired jobs depends on the driver:
 | Driver | How retention finds expired jobs |
 |---|---|
 | pgxv5, stdlib (Postgres, MySQL, SQLite), gorm, bun, MongoDB, Redis | index on state and finalization time, batched deletes (`driver.JobPruner`) |
-| Cassandra, ClickHouse, DynamoDB, Firestore | lists terminal jobs page by page; each page currently reads all retained jobs, so a pass grows quadratically. Indexed pruning for these drivers is planned for the next release |
+| DynamoDB | sparse GSI `gsi_retention` on terminal jobs, sharded 16 ways; created by `Migrate` |
+| Firestore | composite index `state ASC, finalized_at ASC` on `goncordia_jobs` (create it yourself, like the fetch index); results use the automatic `updated_at` index |
+| Cassandra | lookup tables `goncordia_jobs_finalized` and `goncordia_results_written`, read from a stored watermark so deleted rows' tombstones are not rescanned |
+| ClickHouse | data-skipping indexes on `state`, `finalized_at`, `id`, and result `updated_at`; expired rows are removed physically with lightweight `DELETE`, including rows that `JobDelete` only marked deleted |
 | memory | scans in process memory |
 
 On SQL and MongoDB, `Migrate` creates the retention indexes
