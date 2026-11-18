@@ -65,6 +65,9 @@ type redisJob struct {
 	Tags             []string          `json:"tags"`
 	Errors           []redisAttemptErr `json:"errors"`
 	PipelineID       string            `json:"pipeline_id,omitempty"`
+	// HasResult marks that a future result was stored, so a missing result
+	// key can be told apart from a job that never produced one.
+	HasResult bool `json:"has_result,omitempty"`
 }
 
 // millis accepts the scientific notation emitted by Redis's embedded cjson
@@ -256,11 +259,37 @@ redis.call('ZADD', KEYS[2], score, ARGV[1])
 return 1
 `)
 
+// putResultScript stores a result only while the job exists and marks the job
+// with has_result in the same atomic step.
 var putResultScript = redis.NewScript(`
-if redis.call('EXISTS', KEYS[1]) == 0 then
-  return 0
+local raw = redis.call('GET', KEYS[1])
+if not raw then return 0 end
+local ok, job = pcall(cjson.decode, raw)
+if not ok then return redis.error_reply('goncordia: corrupt job document') end
+if job.has_result ~= true then
+  job.has_result = true
+  if type(job.tags) == 'table' and next(job.tags) == nil then job.tags = cjson.empty_array end
+  if type(job.errors) == 'table' and next(job.errors) == nil then job.errors = cjson.empty_array end
+  cjson.encode_number_precision(14)
+  redis.call('SET', KEYS[1], cjson.encode(job))
 end
 redis.call('SET', KEYS[2], ARGV[1])
+return 1
+`)
+
+// deleteResultScript removes a result and clears has_result, so a deliberate
+// delete is not reported as a lost result.
+var deleteResultScript = redis.NewScript(`
+redis.call('DEL', KEYS[2])
+local raw = redis.call('GET', KEYS[1])
+if not raw then return 0 end
+local ok, job = pcall(cjson.decode, raw)
+if not ok or job.has_result ~= true then return 0 end
+job.has_result = nil
+if type(job.tags) == 'table' and next(job.tags) == nil then job.tags = cjson.empty_array end
+if type(job.errors) == 'table' and next(job.errors) == nil then job.errors = cjson.empty_array end
+cjson.encode_number_precision(14)
+redis.call('SET', KEYS[1], cjson.encode(job))
 return 1
 `)
 
@@ -377,18 +406,29 @@ func (e *executor) JobResultPut(ctx context.Context, jobID string, value []byte)
 	return nil
 }
 
-// JobResultGet returns a stored result or driver.ErrNotFound.
+// JobResultGet returns a stored result or driver.ErrNotFound. A result that
+// was stored but is missing, typically evicted under an allkeys-* maxmemory
+// policy, also matches driver.ErrResultLost.
 func (e *executor) JobResultGet(ctx context.Context, jobID string) ([]byte, error) {
 	value, err := e.rdb.Get(ctx, resultKey(jobID)).Bytes()
-	if errors.Is(err, redis.Nil) {
-		return nil, fmt.Errorf("%w: result for job %q", driver.ErrNotFound, jobID)
+	if !errors.Is(err, redis.Nil) {
+		return value, err
 	}
-	return value, err
+	raw, jobErr := e.rdb.Get(ctx, jobKey(jobID)).Bytes()
+	if jobErr == nil {
+		var job redisJob
+		if json.Unmarshal(raw, &job) == nil && job.HasResult {
+			return nil, fmt.Errorf("%w: %w: result for job %q", driver.ErrResultLost, driver.ErrNotFound, jobID)
+		}
+	} else if !errors.Is(jobErr, redis.Nil) {
+		return nil, jobErr
+	}
+	return nil, fmt.Errorf("%w: result for job %q", driver.ErrNotFound, jobID)
 }
 
 // JobResultDelete removes a stored result. Missing results are ignored.
 func (e *executor) JobResultDelete(ctx context.Context, jobID string) error {
-	return e.rdb.Del(ctx, resultKey(jobID)).Err()
+	return deleteResultScript.Run(ctx, e.rdb, []string{jobKey(jobID), resultKey(jobID)}).Err()
 }
 
 func (e *executor) JobDelete(ctx context.Context, id string) error {
