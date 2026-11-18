@@ -3,12 +3,25 @@
 [![CI](https://github.com/kirimatt/goncordia/actions/workflows/ci.yml/badge.svg)](https://github.com/kirimatt/goncordia/actions/workflows/ci.yml)
 [![Go Reference](https://pkg.go.dev/badge/github.com/kirimatt/goncordia/v2.svg)](https://pkg.go.dev/github.com/kirimatt/goncordia/v2)
 [![GitHub release](https://img.shields.io/github/v/tag/kirimatt/goncordia?label=version)](https://github.com/kirimatt/goncordia/releases)
+[![Go version](https://img.shields.io/github/go-mod/go-version/kirimatt/goncordia)](go.mod)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-[Changelog](CHANGELOG.md)
+[Changelog](CHANGELOG.md) · [API reference](https://pkg.go.dev/github.com/kirimatt/goncordia/v2) · [Migrating to v2](MIGRATING_TO_V2.md)
 
-A job queue engine for Go that works with the database you already have.
+**A background job queue for Go that runs on the database you already have.**
+Enqueue jobs in the same transaction as your data, process them with retries,
+schedules, and priorities, and await a job's typed result when you need it —
+on Postgres, MySQL, SQLite, MongoDB, Redis, Cassandra, ClickHouse, DynamoDB,
+Firestore, or in memory. No new broker to run.
 
-One `Driver[TTx]` interface parameterized by your library's native transaction type covers Postgres, MySQL, SQLite, MongoDB, Redis, Cassandra, ClickHouse, DynamoDB, Firestore, and in-memory — without forcing you to adopt a new dependency.
+Use it for the jobs a Go service sends to the background: emails and
+notifications, webhooks, report and thumbnail generation, syncing with
+external APIs, and periodic cleanups. It covers the role of Sidekiq or Celery
+in Go, plus the transactional outbox pattern.
+
+One `Driver[TTx]` interface, parameterized by your database library's native
+transaction type (`pgx.Tx`, `*sql.Tx`, `*gorm.DB`, `bun.Tx`, `*mongo.Session`,
+…), connects the client and workers to storage without an adapter layer.
 
 `EnqueueTx` implements the [transactional outbox pattern](https://microservices.io/patterns/data/transactional-outbox.html): the job is written inside your existing transaction and becomes visible to workers only after commit. If the transaction rolls back, the job disappears — no separate relay process, no dual-write risk.
 
@@ -102,19 +115,19 @@ Pick a driver:
 
 ```bash
 # PostgreSQL via pgx v5
-go get github.com/kirimatt/goncordia/driver/pgxv5/v2@v2.2.0
+go get github.com/kirimatt/goncordia/driver/pgxv5/v2@v2.6.0
 
 # PostgreSQL / MySQL / SQLite via database/sql
-go get github.com/kirimatt/goncordia/driver/stdlib/v2@v2.2.0
+go get github.com/kirimatt/goncordia/driver/stdlib/v2@v2.6.0
 
 # gorm adapter
-go get github.com/kirimatt/goncordia/driver/gorm/v2@v2.2.0
+go get github.com/kirimatt/goncordia/driver/gorm/v2@v2.6.0
 
 # bun adapter
-go get github.com/kirimatt/goncordia/driver/bun/v2@v2.2.0
+go get github.com/kirimatt/goncordia/driver/bun/v2@v2.6.0
 
 # MongoDB (replica set required)
-go get github.com/kirimatt/goncordia/driver/mongodbv2/v2@v2.3.0
+go get github.com/kirimatt/goncordia/driver/mongodbv2/v2@v2.6.0
 
 # Redis
 go get github.com/kirimatt/goncordia/driver/redis/v2@v2.5.1
@@ -1247,7 +1260,7 @@ _ = pool.Shutdown(context.Background())
 ## Observability (OpenTelemetry)
 
 ```bash
-go get github.com/kirimatt/goncordia/otel/v2@v2.2.0
+go get github.com/kirimatt/goncordia/otel/v2@v2.6.0
 ```
 
 ```go
