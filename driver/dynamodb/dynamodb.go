@@ -172,7 +172,7 @@ func (d *Driver) Migrate(ctx context.Context) error {
 			return fmt.Errorf("dynamodb migrate: wait %s: %w", *input.TableName, err)
 		}
 	}
-	return d.migrateRetention(ctx)
+	return nil
 }
 
 func (d *Driver) Name() string { return "dynamodb" }

@@ -6,10 +6,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
-	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
-
 	dynamodbdriver "github.com/kirimatt/goncordia/driver/dynamodb/v2"
 	goncordia "github.com/kirimatt/goncordia/v2"
 	"github.com/kirimatt/goncordia/v2/clock"
@@ -47,10 +43,10 @@ func finishJob(t *testing.T, exec driver.Executor, state driver.JobState, result
 	return rows[0].ID
 }
 
-// TestDynamoDB_RetentionIndexUpgrade drops gsi_retention and the index keys
-// of an existing job, as on a table from before v2.7.0, and checks that
-// Migrate restores the index and backfills the job.
-func TestDynamoDB_RetentionIndexUpgrade(t *testing.T) {
+// TestDynamoDB_RetentionIndex checks the gsi_retention buckets: a result
+// pass moves a job out of completed_result so the next pass skips it, and a
+// rescheduled job leaves the index.
+func TestDynamoDB_RetentionIndex(t *testing.T) {
 	svc, cleanup := newTestClient(t)
 	defer cleanup()
 	ctx := context.Background()
@@ -61,43 +57,20 @@ func TestDynamoDB_RetentionIndexUpgrade(t *testing.T) {
 	exec := d.Executor()
 	done := finishJob(t, exec, driver.JobStateCompleted, true)
 	revived := finishJob(t, exec, driver.JobStateDiscarded, false)
-
-	if _, err := svc.UpdateItem(ctx, &dynamodb.UpdateItemInput{
-		TableName:        aws.String("goncordia_jobs"),
-		Key:              map[string]types.AttributeValue{"id": &types.AttributeValueMemberS{Value: done}},
-		UpdateExpression: aws.String("REMOVE rt_pk, rt_at, has_result"),
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := svc.DeleteItem(ctx, &dynamodb.DeleteItemInput{
-		TableName: aws.String("goncordia_schedule_cursors"),
-		Key:       map[string]types.AttributeValue{"id": &types.AttributeValueMemberS{Value: "goncordia:migration:retention-v1"}},
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := svc.UpdateTable(ctx, &dynamodb.UpdateTableInput{
-		TableName:                   aws.String("goncordia_jobs"),
-		GlobalSecondaryIndexUpdates: []types.GlobalSecondaryIndexUpdate{{Delete: &types.DeleteGlobalSecondaryIndexAction{IndexName: aws.String("gsi_retention")}}},
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if err := d.Migrate(ctx); err != nil {
-		t.Fatalf("Migrate on an old table: %v", err)
-	}
-
-	// Retrying a discarded job takes it out of the index.
 	if err := exec.JobReschedule(ctx, driver.RescheduleParams{ID: revived, RunAt: time.Now().Add(time.Hour)}); err != nil {
 		t.Fatal(err)
 	}
+
 	m := goncordia.NewMaintenance(d, goncordia.MaintenanceConfig{Clock: clock.NewManual(time.Now().Add(2 * time.Hour))})
-	result, err := m.Prune(ctx, goncordia.RetentionPolicy{Completed: 24 * time.Hour, Results: time.Hour})
+	policy := goncordia.RetentionPolicy{Completed: 24 * time.Hour, Results: time.Hour}
+	result, err := m.Prune(ctx, policy)
 	if err != nil || result.ResultsDeleted != 1 || result.Deleted != 0 {
 		t.Fatalf("results pass = %+v, %v", result, err)
 	}
 	if _, err := exec.JobResultGet(ctx, done); !errors.Is(err, driver.ErrNotFound) {
-		t.Fatalf("backfilled result survived: %v", err)
+		t.Fatalf("result survived: %v", err)
 	}
-	if again, _ := m.Prune(ctx, goncordia.RetentionPolicy{Completed: 24 * time.Hour, Results: time.Hour}); again.ResultsDeleted != 0 {
+	if again, _ := m.Prune(ctx, policy); again.ResultsDeleted != 0 {
 		t.Fatalf("second results pass revisited jobs: %+v", again)
 	}
 	result, err = m.Prune(ctx, goncordia.RetentionPolicy{Completed: time.Hour, Discarded: time.Hour})

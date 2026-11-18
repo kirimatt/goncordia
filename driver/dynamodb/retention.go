@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/feature/dynamodb/attributevalue"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 
@@ -27,11 +26,9 @@ import (
 // revisit it. Sixteen shards spread writes, since a GSI partition key that
 // takes every finalization would throttle the base table.
 const (
-	retentionShards        = 16
-	bucketCompletedResult  = "completed_result"
-	retentionTimeFormat    = "2006-01-02T15:04:05.000000000Z"
-	retentionMigrationID   = "goncordia:migration:retention-v1"
-	retentionIndexWaitTime = 10 * time.Minute
+	retentionShards       = 16
+	bucketCompletedResult = "completed_result"
+	retentionTimeFormat   = "2006-01-02T15:04:05.000000000Z"
 )
 
 func retentionBucket(state driver.JobState, hasResult bool) string {
@@ -62,144 +59,6 @@ func retentionIndex() types.GlobalSecondaryIndex {
 		},
 		Projection: &types.Projection{ProjectionType: types.ProjectionTypeKeysOnly},
 	}
-}
-
-// migrateRetention adds gsi_retention to a jobs table created before v2.7.0
-// and indexes its existing terminal jobs once.
-func (d *Driver) migrateRetention(ctx context.Context) error {
-	out, err := d.svc.DescribeTable(ctx, &dynamodb.DescribeTableInput{TableName: aws.String(tableJobs)})
-	if err != nil {
-		return fmt.Errorf("dynamodb migrate: describe jobs: %w", err)
-	}
-	if !hasIndex(out.Table, gsiRetention) {
-		index := retentionIndex()
-		if _, err := d.svc.UpdateTable(ctx, &dynamodb.UpdateTableInput{
-			TableName: aws.String(tableJobs),
-			AttributeDefinitions: []types.AttributeDefinition{
-				{AttributeName: aws.String("rt_pk"), AttributeType: types.ScalarAttributeTypeS},
-				{AttributeName: aws.String("rt_at"), AttributeType: types.ScalarAttributeTypeS},
-			},
-			GlobalSecondaryIndexUpdates: []types.GlobalSecondaryIndexUpdate{{Create: &types.CreateGlobalSecondaryIndexAction{
-				IndexName: index.IndexName, KeySchema: index.KeySchema, Projection: index.Projection,
-			}}},
-		}); err != nil {
-			return fmt.Errorf("dynamodb migrate: add %s: %w", gsiRetention, err)
-		}
-	}
-	if err := d.waitIndexActive(ctx); err != nil {
-		return err
-	}
-	return d.backfillRetention(ctx)
-}
-
-func hasIndex(table *types.TableDescription, name string) bool {
-	if table == nil {
-		return false
-	}
-	for _, index := range table.GlobalSecondaryIndexes {
-		if aws.ToString(index.IndexName) == name {
-			return true
-		}
-	}
-	return false
-}
-
-func (d *Driver) waitIndexActive(ctx context.Context) error {
-	deadline := d.clk.Now().Add(retentionIndexWaitTime)
-	for {
-		out, err := d.svc.DescribeTable(ctx, &dynamodb.DescribeTableInput{TableName: aws.String(tableJobs)})
-		if err != nil {
-			return fmt.Errorf("dynamodb migrate: describe jobs: %w", err)
-		}
-		for _, index := range out.Table.GlobalSecondaryIndexes {
-			if aws.ToString(index.IndexName) == gsiRetention && index.IndexStatus == types.IndexStatusActive {
-				return nil
-			}
-		}
-		if d.clk.Now().After(deadline) {
-			return fmt.Errorf("dynamodb migrate: %s is not active after %s; run Migrate again later", gsiRetention, retentionIndexWaitTime)
-		}
-		timer := d.clk.NewTimer(time.Second)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return ctx.Err()
-		case <-timer.C():
-		}
-	}
-}
-
-// backfillRetention indexes terminal jobs finalized before rt_pk existed. A
-// marker in the schedule cursors table makes it run once.
-func (d *Driver) backfillRetention(ctx context.Context) error {
-	marker, err := d.svc.GetItem(ctx, &dynamodb.GetItemInput{
-		TableName: aws.String(tableCursors),
-		Key:       map[string]types.AttributeValue{"id": &types.AttributeValueMemberS{Value: retentionMigrationID}},
-	})
-	if err != nil {
-		return fmt.Errorf("dynamodb migrate: read retention marker: %w", err)
-	}
-	if marker.Item != nil {
-		return nil
-	}
-	paginator := dynamodb.NewScanPaginator(d.svc, &dynamodb.ScanInput{
-		TableName:                aws.String(tableJobs),
-		FilterExpression:         aws.String("attribute_not_exists(#rtpk) AND #state IN (:c, :d, :x)"),
-		ExpressionAttributeNames: map[string]string{"#rtpk": "rt_pk", "#state": "state"},
-		ExpressionAttributeValues: map[string]types.AttributeValue{
-			":c": &types.AttributeValueMemberS{Value: string(driver.JobStateCompleted)},
-			":d": &types.AttributeValueMemberS{Value: string(driver.JobStateDiscarded)},
-			":x": &types.AttributeValueMemberS{Value: string(driver.JobStateCancelled)},
-		},
-	})
-	for paginator.HasMorePages() {
-		page, err := paginator.NextPage(ctx)
-		if err != nil {
-			return fmt.Errorf("dynamodb migrate: scan terminal jobs: %w", err)
-		}
-		for _, item := range page.Items {
-			var j dynamoJob
-			if err := attributevalue.UnmarshalMap(item, &j); err != nil || j.FinalizedAt == "" {
-				continue
-			}
-			hasResult := false
-			if j.State == string(driver.JobStateCompleted) {
-				res, err := d.svc.GetItem(ctx, &dynamodb.GetItemInput{
-					TableName:            aws.String(tableResults),
-					Key:                  map[string]types.AttributeValue{"id": &types.AttributeValueMemberS{Value: j.ID}},
-					ProjectionExpression: aws.String("id"),
-				})
-				if err != nil {
-					return fmt.Errorf("dynamodb migrate: read result %s: %w", j.ID, err)
-				}
-				hasResult = res.Item != nil
-			}
-			_, err := d.svc.UpdateItem(ctx, &dynamodb.UpdateItemInput{
-				TableName:                aws.String(tableJobs),
-				Key:                      map[string]types.AttributeValue{"id": &types.AttributeValueMemberS{Value: j.ID}},
-				UpdateExpression:         aws.String("SET #rtpk = :pk, #rtat = :at"),
-				ConditionExpression:      aws.String("attribute_not_exists(#rtpk) AND #state = :state"),
-				ExpressionAttributeNames: map[string]string{"#rtpk": "rt_pk", "#rtat": "rt_at", "#state": "state"},
-				ExpressionAttributeValues: map[string]types.AttributeValue{
-					":pk":    &types.AttributeValueMemberS{Value: retentionPK(retentionBucket(driver.JobState(j.State), hasResult), j.ID)},
-					":at":    &types.AttributeValueMemberS{Value: retentionTime(parseTime(j.FinalizedAt))},
-					":state": &types.AttributeValueMemberS{Value: j.State},
-				},
-			})
-			var cce *types.ConditionalCheckFailedException
-			if err != nil && !errors.As(err, &cce) {
-				return fmt.Errorf("dynamodb migrate: index job %s: %w", j.ID, err)
-			}
-		}
-	}
-	_, err = d.svc.PutItem(ctx, &dynamodb.PutItemInput{
-		TableName: aws.String(tableCursors),
-		Item:      map[string]types.AttributeValue{"id": &types.AttributeValueMemberS{Value: retentionMigrationID}},
-	})
-	if err != nil {
-		return fmt.Errorf("dynamodb migrate: write retention marker: %w", err)
-	}
-	return nil
 }
 
 type retentionEntry struct {
