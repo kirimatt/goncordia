@@ -137,7 +137,7 @@ func TestPgxv5_BindTxCommitAndRollback(t *testing.T) {
 	// Await returns at once with ErrNotFound instead of waiting forever.
 	awaitCtx, awaitCancel := context.WithTimeout(ctx, 5*time.Second)
 	defer awaitCancel()
-	if _, err := lost.Await(awaitCtx); !errors.Is(err, driver.ErrNotFound) {
+	if _, err := lost.Await(awaitCtx); !errors.Is(err, future.ErrNotFound) {
 		t.Fatalf("Await of a rolled-back job err = %v, want ErrNotFound", err)
 	}
 
