@@ -86,6 +86,7 @@ github.com/containerd/platforms v0.2.1 h1:zvwtM3rz2YHPQsF2CHYM8+KtB5dvhISiXh5ZpS
 github.com/containerd/platforms v0.2.1/go.mod h1:XHCb+2/hzowdiut9rkudds9bE5yJ7npe7dG/wG+uFPw=
 github.com/cpuguy83/dockercfg v0.3.2 h1:DlJTyZGBDlXqUZ2Dk2Q3xHs/FtnooJJVaad2S9GKorA=
 github.com/cpuguy83/dockercfg v0.3.2/go.mod h1:sugsbF4//dDlL/i+S+rtpIWp+5h0BHJHfjj5/jFyUJc=
+github.com/creack/pty v1.1.9/go.mod h1:oKZEueFk5CKHvIhNR5MUki03XCEU+Q6VDXinZuGJ33E=
 github.com/creack/pty v1.1.24 h1:bJrF4RRfyJnbTJqzRLHzcGaZK1NeM5kTC9jGgovnR1s=
 github.com/creack/pty v1.1.24/go.mod h1:08sCNb52WyoAwi2QDyzUCTgcvVFhUzewun7wtTfvcwE=
 github.com/davecgh/go-spew v1.1.0/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
@@ -179,8 +180,9 @@ github.com/kr/pretty v0.1.0/go.mod h1:dAy3ld7l9f0ibDNOQOHHMYYIIbhfbHSm3C4ZsoJORN
 github.com/kr/pretty v0.3.1 h1:flRD4NNwYAUpkphVc1HcthR4KEIFJ65n8Mw5qdRn3LE=
 github.com/kr/pretty v0.3.1/go.mod h1:hoEshYVHaxMs3cyo3Yncou5ZscifuDolrwPKZanG3xk=
 github.com/kr/pty v1.1.1/go.mod h1:pFQYn66WHrOpPYNljwOMqo10TkYh1fy3cYio2l3bCsQ=
-github.com/kr/text v0.1.0 h1:45sCR5RtlFHMR4UwH9sdQ5TC8v0qDQCHnXt+kaKSTVE=
 github.com/kr/text v0.1.0/go.mod h1:4Jbv+DJW3UT/LiOwJeYQe1efqtUx/iVham/4vfdArNI=
+github.com/kr/text v0.2.0 h1:5Nx0Ya0ZqY2ygV366QzturHI13Jq95ApcVaJBhpS+AY=
+github.com/kr/text v0.2.0/go.mod h1:eLer722TekiGuMkidMxC/pM04lWEeraHUUmBw8l2grE=
 github.com/lufia/plan9stats v0.0.0-20260330125221-c963978e514e h1:Q6MvJtQK/iRcRtzAscm/zF23XxJlbECiGPyRicsX+Ak=
 github.com/lufia/plan9stats v0.0.0-20260330125221-c963978e514e/go.mod h1:autxFIvghDt3jPTLoqZ9OZ7s9qTGNAWmYCjVFWPX/zg=
 github.com/magiconair/properties v1.18.12 h1:sT9zQpvTB3B4gzrX0tmZNTEaGyg8Zw55MFYRE32Mr9I=
@@ -259,8 +261,8 @@ github.com/testcontainers/testcontainers-go/modules/clickhouse v0.45.0 h1:KkU7HC
 github.com/testcontainers/testcontainers-go/modules/clickhouse v0.45.0/go.mod h1:YqCv8+IixUDAcckwzAOGDOgWunGEgOLNs/z1SL4OVxQ=
 github.com/testcontainers/testcontainers-go/modules/mongodb v0.45.0 h1:lOeoea1MnafesDCZ3AxmH1BbHWKpTlRM2x4HAogPHX8=
 github.com/testcontainers/testcontainers-go/modules/mongodb v0.45.0/go.mod h1:U6l6ppAf5SGoZMzL8dFWFmiJ79qNUr7Fj5BX2TrMeAw=
-github.com/testcontainers/testcontainers-go/modules/mysql v0.44.0 h1:oJPJPxNE6YQ0zlq6mZKh06JOlyimCky4ruQUimdDet4=
-github.com/testcontainers/testcontainers-go/modules/mysql v0.44.0/go.mod h1:MSOAU6ukCpehJVHQDN1k9JgOZXZuqHD+2pT20M3JkIg=
+github.com/testcontainers/testcontainers-go/modules/mysql v0.45.0 h1:7bMiRqhS93pmbshw2rA4acBHUob8r+NbwE7y2MuSrM4=
+github.com/testcontainers/testcontainers-go/modules/mysql v0.45.0/go.mod h1:zSmbgsxrsD09BtzsVpsfZF+LixiKCa1xcdnPB4bPH/s=
 github.com/testcontainers/testcontainers-go/modules/postgres v0.45.0 h1:XsZa4fjEGqWVM3psvyJx04+dG3ZOPV0KkwFhJRqzcJM=
 github.com/testcontainers/testcontainers-go/modules/postgres v0.45.0/go.mod h1:v59yuxG94bpGrtq6MTMmrH1It+196bg7mtGwtDx1QEY=
 github.com/testcontainers/testcontainers-go/modules/redis v0.45.0 h1:U7GClvzAxLc7pjDfFxw3K6+odTa8NbxEa31svO5gl/Q=
