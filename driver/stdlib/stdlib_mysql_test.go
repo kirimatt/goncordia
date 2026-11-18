@@ -28,7 +28,7 @@ func newMySQLDriver(t *testing.T, opts ...stdlibdriver.Option) *stdlibdriver.Dri
 
 	// Each test gets a fresh schema by using a unique DB name via a fresh migrate.
 	// Because we share the container we just drop/recreate tables.
-	if _, err := db.ExecContext(ctx, "DROP TABLE IF EXISTS goncordia_jobs, goncordia_queues, goncordia_leaders, goncordia_schema_migrations"); err != nil {
+	if _, err := db.ExecContext(ctx, "DROP TABLE IF EXISTS goncordia_jobs, goncordia_job_results, goncordia_queues, goncordia_leaders, goncordia_schema_migrations"); err != nil {
 		db.Close()
 		t.Fatalf("drop tables: %v", err)
 	}
@@ -54,7 +54,7 @@ func TestStdlibMySQL_ConcurrentMigrate(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db2.Close()
-	if _, err := db1.ExecContext(ctx, "DROP TABLE IF EXISTS goncordia_jobs, goncordia_queues, goncordia_leaders, goncordia_schedule_cursors, goncordia_schema_migrations"); err != nil {
+	if _, err := db1.ExecContext(ctx, "DROP TABLE IF EXISTS goncordia_jobs, goncordia_job_results, goncordia_queues, goncordia_leaders, goncordia_schedule_cursors, goncordia_schema_migrations"); err != nil {
 		t.Fatal(err)
 	}
 	drivers := []*stdlibdriver.Driver{
