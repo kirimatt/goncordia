@@ -3,8 +3,8 @@ module github.com/kirimatt/goncordia/driver/bun/v2
 go 1.26.0
 
 require (
-	github.com/kirimatt/goncordia/driver/stdlib/v2 v2.2.0
-	github.com/kirimatt/goncordia/v2 v2.5.1
+	github.com/kirimatt/goncordia/driver/stdlib/v2 v2.6.0
+	github.com/kirimatt/goncordia/v2 v2.6.0
 	github.com/uptrace/bun v1.3.0
 	github.com/uptrace/bun/dialect/sqlitedialect v1.3.0
 	modernc.org/sqlite v1.62.0
