@@ -1,6 +1,8 @@
 # goncordia
 
-> Transactional job queue engine for Go with ten storage backends, typed futures, crash recovery, pipeline serialization, leader-safe schedules, an embeddable admin UI, OpenTelemetry, and deterministic injected clocks.
+> Background job queue for Go that stores jobs in the database you already use (Postgres, MySQL, SQLite, MongoDB, Redis, Cassandra, ClickHouse, DynamoDB, Firestore, in-memory). Transactional enqueue (outbox pattern), typed futures that await a job's result, retries, cron, retention by default, crash recovery, an embeddable admin UI, OpenTelemetry, and deterministic injected clocks.
+
+Install: `go get github.com/kirimatt/goncordia/v2` plus one driver module, e.g. `github.com/kirimatt/goncordia/driver/pgxv5/v2`. Import paths carry `/v2`.
 
 ## Key concept
 
@@ -37,7 +39,7 @@ Transactional inserts supported on: Postgres, MySQL, SQLite, MongoDB, Firestore,
 ## Documentation
 
 - [README](https://github.com/kirimatt/goncordia/blob/main/README.md): Full documentation — features, driver table, quick start per backend, benchmarks, retry policies, cron jobs, OpenTelemetry
-- [CLAUDE.md](https://github.com/kirimatt/goncordia/blob/main/CLAUDE.md): Concise AI assistant reference — driver selection, job definition, EnqueueTx, testing, common mistakes
+- [AGENTS.md](https://github.com/kirimatt/goncordia/blob/main/AGENTS.md): Concise reference for coding agents — driver selection, job definition, EnqueueTx, testing, common mistakes
 - [pkg.go.dev](https://pkg.go.dev/github.com/kirimatt/goncordia/v2): Go API reference
 - [CHANGELOG](https://github.com/kirimatt/goncordia/blob/main/CHANGELOG.md): Version history
 - [MIGRATING_TO_V2.md](https://github.com/kirimatt/goncordia/blob/main/MIGRATING_TO_V2.md): Upgrading from v1 — `/v2` import paths and removed APIs

@@ -34,7 +34,8 @@ tx.Commit(ctx)  // job and order appear atomically
 - **Fair multi-queue scheduling** — weighted round-robin with per-queue concurrency and composable local/global execution rate limits
 - **Payload evolution** — versioned payloads with ordered upcasters and permanent decode failures
 - **Batch enqueue** — shared options or independent per-item options, with transactional variants
-- **Futures** — enqueue a job and `Await` the value its handler returns, with local wake-up and polling fallback
+- **Futures** — enqueue a job and `Await` the value its handler returns, with local wake-up and polling fallback; `Call` runs a one-shot job like a function call
+- **Retention by default** — old completed, cancelled, and discarded jobs and future results are pruned under a leader lease
 - **Queue pause/resume** — drain a queue without stopping workers
 - **Push notifications** — LISTEN/NOTIFY (Postgres), Change Streams (MongoDB), Pub/Sub (Redis); polling fallback elsewhere
 - **SKIP LOCKED** — lock-free concurrent fetching on Postgres and MySQL
@@ -75,9 +76,11 @@ tx.Commit(ctx)  // job and order appear atomically
 | Priority queues | ✅ | ✅ | ✅ | ❌ |
 | Push notifications | ✅ LISTEN/NOTIFY, Change Streams, Pub/Sub | ✅ LISTEN/NOTIFY | ✅ Pub/Sub | ❌ polling |
 | Web UI | ✅ embeddable | ✅ (River UI, Pro) | ✅ (asynqmon) | ❌ |
+| Await a job's typed result | ✅ `future.Func.Call` / `Await` | ❌ | stores results, no await | ✅ `AsyncResult.Get` |
+| Unit tests without Docker | ✅ in-memory driver + `gontest` | needs Postgres | needs Redis | needs a broker |
 | Workflow primitives (chains, chords) | ❌ | ❌ | ❌ | ✅ |
 
-**Choose goncordia** when you want the transactional outbox pattern and don't want to introduce Redis or a dedicated Postgres instance — it works with whatever database your application already uses.
+**Choose goncordia** when you want the transactional outbox pattern and don't want to introduce Redis or a dedicated Postgres instance — it works with whatever database your application already uses. It also fits when a caller needs the value a background job returns (`future.Func.Call`), or when you want unit tests of enqueue and worker code without Docker.
 
 **Choose River** if you're on Postgres and want a mature, battle-tested library with a polished UI and a professional support tier.
 

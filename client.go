@@ -1,17 +1,26 @@
-// Package goncordia provides a transactional job queue engine for Go.
-// It supports multiple storage backends (Postgres, MySQL, SQLite, MongoDB, Redis, in-memory)
-// through a driver interface parameterized by the native transaction type of each backend.
+// Package goncordia is a background job queue for Go that stores jobs in the
+// database you already use: Postgres, MySQL, SQLite, MongoDB, Redis,
+// Cassandra, ClickHouse, DynamoDB, Firestore, or in memory.
 //
-// Transactional usage (shared transaction with business logic):
+// EnqueueTx writes a job inside your own transaction (the transactional
+// outbox pattern), so the job exists only if the transaction commits:
 //
 //	tx, _ := pool.Begin(ctx)
 //	_, _ = queries.CreateOrder(ctx, tx, orderParams)
 //	_, _ = client.EnqueueTx(ctx, tx, SendConfirmationEmailArgs{OrderID: id}, nil)
-//	tx.Commit(ctx) // both operations are atomic
+//	tx.Commit(ctx) // order and job commit together
 //
-// Non-transactional usage (at-least-once semantics):
+// Backends without transactions use Enqueue after the commit, with
+// at-least-once delivery:
 //
 //	client.Enqueue(ctx, SendConfirmationEmailArgs{OrderID: id}, nil)
+//
+// Also included: scheduled, unique, and prioritized jobs; retries with
+// backoff; crash recovery; cron scheduling under a leader lease; retention
+// by default; an admin dashboard with Prometheus metrics; OpenTelemetry (in
+// the otel module); and injected clocks for deterministic tests. Package
+// future awaits the value a job returns, and package gontest tests enqueue
+// and worker code without a database.
 package goncordia
 
 import (
