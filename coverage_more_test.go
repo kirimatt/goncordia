@@ -14,15 +14,17 @@ import (
 	"github.com/kirimatt/goncordia/v2/driver/memory"
 )
 
+// pollingDriver has no Listener, like stdlib, Cassandra, ClickHouse,
+// DynamoDB, and Firestore, so the pool polls.
+type pollingDriver struct{ *memory.Driver }
+
+func (pollingDriver) Listener() driver.Listener { return nil }
+
 // TestWorkerPoolPollsWithoutNotifications covers drivers without push
-// notifications (stdlib, Cassandra, ClickHouse, DynamoDB, Firestore): a job
-// enqueued after start is fetched on the next poll tick.
+// notifications: a job enqueued after start is fetched on the next poll tick.
 func TestWorkerPoolPollsWithoutNotifications(t *testing.T) {
 	clk := clock.NewManual(time.Date(2026, 11, 18, 12, 0, 0, 0, time.UTC))
-	mem := memory.New(memory.WithClock(clk))
-	caps := mem.Capabilities()
-	caps.ListenNotify = false
-	d := &limitedCapabilityDriver{Driver: mem, capabilities: caps}
+	d := pollingDriver{memory.New(memory.WithClock(clk))}
 	registry := core.NewRegistry()
 	var processed atomic.Int64
 	core.RegisterWorker(registry, core.WorkerFunc[featureArgs](func(context.Context, *core.Job[featureArgs]) error {
