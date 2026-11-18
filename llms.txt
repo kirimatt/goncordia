@@ -34,7 +34,7 @@ Worker pools prune by default on every driver, under a shared leader lease: comp
 
 Postgres (pgx v5, database/sql, gorm, bun), MySQL, SQLite, MongoDB, Redis, Cassandra, ClickHouse, Amazon DynamoDB, Cloud Firestore, in-memory.
 
-Transactional inserts supported on: Postgres, MySQL, SQLite, MongoDB, Firestore, in-memory.
+Transactional inserts supported on: Postgres, MySQL, SQLite, MongoDB, Firestore (not in-memory, Redis, Cassandra, ClickHouse, DynamoDB).
 
 ## Documentation
 

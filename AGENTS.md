@@ -61,8 +61,8 @@ _, _ = client.EnqueueTx(ctx, tx, SendEmailArgs{To: "user@example.com"}, nil)
 tx.Commit(ctx)  // job and order are atomic
 ```
 
-Works with: Postgres (pgxv5, stdlib, gorm, bun), MongoDB, Firestore, in-memory.
-Does NOT support rollback: Redis, Cassandra, ClickHouse, DynamoDB (use `Enqueue` after commit instead).
+Works with: Postgres, MySQL, SQLite (pgxv5, stdlib, gorm, bun), MongoDB, Firestore.
+Rejected with `driver.ErrUnsupported`: Redis, Cassandra, ClickHouse, DynamoDB, in-memory (use `Enqueue` after commit instead).
 
 ## Enqueue without a transaction
 
