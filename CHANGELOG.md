@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Stopping a worker pool (or the context of `RunRetention`) during a
+  retention pass no longer reports `retention: ... context canceled` to
+  `ErrorHandler`, `OnPrune`, or the retention observer, so a graceful
+  shutdown no longer logs an error.
+
 ---
 
 ## [v2.7.1] — 2026-11-18
