@@ -1,0 +1,4 @@
+# driver/drivertest is the conformance suite that driver modules run in
+# their own tests; it is test support code, not part of the library.
+ignore:
+  - "driver/drivertest"
