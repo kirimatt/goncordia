@@ -131,6 +131,9 @@ func Run(t *testing.T, exec driver.Executor) {
 	if err != nil || row == nil || row.PipelineID != "entity-1" || row.Timeout != time.Second {
 		t.Fatalf("get inserted job: row=%+v err=%v", row, err)
 	}
+	if missing, err := exec.JobGetByID(ctx, "missing-"+queue); !errors.Is(err, driver.ErrNotFound) {
+		t.Fatalf("get missing job: row=%+v err=%v, want ErrNotFound", missing, err)
+	}
 
 	adminExec, ok := exec.(driver.AdminExecutor)
 	if !ok {
