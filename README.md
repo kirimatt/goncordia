@@ -92,7 +92,7 @@ tx.Commit(ctx)  // job and order appear atomically
 Requires Go 1.26 or newer.
 
 ```bash
-go get github.com/kirimatt/goncordia/v2@v2.4.0
+go get github.com/kirimatt/goncordia/v2@v2.5.0
 ```
 
 Pick a driver:
@@ -288,6 +288,10 @@ TTL. `redisdriver.WithAllowEviction()` disables the check; when `CONFIG` is
 blocked, as on some managed services, the check is skipped. If a result is
 evicted anyway, `Await` returns `future.ErrResultLost` rather than the
 misleading `future.ErrNoResult`.
+
+`Migrate` also builds the retention indexes for jobs written before v2.5.0.
+During a rolling upgrade, older instances keep finalizing jobs without
+indexing them, so run `Migrate` once more after every instance is upgraded.
 
 ### Cassandra / ScyllaDB
 
@@ -640,7 +644,7 @@ type Gallery struct {
 }
 
 func (g *Gallery) Thumbnail(ctx context.Context, id string) (Thumbnail, error) {
-    return g.resize.Call(ctx, ResizeArgs{ImageID: id}) // enqueue and wait
+    return g.resize.Call(ctx, ResizeArgs{ImageID: id}) // enqueue, wait, delete the job
 }
 
 f, err := g.resize.Enqueue(ctx, args)                        // *Future[Thumbnail], wait later
@@ -649,6 +653,12 @@ thumb, err := f.Await(ctx)        // blocks until completed, discarded, or cance
 thumb, done, err := f.TryGet(ctx) // one non-blocking check
 later := g.resize.Of(f.ID())      // follow a job enqueued elsewhere
 ```
+
+`Call` is for one-shot calls: after it returns a value, it deletes the job and
+its result, since nobody else knows the job ID. Unique jobs (other callers may
+share them) and failed jobs stay for [retention](#retention); set
+`future.Config.KeepCalledJobs` to keep every job. Jobs from `Enqueue` stay
+until retention removes them.
 
 To enqueue inside a transaction, bind with `future.BindTx`; the result also
 has `EnqueueTx(ctx, tx, args)`. Call `Await` only after the transaction
@@ -815,12 +825,6 @@ maintenance := goncordia.NewMaintenance(d, goncordia.MaintenanceConfig{
     Clock: appClock,
 })
 
-result, err := maintenance.Prune(ctx, goncordia.RetentionPolicy{
-    Completed: 30 * 24 * time.Hour,
-    Discarded: 90 * 24 * time.Hour,
-    Cancelled: 7 * 24 * time.Hour,
-})
-
 cancelled, err := maintenance.BulkCancel(ctx, jobIDs)
 retried, err := maintenance.BulkRetry(ctx, jobIDs, time.Time{}) // now via Clock
 deleted, err := maintenance.BulkDelete(ctx, jobIDs)
@@ -831,38 +835,66 @@ replayed, err := maintenance.DeadLetterReplay(ctx, jobIDs, time.Time{})
 
 Bulk operations preserve partial progress in `BulkResult`; their returned error
 joins per-job failures, so `errors.Is` still recognizes typed driver errors.
-Dead-letter replay first verifies that each job is still discarded. Retention
-durations of zero disable that state, and negative durations are rejected.
+Dead-letter replay first verifies that each job is still discarded.
 
-`RetentionPolicy.Results` deletes the stored future results of completed jobs
-earlier than the jobs themselves, which also cleans up results nobody awaited.
-Storage cannot know whether some process will still call `Await` (waiters
-live in other processes' memory, and `future.Of` can follow a job later), so
-results expire by age, not by waiter count. After that, `Await` on such a job
-returns `future.ErrNoResult`. Use `Manager.Forget` to drop a result right after
-reading it.
+### Retention
 
-Nothing is pruned automatically unless you run retention. `RunRetention` does
-it on a schedule; start it in every instance, and a leader lease makes sure
-only one instance prunes at a time, with another taking over if it stops:
+Every worker pool prunes old jobs by default, on every driver. Pools share a
+leader lease, so only one instance prunes at a time, and another takes over
+if it stops. The default `goncordia.DefaultRetentionPolicy` keeps:
+
+| What | Kept for |
+|---|---|
+| completed jobs | 24 hours |
+| cancelled jobs | 24 hours |
+| discarded jobs (dead letters) | 7 days |
+| future results of completed jobs | 1 hour |
+
+Override any field in `WorkerConfig`; zero fields keep the default, and
+`goncordia.KeepForever` turns a state off. A negative `RetentionInterval`
+disables retention in that pool:
+
+```go
+wp := goncordia.NewWorkerPool(d, registry, goncordia.WorkerConfig{
+    Retention: goncordia.RetentionPolicy{
+        Completed: 7 * 24 * time.Hour,
+        Discarded: goncordia.KeepForever,
+    },
+    RetentionInterval: 10 * time.Minute, // default 5 minutes
+})
+```
+
+Futures results expire earlier than the jobs. Storage cannot know whether
+some process will still call `Await` (waiters live in other processes'
+memory, and `future.Of` can follow a job later), so results expire by age, not
+by waiter count; after that, `Await` returns `future.ErrNoResult`. `Func.Call`
+does not wait for retention: its job ID never leaves the call, so it deletes
+the job and result as soon as it returns a value (see
+[Futures](#futures-waiting-for-a-jobs-result)). `Manager.Forget` drops a result
+you have read.
+
+Without a worker pool, for example in a separate maintenance process, run the
+same loop yourself, or call `Prune` once:
 
 ```go
 go maintenance.RunRetention(ctx, goncordia.RetentionRunConfig{
-    Policy: goncordia.RetentionPolicy{
-        Completed: 7 * 24 * time.Hour,
-        Discarded: 30 * 24 * time.Hour,
-        Cancelled: 7 * 24 * time.Hour,
-        Results:   time.Hour, // results live an hour; job history stays a week
-    },
+    Policy:   goncordia.DefaultRetentionPolicy,
     Interval: 10 * time.Minute,
     OnPrune: func(r goncordia.PruneResult, err error) {
         slog.Info("retention", "deleted", r.Deleted, "results", r.ResultsDeleted, "err", err)
     },
 })
+
+result, err := maintenance.Prune(ctx, goncordia.RetentionPolicy{
+    Completed: 30 * 24 * time.Hour,
+    Results:   time.Hour,
+})
 ```
 
-Each pass lists terminal jobs page by page, so its cost grows with the number
-of retained jobs; pick an interval that fits your volume.
+Zero durations in `Prune` and `RunRetention` skip that state; negative ones
+other than `KeepForever` are rejected. Drivers implementing `driver.JobPruner`
+read only expired jobs from an index; Redis does. Others list terminal jobs
+page by page, so a pass costs time proportional to retained jobs.
 
 ---
 
