@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Dependencies
+- Driver, otel, and gontest modules require root v2.2.0.
+- AWS SDK v2 1.48.0 (config 1.33.18, credentials 1.21.0, DynamoDB 1.74.0,
+  attributevalue 1.21.21), modernc.org/sqlite 1.62.0, and
+  testcontainers MySQL module 0.45.0.
+
 ---
 
 ## [v2.2.0] — 2026-11-18
