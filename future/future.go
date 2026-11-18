@@ -1,29 +1,33 @@
 // Package future lets a producer enqueue a job and wait for the value its
 // handler returns.
 //
-// The worker side registers a Handler that returns a value next to its error.
-// The value is JSON-encoded and written to a result store. The producer side
-// receives a Future from Enqueue and calls Await to block until the job reaches
-// a terminal state:
+// Declare a Task once, next to the job arguments, to tie them to the result
+// type. Workers register a handler for it; application code receives a bound
+// Func and calls it without type parameters:
 //
+//	// contract, shared by producers and workers
+//	var Resize = future.Define[ResizeArgs, Thumbnail]()
+//
+//	// main
 //	m, err := future.New(d, future.Config{})
-//
-//	// worker process
-//	future.RegisterWorker(registry, m, func(ctx context.Context, job *core.Job[ResizeArgs]) (Thumbnail, error) {
-//	    return resize(ctx, job.Args)
-//	}, core.WorkerOpts{})
+//	Resize.Register(registry, m, resizeHandler, core.WorkerOpts{})
 //	wp := goncordia.NewWorkerPool(d, registry, goncordia.WorkerConfig{Observer: m})
+//	gallery := &Gallery{resize: future.Bind(m, client, Resize)}
 //
-//	// producer
-//	f, err := future.Enqueue[Thumbnail](ctx, m, client, ResizeArgs{ImageID: id}, nil)
-//	thumb, err := f.Await(ctx)
+//	// application code (method of Gallery)
+//	thumb, err := g.resize.Call(ctx, ResizeArgs{ImageID: id})
+//
+// The handler's value is JSON-encoded and written to a result store before the
+// job is marked completed. Use BindTx to also enqueue inside a transaction, and
+// the lower-level Enqueue, EnqueueTx, RegisterWorker, and Of functions when a
+// Task is not convenient.
 //
 // Futures work with every driver. Job state is read through
 // Executor.JobGetByID and results are stored by the driver, or by Config.Store
 // when it is set. When the producer and the worker pool share a Manager in one
 // process, and the Manager is installed as (or inside goncordia.WorkerObservers
-// for) WorkerConfig.Observer, Await wakes as soon as the job finishes. Otherwise it polls storage every
-// Config.PollInterval on the injected clock.
+// for) WorkerConfig.Observer, Await wakes as soon as the job finishes.
+// Otherwise it polls storage every Config.PollInterval on the injected clock.
 //
 // Delivery is at-least-once. A handler may run again after a crash or a failed
 // result write, and the last stored value wins.

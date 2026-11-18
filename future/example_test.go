@@ -13,6 +13,8 @@ import (
 	"github.com/kirimatt/goncordia/v2/future"
 )
 
+// --- Contract: shared by producers and workers. ---
+
 type SumArgs struct {
 	A int `json:"a"`
 	B int `json:"b"`
@@ -20,30 +22,43 @@ type SumArgs struct {
 
 func (SumArgs) Kind() string { return "sum" }
 
-// Example runs a future end to end on the in-memory driver: the worker returns
-// a value, the producer awaits it, and a discarded job surfaces as
-// future.ErrDiscarded.
+// Sum declares that SumArgs jobs produce an int.
+var Sum = future.Define[SumArgs, int]()
+
+// --- Worker code. ---
+
+func sumHandler(_ context.Context, job *core.Job[SumArgs]) (int, error) {
+	if job.Args.A < 0 {
+		return 0, core.Discard(errors.New("negative input"))
+	}
+	return job.Args.A + job.Args.B, nil
+}
+
+// --- Caller code: knows only the bound task, not the queue. ---
+
+type Billing struct {
+	sum *future.Func[SumArgs, int]
+}
+
+func (b *Billing) Total(ctx context.Context, a, c int) (int, error) {
+	return b.sum.Call(ctx, SumArgs{A: a, B: c})
+}
+
+// Example wires the in-memory driver in main and calls the task from ordinary
+// application code.
 func Example() {
 	ctx := context.Background()
 	clk := clock.NewManual(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
 	d := memory.New(memory.WithClock(clk))
 
-	// The Manager stores results with the driver and wakes local waiters.
 	m, err := future.New(d, future.Config{Clock: clk})
 	if err != nil {
 		panic(err)
 	}
-
 	registry := core.NewRegistry()
-	future.RegisterWorker(registry, m, func(_ context.Context, job *core.Job[SumArgs]) (int, error) {
-		if job.Args.A < 0 {
-			return 0, core.Discard(errors.New("negative input"))
-		}
-		return job.Args.A + job.Args.B, nil
-	}, core.WorkerOpts{})
+	Sum.Register(registry, m, sumHandler, core.WorkerOpts{})
 
-	// Passing the Manager as the observer wakes Await as soon as the job
-	// finishes in this process; no polling interval has to elapse.
+	// The Manager as observer wakes Await the moment a job finishes.
 	wp := goncordia.NewWorkerPool(d, registry, goncordia.WorkerConfig{
 		Clock: clk, PollInterval: time.Hour, Observer: m,
 	})
@@ -59,22 +74,15 @@ func Example() {
 	}()
 
 	client := goncordia.NewClient(d, goncordia.ClientConfig{Clock: clk})
+	billing := &Billing{sum: future.Bind(m, client, Sum)}
 
-	f, err := future.Enqueue[int](ctx, m, client, SumArgs{A: 2, B: 3}, nil)
-	if err != nil {
-		panic(err)
-	}
-	sum, err := f.Await(ctx)
-	fmt.Println("sum:", sum, err)
+	total, err := billing.Total(ctx, 2, 3)
+	fmt.Println("total:", total, err)
 
-	bad, err := future.Enqueue[int](ctx, m, client, SumArgs{A: -1}, nil)
-	if err != nil {
-		panic(err)
-	}
-	_, err = bad.Await(ctx)
+	_, err = billing.Total(ctx, -1, 0)
 	fmt.Println("discarded:", errors.Is(err, future.ErrDiscarded))
 
 	// Output:
-	// sum: 5 <nil>
+	// total: 5 <nil>
 	// discarded: true
 }

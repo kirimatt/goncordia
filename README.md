@@ -91,7 +91,7 @@ tx.Commit(ctx)  // job and order appear atomically
 Requires Go 1.26 or newer.
 
 ```bash
-go get github.com/kirimatt/goncordia/v2@v2.0.0
+go get github.com/kirimatt/goncordia/v2@v2.1.0
 ```
 
 Pick a driver:
@@ -579,31 +579,66 @@ lease while the handler runs and cancels the handler context if renewal is lost.
 ### Futures: waiting for a job's result
 
 The `future` package lets a producer enqueue a job and wait for the value its
-handler returns. Register the handler with `future.RegisterWorker`; it returns
-`(R, error)` instead of `error`. The value is JSON-encoded and stored before the
-job is marked completed.
+handler returns. Declare a `Task` once to tie the job arguments to the result
+type; workers register a handler for it, and application code gets a bound
+`Func` that it calls without type parameters. The value is JSON-encoded and
+stored before the job is marked completed.
+
+**Contract** — shared by producers and workers:
 
 ```go
 import "github.com/kirimatt/goncordia/v2/future"
 
+type ResizeArgs struct{ ImageID string }
+
+func (ResizeArgs) Kind() string { return "resize" }
+
+var Resize = future.Define[ResizeArgs, Thumbnail]()
+```
+
+**`main`** — wiring only:
+
+```go
 m, err := future.New(d, future.Config{PollInterval: 500 * time.Millisecond})
 
-// Worker side
-future.RegisterWorker(registry, m, func(ctx context.Context, job *core.Job[ResizeArgs]) (Thumbnail, error) {
-    return resize(ctx, job.Args)
-}, core.WorkerOpts{})
-wp := goncordia.NewWorkerPool(d, registry, goncordia.WorkerConfig{
-    // Wakes local Await calls the moment a job finishes. Combine with other
-    // observers through goncordia.WorkerObservers.
+registry := core.NewRegistry()
+Resize.Register(registry, m, resizeHandler, core.WorkerOpts{}) // func(ctx, *core.Job[ResizeArgs]) (Thumbnail, error)
+
+wp := pgxdriver.NewWorkerPool(d, registry, goncordia.WorkerConfig{
+    // Wakes local Await calls the moment a job finishes.
     Observer: goncordia.WorkerObservers(instrumentation, m),
 })
+go wp.Start(ctx)
 
-// Producer side
-f, err := future.Enqueue[Thumbnail](ctx, m, client, ResizeArgs{ImageID: id}, nil)
-thumb, err := f.Await(ctx)              // blocks until completed, discarded, or cancelled
-thumb, done, err := f.TryGet(ctx)       // one non-blocking check
-later := future.Of[Thumbnail](m, f.ID()) // follow a job enqueued elsewhere
+client := pgxdriver.NewClient(d, goncordia.ClientConfig{})
+gallery := &Gallery{resize: future.Bind(m, client, Resize)}
 ```
+
+**Application code** — knows only the bound task:
+
+```go
+type Gallery struct {
+    resize *future.Func[ResizeArgs, Thumbnail]
+}
+
+func (g *Gallery) Thumbnail(ctx context.Context, id string) (Thumbnail, error) {
+    return g.resize.Call(ctx, ResizeArgs{ImageID: id}) // enqueue and wait
+}
+
+f, err := g.resize.Enqueue(ctx, args)                        // *Future[Thumbnail], wait later
+f, err := g.resize.With(&core.InsertOpts{Queue: "images"}).Enqueue(ctx, args)
+thumb, err := f.Await(ctx)        // blocks until completed, discarded, or cancelled
+thumb, done, err := f.TryGet(ctx) // one non-blocking check
+later := g.resize.Of(f.ID())      // follow a job enqueued elsewhere
+```
+
+To enqueue inside a transaction, bind with `future.BindTx`; the result also
+has `EnqueueTx(ctx, tx, args)`. Call `Await` only after the transaction
+commits. The handler can live in the same package as the calling code when
+API and workers run in one binary; when they are separate binaries, keep the
+contract in a shared package and the handler in the worker. The lower-level
+`future.Enqueue[R]`, `EnqueueTx[R]`, `RegisterWorker`, and `Of[R]` remain
+available.
 
 `Await` returns the handler value, or an error you can classify with
 `errors.Is`: `future.ErrDiscarded` and `future.ErrCancelled` (both carry a
@@ -625,7 +660,7 @@ stays at-least-once: the last stored value wins if a handler runs twice.
 Runnable examples: [`future/example_test.go`](future/example_test.go) runs the
 whole flow on the in-memory driver with a `clock.Manual`, and
 [`driver/pgxv5/example_future_test.go`](driver/pgxv5/example_future_test.go)
-enqueues with `EnqueueTx` inside a Postgres transaction and awaits the result.
+enqueues with `BindTx` inside a Postgres transaction and awaits the result.
 
 ### Versioned payloads
 
