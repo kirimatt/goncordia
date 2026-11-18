@@ -74,8 +74,12 @@ func (e *executor) JobResultPut(ctx context.Context, jobID string, value []byte)
 	if value == nil {
 		value = []byte{}
 	}
-	return e.session.Query(`INSERT INTO goncordia_job_results (job_id, value, updated_at) VALUES (?, ?, ?)`,
-		jobID, value, e.clk.Now()).WithContext(ctx).Exec()
+	now := e.clk.Now()
+	if err := e.session.Query(`INSERT INTO goncordia_job_results (job_id, value, updated_at) VALUES (?, ?, ?)`,
+		jobID, value, now).WithContext(ctx).Exec(); err != nil {
+		return err
+	}
+	return recordResult(ctx, e.session, now, jobID)
 }
 
 // JobResultGet returns a stored result or driver.ErrNotFound.
@@ -775,6 +779,9 @@ func jobSetStateIfRunning(ctx context.Context, session *gocql.Session, clk clock
 	if err := deleteRunningLookup(ctx, session, j); err != nil {
 		return err
 	}
+	if err := recordFinalized(ctx, session, params.State, now, params.ID); err != nil {
+		return err
+	}
 	if j.UniqueKey != "" && !driver.IsPermanentUniqueKey(j.UniqueKey) {
 		return session.Query(`DELETE FROM goncordia_uniq_v2 WHERE ukey=?`,
 			j.UniqueKey).WithContext(ctx).Exec()
@@ -821,6 +828,9 @@ func jobCancel(ctx context.Context, session *gocql.Session, clk clock.Clock, id 
 	}
 	if !applied {
 		return fmt.Errorf("%w: job %q changed before cancellation", driver.ErrConflict, id)
+	}
+	if err := recordFinalized(ctx, session, driver.JobStateCancelled, now, id); err != nil {
+		return err
 	}
 
 	// Clean up avail lookup if it was available (not scheduled).

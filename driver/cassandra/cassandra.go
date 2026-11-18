@@ -160,6 +160,7 @@ func (d *Driver) Migrate(ctx context.Context) error {
 			applied_at timestamp
 		)`,
 	}
+	stmts = append(stmts, retentionTables...)
 	for _, stmt := range stmts {
 		if err := d.session.Query(stmt).WithContext(ctx).Exec(); err != nil {
 			return fmt.Errorf("cassandra migrate: %w", err)
