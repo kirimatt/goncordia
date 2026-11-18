@@ -11,7 +11,7 @@ fi
 case "$group" in
   base)
     module_dirs=(
-      driver/stdlib driver/pgxv5 driver/mongodb driver/redis
+      driver/stdlib driver/pgxv5 driver/mongodb driver/mongodbv2 driver/redis
       driver/cassandra driver/clickhouse driver/dynamodb driver/firestore
       otel gontest
     )

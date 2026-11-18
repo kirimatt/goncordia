@@ -11,6 +11,7 @@ module_dirs=(
   driver/stdlib
   driver/pgxv5
   driver/mongodb
+  driver/mongodbv2
   driver/redis
   driver/cassandra
   driver/clickhouse

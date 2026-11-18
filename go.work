@@ -10,6 +10,7 @@ use (
 	./driver/firestore
 	./driver/gorm
 	./driver/mongodb
+	./driver/mongodbv2
 	./driver/pgxv5
 	./driver/redis
 	./driver/stdlib

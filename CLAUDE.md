@@ -4,7 +4,7 @@ Job queue engine for Go. One `Driver[TTx]` interface works across Postgres, MySQ
 
 ## Core concept
 
-`TTx` is the native transaction type of your database library (e.g. `pgx.Tx`, `*sql.Tx`, `*gorm.DB`, `mongo.SessionContext`). The client and worker pool are parameterized by it — you never touch an adapter layer.
+`TTx` is the native transaction type of your database library (e.g. `pgx.Tx`, `*sql.Tx`, `*gorm.DB`, `*mongo.Session` for mongodbv2). The client and worker pool are parameterized by it — you never touch an adapter layer.
 
 ## Picking a driver
 
@@ -14,7 +14,8 @@ Job queue engine for Go. One `Driver[TTx]` interface works across Postgres, MySQ
 | `database/sql` (Postgres, MySQL, SQLite) | `driver/stdlib` | `stdlibdriver "github.com/kirimatt/goncordia/driver/stdlib/v2"` |
 | gorm | `driver/gorm` | `gormdriver "github.com/kirimatt/goncordia/driver/gorm/v2"` |
 | bun | `driver/bun` | `bundriver "github.com/kirimatt/goncordia/driver/bun/v2"` |
-| MongoDB | `driver/mongodb` | `mongodriver "github.com/kirimatt/goncordia/driver/mongodb/v2"` |
+| MongoDB (mongo-driver v2) | `driver/mongodbv2` | `mongodriver "github.com/kirimatt/goncordia/driver/mongodbv2/v2"` |
+| MongoDB (mongo-driver v1, deprecated) | `driver/mongodb` | `mongodriver "github.com/kirimatt/goncordia/driver/mongodb/v2"` |
 | Redis | `driver/redis` | `redisdriver "github.com/kirimatt/goncordia/driver/redis/v2"` |
 | Cassandra / ScyllaDB | `driver/cassandra` | `cassandradriver "github.com/kirimatt/goncordia/driver/cassandra/v2"` |
 | ClickHouse | `driver/clickhouse` | `clickhousedriver "github.com/kirimatt/goncordia/driver/clickhouse/v2"` |
