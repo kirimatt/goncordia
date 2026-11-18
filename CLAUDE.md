@@ -119,15 +119,21 @@ clk.Advance(2 * time.Hour)  // job is now available
 ## Waiting for a job's result (futures)
 
 ```go
-m, _ := future.New(d, future.Config{})            // every built-in driver stores results; run Migrate after upgrading
-future.RegisterWorker(registry, m, func(ctx context.Context, job *core.Job[SumArgs]) (int, error) {
-    return job.Args.A + job.Args.B, nil
-}, core.WorkerOpts{})
-wp := goncordia.NewWorkerPool(d, registry, goncordia.WorkerConfig{Observer: m}) // local wake-up
+// contract (shared by producers and workers)
+var Sum = future.Define[SumArgs, int]()
 
-f, _ := future.Enqueue[int](ctx, m, client, SumArgs{A: 2, B: 3}, nil)
-sum, err := f.Await(ctx) // errors.Is(err, future.ErrDiscarded / ErrCancelled / ErrNoResult)
+// main: wiring
+m, _ := future.New(d, future.Config{})            // every built-in driver stores results; run Migrate after upgrading
+Sum.Register(registry, m, sumHandler, core.WorkerOpts{}) // sumHandler: func(ctx, *core.Job[SumArgs]) (int, error)
+wp := goncordia.NewWorkerPool(d, registry, goncordia.WorkerConfig{Observer: m}) // local wake-up
+billing := &Billing{sum: future.Bind(m, client, Sum)} // *future.Func[SumArgs, int]
+
+// application code: no type parameters, no queue client
+total, err := b.sum.Call(ctx, SumArgs{A: 2, B: 3}) // errors.Is(err, future.ErrDiscarded / ErrCancelled / ErrNoResult)
+f, err := b.sum.With(&core.InsertOpts{Queue: "critical"}).Enqueue(ctx, args) // wait later with f.Await
 ```
+
+Use `future.BindTx` for `EnqueueTx(ctx, tx, args)`; await only after commit.
 
 Full runnable examples: `future/example_test.go` (memory) and
 `driver/pgxv5/example_future_test.go` (Postgres with `EnqueueTx`).

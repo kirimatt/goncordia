@@ -11,6 +11,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [v2.1.0] — 2026-11-18
+
+### Added
+- `future.Define[A, R]()` declares a `Task` that ties job arguments to the
+  handler's result type; `Task.Register` type-checks the handler.
+- `future.Bind` returns a `*future.Func[A, R]` with `Call` (enqueue and
+  await), `Enqueue`, `With` (insert options), and `Of`, so application code
+  needs neither type parameters nor the queue client. `future.BindTx` adds
+  `EnqueueTx`.
+- Futures examples split into contract, `main` wiring, and application code.
+
+---
+
 ## [v2.0.0] — 2026-11-18
 
 ### Breaking

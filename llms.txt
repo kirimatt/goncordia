@@ -15,13 +15,13 @@ tx.Commit(ctx)  // job and order appear atomically
 
 ## Futures
 
-`future.Enqueue` returns a `Future[R]`; `Await` returns the value produced by a `future.RegisterWorker` handler. Works on every backend; in-process waiters wake instantly, others poll.
+Declare `future.Define[Args, Result]()` once; workers `Register` a handler, application code calls the bound `Func` without type parameters. Works on every backend; in-process waiters wake instantly, others poll.
 
 ```go
-m, _ := future.New(d, future.Config{})
-future.RegisterWorker(registry, m, func(ctx context.Context, job *core.Job[SumArgs]) (int, error) { return job.Args.A + job.Args.B, nil }, core.WorkerOpts{})
-f, _ := future.Enqueue[int](ctx, m, client, SumArgs{A: 2, B: 3}, nil)
-sum, err := f.Await(ctx)
+var Sum = future.Define[SumArgs, int]()
+Sum.Register(registry, m, sumHandler, core.WorkerOpts{})
+sum := future.Bind(m, client, Sum)
+total, err := sum.Call(ctx, SumArgs{A: 2, B: 3})
 ```
 
 ## Supported backends
