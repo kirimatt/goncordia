@@ -146,3 +146,28 @@ var (
 	_ WorkerObserver = NopWorkerObserver{}
 	_ WorkerObserver = workerObserverList(nil)
 )
+
+// RetentionPassEvent describes one retention pass that this instance ran as
+// the leader.
+type RetentionPassEvent struct {
+	Result     PruneResult
+	Err        error
+	StartedAt  time.Time
+	FinishedAt time.Time
+}
+
+// RetentionObserver is an optional extension of WorkerObserver. A worker
+// pool, or RunRetention with RetentionRunConfig.Observer, calls it after each
+// retention pass this instance runs as the leader. WorkerObservers forwards
+// it to the observers that implement it.
+type RetentionObserver interface {
+	RetentionPassed(context.Context, RetentionPassEvent)
+}
+
+func (l workerObserverList) RetentionPassed(ctx context.Context, event RetentionPassEvent) {
+	for _, observer := range l {
+		if o, ok := observer.(RetentionObserver); ok {
+			o.RetentionPassed(ctx, event)
+		}
+	}
+}

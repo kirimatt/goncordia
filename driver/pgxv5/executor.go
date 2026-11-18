@@ -778,3 +778,50 @@ var (
 	_ driver.JobResultStore = (*executor)(nil)
 	_ driver.JobResultStore = (*txExecutor)(nil)
 )
+
+// JobPruneFinalized deletes up to params.Limit jobs of params.State finalized
+// at or before params.Before in one statement, through
+// idx_goncordia_jobs_finalized. Results go with them by ON DELETE CASCADE.
+func (e *executor) JobPruneFinalized(ctx context.Context, params driver.JobPruneParams) (int, error) {
+	tag, err := e.pool.Exec(ctx, `WITH expired AS (
+	SELECT id FROM goncordia_jobs
+	WHERE state = $1 AND finalized_at <= $2
+	ORDER BY finalized_at
+	LIMIT $3
+	FOR UPDATE SKIP LOCKED
+)
+DELETE FROM goncordia_jobs j USING expired WHERE j.id = expired.id`,
+		string(params.State), params.Before.UTC(), pruneLimit(params.Limit))
+	if err != nil {
+		return 0, fmt.Errorf("prune jobs: %w", err)
+	}
+	return int(tag.RowsAffected()), nil
+}
+
+// JobResultPrune deletes up to params.Limit results written at or before
+// params.Before, through idx_goncordia_job_results_updated. A result is
+// written moments before its job is finalized.
+func (e *executor) JobResultPrune(ctx context.Context, params driver.JobPruneParams) (int, error) {
+	tag, err := e.pool.Exec(ctx, `WITH expired AS (
+	SELECT job_id FROM goncordia_job_results
+	WHERE updated_at <= $1
+	ORDER BY updated_at
+	LIMIT $2
+	FOR UPDATE SKIP LOCKED
+)
+DELETE FROM goncordia_job_results r USING expired WHERE r.job_id = expired.job_id`,
+		params.Before.UTC(), pruneLimit(params.Limit))
+	if err != nil {
+		return 0, fmt.Errorf("prune results: %w", err)
+	}
+	return int(tag.RowsAffected()), nil
+}
+
+func pruneLimit(limit int) int {
+	if limit <= 0 {
+		return 500
+	}
+	return limit
+}
+
+var _ driver.JobPruner = (*executor)(nil)

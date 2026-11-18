@@ -899,3 +899,67 @@ var (
 	_ driver.JobResultStore = (*executor)(nil)
 	_ driver.JobResultStore = (*txExecutor)(nil)
 )
+
+// JobPruneFinalized deletes up to params.Limit jobs of params.State finalized
+// at or before params.Before, through the goncordia_jobs_finalized index.
+func (e *executor) JobPruneFinalized(ctx context.Context, params driver.JobPruneParams) (int, error) {
+	filter := bson.M{"state": string(params.State), "finalized_at": bson.M{"$lte": params.Before}}
+	ids, err := expiredIDs(ctx, e.db.Collection(jobsCollection), filter, "finalized_at", params.Limit)
+	if err != nil || len(ids) == 0 {
+		return 0, err
+	}
+	// The filter is repeated so jobs revived since the lookup stay.
+	filter["_id"] = bson.M{"$in": ids}
+	deleted, err := e.db.Collection(jobsCollection).DeleteMany(ctx, filter)
+	if err != nil {
+		return 0, fmt.Errorf("prune jobs: %w", err)
+	}
+	// Results share the job's _id. A job revived in between loses only a
+	// result it will write again when it runs.
+	if _, err := e.db.Collection(resultsCollection).DeleteMany(ctx, bson.M{"_id": bson.M{"$in": ids}}); err != nil {
+		return int(deleted.DeletedCount), fmt.Errorf("prune results of deleted jobs: %w", err)
+	}
+	return int(deleted.DeletedCount), nil
+}
+
+// JobResultPrune deletes up to params.Limit results written at or before
+// params.Before, through the goncordia_job_results_updated index. A result is
+// written moments before its job is finalized.
+func (e *executor) JobResultPrune(ctx context.Context, params driver.JobPruneParams) (int, error) {
+	results := e.db.Collection(resultsCollection)
+	ids, err := expiredIDs(ctx, results, bson.M{"updated_at": bson.M{"$lte": params.Before}}, "updated_at", params.Limit)
+	if err != nil || len(ids) == 0 {
+		return 0, err
+	}
+	deleted, err := results.DeleteMany(ctx, bson.M{"_id": bson.M{"$in": ids}})
+	if err != nil {
+		return 0, fmt.Errorf("prune results: %w", err)
+	}
+	return int(deleted.DeletedCount), nil
+}
+
+func expiredIDs(ctx context.Context, coll *mongo.Collection, filter bson.M, sortKey string, limit int) ([]bson.ObjectID, error) {
+	if limit <= 0 {
+		limit = 500
+	}
+	cursor, err := coll.Find(ctx, filter, options.Find().
+		SetSort(bson.D{{Key: sortKey, Value: 1}}).
+		SetLimit(int64(limit)).
+		SetProjection(bson.M{"_id": 1}))
+	if err != nil {
+		return nil, fmt.Errorf("select expired documents: %w", err)
+	}
+	var docs []struct {
+		ID bson.ObjectID `bson:"_id"`
+	}
+	if err := cursor.All(ctx, &docs); err != nil {
+		return nil, err
+	}
+	ids := make([]bson.ObjectID, len(docs))
+	for i, doc := range docs {
+		ids[i] = doc.ID
+	}
+	return ids, nil
+}
+
+var _ driver.JobPruner = (*executor)(nil)

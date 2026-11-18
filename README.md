@@ -95,7 +95,7 @@ tx.Commit(ctx)  // job and order appear atomically
 Requires Go 1.26 or newer.
 
 ```bash
-go get github.com/kirimatt/goncordia/v2@v2.5.1
+go get github.com/kirimatt/goncordia/v2@v2.6.0
 ```
 
 Pick a driver:
@@ -895,9 +895,53 @@ result, err := maintenance.Prune(ctx, goncordia.RetentionPolicy{
 ```
 
 Zero durations in `Prune` and `RunRetention` skip that state; negative ones
-other than `KeepForever` are rejected. Drivers implementing `driver.JobPruner`
-read only expired jobs from an index; Redis does. Others list terminal jobs
-page by page, so a pass costs time proportional to retained jobs.
+other than `KeepForever` are rejected.
+
+How a pass finds expired jobs depends on the driver:
+
+| Driver | How retention finds expired jobs |
+|---|---|
+| pgxv5, stdlib (Postgres, MySQL, SQLite), gorm, bun, MongoDB, Redis | index on state and finalization time, batched deletes (`driver.JobPruner`) |
+| Cassandra, ClickHouse, DynamoDB, Firestore, memory | lists terminal jobs page by page; cost grows with retained jobs |
+
+On SQL and MongoDB, `Migrate` creates the retention indexes
+(`idx_goncordia_jobs_finalized`, `idx_goncordia_job_results_updated`). Building
+an index on a large Postgres table blocks writes to it while the index is
+built. To avoid that, create the indexes yourself before upgrading; `Migrate`
+then skips them:
+
+```sql
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_goncordia_jobs_finalized ON goncordia_jobs (state, finalized_at);
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_goncordia_job_results_updated ON goncordia_job_results (updated_at);
+```
+
+#### Retention metrics
+
+`goncordia.NewRetentionMetrics()` counts passes and deletions. Use it as the
+pool's observer and serve it from the admin `/metrics` endpoint:
+
+```go
+retention := goncordia.NewRetentionMetrics()
+wp := goncordia.NewWorkerPool(d, registry, goncordia.WorkerConfig{
+    Observer: goncordia.WorkerObservers(futureManager, retention),
+})
+handler := admin.New(d, admin.WithMetrics(futureMetrics, retention))
+```
+
+| Metric | Type | Labels |
+|---|---|---|
+| `goncordia_retention_passes_total` | counter | `status` (`ok`, `error`) |
+| `goncordia_retention_jobs_deleted_total` | counter | — |
+| `goncordia_retention_results_deleted_total` | counter | — |
+| `goncordia_retention_last_success_timestamp_seconds` | gauge | — |
+| `goncordia_retention_last_pass_duration_seconds` | gauge | — |
+
+Only the instance holding the lease runs passes, so sum across instances.
+Alert on `time() - max(goncordia_retention_last_success_timestamp_seconds)`
+growing past a few intervals. `otelgoncordia.NewInstrumentation` records the
+same data as `goncordia.retention.passes`, `goncordia.retention.deleted`, and
+`goncordia.retention.duration`. A custom `WorkerObserver` receives passes by
+implementing `goncordia.RetentionObserver`.
 
 ---
 
@@ -1008,30 +1052,6 @@ type MyPolicy struct{}
 func (MyPolicy) NextRetryAt(attempt int, err error, clk clock.Clock) time.Time {
     return clk.Now().Add(time.Duration(attempt) * time.Minute)
 }
-```
-
----
-
-## Testing
-
-Use the in-memory driver — no database, no Docker, deterministic time:
-
-```go
-import (
-    "github.com/kirimatt/goncordia/v2/clock"
-    "github.com/kirimatt/goncordia/v2/driver/memory"
-)
-
-clk := clock.NewManual(time.Now())
-d   := memory.New(memory.WithClock(clk))
-
-client := goncordia.NewClient[memory.NoTx](d, goncordia.ClientConfig{Clock: clk})
-wp     := goncordia.NewWorkerPool[memory.NoTx](d, registry, goncordia.WorkerConfig{Clock: clk})
-
-go wp.Start(ctx)
-clk.Advance(time.Hour)  // trigger scheduled jobs instantly
-
-jobs := d.AllJobs()  // inspect state without a real database
 ```
 
 ---
@@ -1184,6 +1204,26 @@ clk.Advance(25 * time.Hour)
 // now start the pool — the job will be picked up immediately
 ```
 
+**Drive the in-memory driver directly** — no database, no Docker, deterministic time:
+
+```go
+import (
+    "github.com/kirimatt/goncordia/v2/clock"
+    "github.com/kirimatt/goncordia/v2/driver/memory"
+)
+
+clk := clock.NewManual(time.Now())
+d   := memory.New(memory.WithClock(clk))
+
+client := goncordia.NewClient[memory.NoTx](d, goncordia.ClientConfig{Clock: clk})
+wp     := goncordia.NewWorkerPool[memory.NoTx](d, registry, goncordia.WorkerConfig{Clock: clk})
+
+go wp.Start(ctx)
+clk.Advance(time.Hour)  // trigger scheduled jobs instantly
+
+jobs := d.AllJobs()  // inspect state without a real database
+```
+
 **Run an end-to-end flow in memory:**
 
 ```go
@@ -1253,6 +1293,9 @@ The instrumentation produces:
 - **Counter** `goncordia.job.finished` — selected durable outcomes
 - **Counter** `goncordia.job.heartbeat.count` — heartbeat outcomes (`ok`/`stale`/`error`)
 - **Counter** `goncordia.job.lease_rescued` — expired claims returned to queues
+- **Counter** `goncordia.retention.passes` — retention passes by `status`
+- **Counter** `goncordia.retention.deleted` — jobs and results deleted, by `what` (`jobs`/`results`)
+- **Histogram** `goncordia.retention.duration` (seconds) — retention pass duration by `status`
 - **Counter** `goncordia.job.count` — labelled by kind, queue, status (`ok` / `error`)
 
 Panics are recovered, converted to errors, recorded on the span, and persisted

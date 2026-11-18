@@ -217,6 +217,10 @@ Mount `admin.New(driver)` behind application authentication for the dashboard,
 JSON job/queue actions, health/readiness probes, and Prometheus metrics. Add
 futures metrics with `admin.WithMetrics(futureMetrics)`, where
 `futureMetrics := future.NewMetrics(nil)` is also the Manager's
-`future.Config.Observer` (combine observers with `future.Observers`). Workers
+`future.Config.Observer` (combine observers with `future.Observers`).
+Retention metrics come from `retention := goncordia.NewRetentionMetrics()`,
+passed as `WorkerConfig.Observer` (via `goncordia.WorkerObservers`) and to
+`admin.WithMetrics`; on SQL, MongoDB, and Redis, retention deletes through an
+index created by `Migrate`. Workers
 automatically rescue stale running jobs; tune `StuckJobTimeout` and
 `RescueInterval` in `WorkerConfig`.
