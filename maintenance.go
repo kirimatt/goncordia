@@ -251,7 +251,8 @@ type RetentionRunConfig struct {
 	// Interval, so a live leader renews before the lease expires.
 	LeaderTTL time.Duration
 	// OnPrune receives the outcome of every pass this instance runs as
-	// leader. Default: log errors with slog.
+	// leader, except a pass cut short because ctx ended, which is neither
+	// reported here nor to Observer. Default: log errors with slog.
 	OnPrune func(PruneResult, error)
 	// Observer also receives every pass, with its timing, for metrics such
 	// as RetentionMetrics.
@@ -310,6 +311,10 @@ func (m *Maintenance[TTx]) RunRetention(ctx context.Context, cfg RetentionRunCon
 		}
 		started := m.clock.Now()
 		result, err := m.Prune(ctx, cfg.Policy)
+		if err != nil && ctx.Err() != nil {
+			// Stopped mid-pass: not a failure, and the next leader resumes.
+			return
+		}
 		cfg.OnPrune(result, err)
 		if cfg.Observer != nil {
 			cfg.Observer.RetentionPassed(ctx, RetentionPassEvent{
