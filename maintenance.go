@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/kirimatt/goncordia/v2/clock"
@@ -30,12 +31,18 @@ type RetentionPolicy struct {
 	Completed time.Duration
 	Discarded time.Duration
 	Cancelled time.Duration
+	// Results deletes the stored future results of completed jobs finalized
+	// this long ago, while the job rows stay until Completed. Use it to free
+	// result storage early, including results nobody awaited. It has no
+	// effect when it is not shorter than Completed.
+	Results time.Duration
 }
 
 // PruneResult summarizes a retention pass.
 type PruneResult struct {
-	Scanned int `json:"scanned"`
-	Deleted int `json:"deleted"`
+	Scanned        int `json:"scanned"`
+	Deleted        int `json:"deleted"`
+	ResultsDeleted int `json:"results_deleted"`
 }
 
 // BulkFailure describes one item that could not be changed.
@@ -59,9 +66,10 @@ func NewMaintenance[TTx any](d driver.Driver[TTx], cfg MaintenanceConfig) *Maint
 	return &Maintenance[TTx]{driver: d, clock: clk}
 }
 
-// Prune deletes terminal jobs finalized on or before each configured cutoff.
+// Prune deletes terminal jobs finalized on or before each configured cutoff,
+// and the stored results of completed jobs older than policy.Results.
 func (m *Maintenance[TTx]) Prune(ctx context.Context, policy RetentionPolicy) (PruneResult, error) {
-	for _, duration := range []time.Duration{policy.Completed, policy.Discarded, policy.Cancelled} {
+	for _, duration := range []time.Duration{policy.Completed, policy.Discarded, policy.Cancelled, policy.Results} {
 		if duration < 0 {
 			return PruneResult{}, fmt.Errorf("retention duration must not be negative")
 		}
@@ -71,20 +79,22 @@ func (m *Maintenance[TTx]) Prune(ctx context.Context, policy RetentionPolicy) (P
 		return PruneResult{}, fmt.Errorf("%w: driver %q does not support job listing", driver.ErrUnsupported, m.driver.Name())
 	}
 
+	exec := m.driver.Executor()
+	now := m.clock.Now()
 	var result PruneResult
 	var errs []error
 	for _, item := range []struct {
 		state    driver.JobState
 		duration time.Duration
+		results  time.Duration
 	}{
-		{driver.JobStateCompleted, policy.Completed},
-		{driver.JobStateDiscarded, policy.Discarded},
-		{driver.JobStateCancelled, policy.Cancelled},
+		{driver.JobStateCompleted, policy.Completed, policy.Results},
+		{driver.JobStateDiscarded, policy.Discarded, 0},
+		{driver.JobStateCancelled, policy.Cancelled, 0},
 	} {
-		if item.duration == 0 {
+		if item.duration == 0 && item.results == 0 {
 			continue
 		}
-		cutoff := m.clock.Now().Add(-item.duration)
 		cursor := ""
 		for {
 			rows, err := admin.JobList(ctx, driver.JobListParams{State: item.state, Cursor: cursor, Limit: maintenancePageSize})
@@ -96,14 +106,27 @@ func (m *Maintenance[TTx]) Prune(ctx context.Context, policy RetentionPolicy) (P
 			}
 			for _, row := range rows {
 				result.Scanned++
-				if row.FinalizedAt == nil || row.FinalizedAt.After(cutoff) {
+				if row.FinalizedAt == nil {
 					continue
 				}
-				if err := m.driver.Executor().JobDelete(ctx, row.ID); err != nil {
-					errs = append(errs, fmt.Errorf("delete job %s: %w", row.ID, err))
-					continue
+				age := now.Sub(*row.FinalizedAt)
+				switch {
+				case item.duration > 0 && age >= item.duration:
+					if err := exec.JobDelete(ctx, row.ID); err != nil {
+						errs = append(errs, fmt.Errorf("delete job %s: %w", row.ID, err))
+						continue
+					}
+					result.Deleted++
+				case item.results > 0 && age >= item.results:
+					deleted, err := deleteResult(ctx, exec, row.ID)
+					if err != nil {
+						errs = append(errs, fmt.Errorf("delete result of job %s: %w", row.ID, err))
+						continue
+					}
+					if deleted {
+						result.ResultsDeleted++
+					}
 				}
-				result.Deleted++
 			}
 			if len(rows) < maintenancePageSize {
 				break
@@ -112,6 +135,99 @@ func (m *Maintenance[TTx]) Prune(ctx context.Context, policy RetentionPolicy) (P
 		}
 	}
 	return result, errors.Join(errs...)
+}
+
+// deleteResult removes a stored result and reports whether one existed, so
+// repeated passes do not count results that are already gone.
+func deleteResult(ctx context.Context, store driver.JobResultStore, jobID string) (bool, error) {
+	if _, err := store.JobResultGet(ctx, jobID); err != nil {
+		if errors.Is(err, driver.ErrNotFound) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, store.JobResultDelete(ctx, jobID)
+}
+
+// RetentionRunConfig configures Maintenance.RunRetention.
+type RetentionRunConfig struct {
+	// Policy is applied on every pass.
+	Policy RetentionPolicy
+	// Interval between passes. Default: one hour.
+	Interval time.Duration
+	// LeaderName identifies the retention lease. Default: "goncordia-retention".
+	LeaderName string
+	// WorkerID identifies this instance in the lease. Default: random.
+	WorkerID string
+	// LeaderTTL bounds how long a crashed leader blocks others. Default: twice
+	// Interval, so a live leader renews before the lease expires.
+	LeaderTTL time.Duration
+	// OnPrune receives the outcome of every pass this instance runs as
+	// leader. Default: log errors with slog.
+	OnPrune func(PruneResult, error)
+}
+
+// RunRetention prunes on a schedule until ctx ends. Run it in every instance:
+// each pass first takes a leader lease, so only one instance prunes at a
+// time, and another takes over if the leader stops. The first pass runs
+// immediately. It returns ctx's error, or a configuration error at once.
+func (m *Maintenance[TTx]) RunRetention(ctx context.Context, cfg RetentionRunConfig) error {
+	for _, duration := range []time.Duration{cfg.Policy.Completed, cfg.Policy.Discarded, cfg.Policy.Cancelled, cfg.Policy.Results, cfg.Interval, cfg.LeaderTTL} {
+		if duration < 0 {
+			return fmt.Errorf("retention durations must not be negative")
+		}
+	}
+	if cfg.Interval == 0 {
+		cfg.Interval = time.Hour
+	}
+	if cfg.LeaderName == "" {
+		cfg.LeaderName = "goncordia-retention"
+	}
+	if cfg.WorkerID == "" {
+		cfg.WorkerID = newWorkerID()
+	}
+	if cfg.LeaderTTL == 0 {
+		cfg.LeaderTTL = 2 * cfg.Interval
+	}
+	if cfg.OnPrune == nil {
+		cfg.OnPrune = func(_ PruneResult, err error) {
+			if err != nil {
+				slog.Error("goncordia retention error", "error", err)
+			}
+		}
+	}
+	exec := m.driver.Executor()
+	defer func() {
+		resignCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		_ = exec.LeaderResign(resignCtx, driver.LeaderResignParams{Name: cfg.LeaderName, WorkerID: cfg.WorkerID})
+	}()
+
+	pass := func() {
+		elected, err := exec.LeaderAttemptElect(ctx, driver.LeaderElectParams{
+			Name: cfg.LeaderName, WorkerID: cfg.WorkerID, TTL: cfg.LeaderTTL,
+		})
+		if err != nil {
+			if ctx.Err() == nil {
+				cfg.OnPrune(PruneResult{}, fmt.Errorf("retention leader election: %w", err))
+			}
+			return
+		}
+		if elected {
+			cfg.OnPrune(m.Prune(ctx, cfg.Policy))
+		}
+	}
+	ticker := m.clock.NewTicker(cfg.Interval)
+	defer ticker.Stop()
+	pass()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C():
+			pass()
+		}
+	}
 }
 
 // BulkRetry reschedules jobs at runAt. A zero runAt uses the injected clock.

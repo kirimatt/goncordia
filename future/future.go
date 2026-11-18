@@ -173,7 +173,8 @@ func (f *Future[R]) ID() string { return f.id }
 //
 // It returns the handler value for a completed job, a *JobError matching
 // ErrDiscarded or ErrCancelled for a failed job, ErrNoResult for a job that
-// completed without a stored value, and ErrNotFound (which also matches
+// completed without a stored value, ErrResultLost for a job whose stored
+// value disappeared (for example evicted from Redis), and ErrNotFound (which also matches
 // driver.ErrNotFound) when the job does not exist. Await does not wait for a
 // missing job to appear: a job whose transaction rolled back or has not
 // committed yet, or that was deleted, returns ErrNotFound immediately; the
@@ -279,6 +280,10 @@ func (f *Future[R]) check(ctx context.Context, stats *AwaitFinish) (R, bool, err
 	switch row.State {
 	case driver.JobStateCompleted:
 		raw, err := f.m.store.JobResultGet(ctx, f.id)
+		if errors.Is(err, driver.ErrResultLost) {
+			stats.Outcome = OutcomeResultLost
+			return f.resolve(zero, fmt.Errorf("%w: job %s: %w", ErrResultLost, f.id, err))
+		}
 		if errors.Is(err, driver.ErrNotFound) {
 			stats.Outcome = OutcomeNoResult
 			return f.resolve(zero, fmt.Errorf("%w: job %s", ErrNoResult, f.id))

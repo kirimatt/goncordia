@@ -9,7 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (driver/redis)
+- `Migrate` rejects an `allkeys-*` `maxmemory-policy` with
+  `redisdriver.ErrEvictionPolicy`, since eviction can drop jobs and results;
+  `WithAllowEviction()` opts out, and the check is skipped when `CONFIG` is
+  blocked.
+- A stored result that was evicted is reported as `driver.ErrResultLost`
+  (still matching `driver.ErrNotFound`); `Forget` clears the marker.
+
+---
+
+## [v2.4.0] — 2026-11-18
+
 ### Added
+- `future.ErrResultLost` and `driver.ErrResultLost` tell an evicted or
+  otherwise lost result apart from `ErrNoResult`; outcome `result_lost`.
+- `RetentionPolicy.Results` expires future results of completed jobs before
+  the job rows; `PruneResult.ResultsDeleted` counts them.
+- `Maintenance.RunRetention` prunes on a schedule under a leader lease, so
+  every instance can run it and only one prunes at a time.
 - `driver/mongodbv2`: the MongoDB driver on the official Go driver v2
   (`go.mongodb.org/mongo-driver/v2` v2.10.0). `New` takes a v2
   `*mongo.Client`, and the transaction type is `*mongo.Session`. It uses the
