@@ -316,8 +316,11 @@ func TestCompletedWithoutResult(t *testing.T) {
 func TestAwaitUnknownJob(t *testing.T) {
 	fx := newFixture(t)
 	_, err := Of[int](fx.m, "missing").Await(t.Context())
-	if !errors.Is(err, driver.ErrNotFound) {
-		t.Fatalf("err = %v, want ErrNotFound", err)
+	if !errors.Is(err, ErrNotFound) || !errors.Is(err, driver.ErrNotFound) {
+		t.Fatalf("err = %v, want future.ErrNotFound and driver.ErrNotFound", err)
+	}
+	if _, _, err := Of[int](fx.m, "missing").TryGet(t.Context()); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("TryGet err = %v, want ErrNotFound", err)
 	}
 	if fx.obs.lastAwait(t).Outcome != OutcomeNotFound {
 		t.Fatalf("outcome = %s", fx.obs.lastAwait(t).Outcome)

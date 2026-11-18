@@ -129,11 +129,11 @@ wp := goncordia.NewWorkerPool(d, registry, goncordia.WorkerConfig{Observer: m}) 
 billing := &Billing{sum: future.Bind(m, client, Sum)} // *future.Func[SumArgs, int]
 
 // application code: no type parameters, no queue client
-total, err := b.sum.Call(ctx, SumArgs{A: 2, B: 3}) // errors.Is(err, future.ErrDiscarded / ErrCancelled / ErrNoResult)
+total, err := b.sum.Call(ctx, SumArgs{A: 2, B: 3}) // errors.Is(err, future.ErrDiscarded / ErrCancelled / ErrNoResult / ErrNotFound)
 f, err := b.sum.With(&core.InsertOpts{Queue: "critical"}).Enqueue(ctx, args) // wait later with f.Await
 ```
 
-Use `future.BindTx` for `EnqueueTx(ctx, tx, args)`; await only after commit. After a rollback (or before commit) the job does not exist and `Await` returns `driver.ErrNotFound` immediately.
+Use `future.BindTx` for `EnqueueTx(ctx, tx, args)`; await only after commit. After a rollback (or before commit) the job does not exist and `Await` returns `future.ErrNotFound` immediately.
 
 Full runnable examples: `future/example_test.go` (memory) and
 `driver/pgxv5/example_future_test.go` (Postgres with `EnqueueTx`).

@@ -91,7 +91,7 @@ tx.Commit(ctx)  // job and order appear atomically
 Requires Go 1.26 or newer.
 
 ```bash
-go get github.com/kirimatt/goncordia/v2@v2.1.0
+go get github.com/kirimatt/goncordia/v2@v2.2.0
 ```
 
 Pick a driver:
@@ -635,7 +635,7 @@ later := g.resize.Of(f.ID())      // follow a job enqueued elsewhere
 To enqueue inside a transaction, bind with `future.BindTx`; the result also
 has `EnqueueTx(ctx, tx, args)`. Call `Await` only after the transaction
 commits. If the transaction rolls back, the job never exists, and `Await`
-returns an error matching `driver.ErrNotFound` immediately instead of waiting.
+returns `future.ErrNotFound` immediately instead of waiting.
 Awaiting before the commit, or after the job was deleted, gives the same
 error, because storage cannot tell these cases apart. The handler can live in the same package as the calling code when
 API and workers run in one binary; when they are separate binaries, keep the
@@ -646,7 +646,8 @@ available.
 `Await` returns the handler value, or an error you can classify with
 `errors.Is`: `future.ErrDiscarded` and `future.ErrCancelled` (both carry a
 `*future.JobError` with the last handler error), `future.ErrNoResult` for a job
-completed by a plain worker, and `driver.ErrNotFound` for an unknown job. Use
+completed by a plain worker, and `future.ErrNotFound` (also matches
+`driver.ErrNotFound`) for a job that does not exist. Use
 `EnqueueTx` the same way, and call `Await` only after the transaction commits.
 
 Futures work with every driver. Job state is read through the portable
