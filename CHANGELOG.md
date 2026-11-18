@@ -9,9 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+---
+
+## [v2.2.0] — 2026-11-18
+
+### Added
+- `future.ErrNotFound` for a job that does not exist (rolled-back or
+  uncommitted transaction, deleted job). It also matches
+  `driver.ErrNotFound`, so existing checks keep working.
+
 ### Documentation
 - `Await` on a job whose transaction rolled back (or has not committed)
-  returns `driver.ErrNotFound` immediately; documented and covered by a pgx v5
+  returns `future.ErrNotFound` immediately; documented and covered by a pgx v5
   test.
 
 ---

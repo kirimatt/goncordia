@@ -18,6 +18,10 @@ var (
 	// ErrNoResult reports a completed job without a stored value, for example
 	// one processed by a plain core.Worker instead of future.RegisterWorker.
 	ErrNoResult = errors.New("goncordia/future: job completed without a stored result")
+	// ErrNotFound reports a job that does not exist: its transaction rolled
+	// back or has not committed yet, or it was deleted. Storage cannot tell
+	// these apart. Errors matching ErrNotFound also match driver.ErrNotFound.
+	ErrNotFound = errors.New("goncordia/future: job not found")
 )
 
 // JobError describes a job that ended without a value.

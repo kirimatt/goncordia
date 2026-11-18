@@ -101,7 +101,7 @@ func (f *TxFunc[A, R, TTx]) With(opts *core.InsertOpts) *TxFunc[A, R, TTx] {
 
 // EnqueueTx inserts a job inside tx. The job is invisible until tx commits,
 // so call Await only after the commit. If tx rolls back, the job never
-// exists and Await returns an error matching driver.ErrNotFound at once.
+// exists and Await returns ErrNotFound at once.
 func (f *TxFunc[A, R, TTx]) EnqueueTx(ctx context.Context, tx TTx, args A) (*Future[R], error) {
 	result, err := f.enqueueTx(ctx, tx, args, f.opts)
 	if err != nil {
