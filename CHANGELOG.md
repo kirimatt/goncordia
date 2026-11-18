@@ -15,6 +15,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instead of every job. `Migrate` backfills them; run it again after a
   rolling upgrade.
 
+### Fixed (driver/firestore)
+- `JobGetByID` returns `driver.ErrNotFound` for a missing job instead of
+  `(nil, nil)`.
+
+---
+
+## [v2.5.1] — 2026-11-18
+
+### Fixed
+- `future.Await` no longer panics when a driver reports a missing job as
+  `(nil, nil)`; it returns `future.ErrNotFound`. On Firestore this happened
+  when awaiting a job that retention had deleted.
+- The `Executor` contract now states that `JobGetByID` reports a missing job
+  with `driver.ErrNotFound`, and `drivertest.Run` checks it.
+
 ---
 
 ## [v2.5.0] — 2026-11-18

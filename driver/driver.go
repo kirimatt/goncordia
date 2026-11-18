@@ -159,6 +159,8 @@ type baseExecutor interface {
 	// --- Jobs ---
 
 	JobInsertMany(ctx context.Context, params []JobInsertParams) ([]JobInsertResult, error)
+	// JobGetByID returns the job, or an error matching ErrNotFound when it
+	// does not exist. It never returns (nil, nil).
 	JobGetByID(ctx context.Context, id string) (*JobRow, error)
 	// JobFetchBatch atomically claims up to limit due jobs for processing in
 	// priority DESC, run_at ASC, created_at ASC, id ASC order.
