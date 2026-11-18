@@ -9,10 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Fixed (drivers stdlib v2.7.2, gorm v2.7.2)
+### Fixed (drivers stdlib v2.7.2, gorm v2.7.2; 2026-11-19)
 - The MySQL dialect works on MariaDB. Recording a job error used
   `CAST(? AS JSON)`, which MariaDB rejects, so a failed job stayed running
   until rescued. CI now runs the MySQL suite on MariaDB 11.4 as well.
+  gorm v2.7.2 requires stdlib v2.7.2.
 
 ---
 
