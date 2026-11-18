@@ -85,6 +85,7 @@ func TestFirestore_EnqueueAndProcess(t *testing.T) {
 	d := firestoredriver.New(client)
 	drivertest.Run(t, d.Executor())
 	drivertest.RunResults(t, d.Executor())
+	drivertest.RunRetention(t, d)
 
 	registry := core.NewRegistry()
 	var processed atomic.Int64

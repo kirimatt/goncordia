@@ -8,6 +8,7 @@ import (
 
 	"github.com/kirimatt/goncordia/v2"
 	"github.com/kirimatt/goncordia/v2/clock"
+	"github.com/kirimatt/goncordia/v2/core"
 	"github.com/kirimatt/goncordia/v2/driver"
 	"github.com/kirimatt/goncordia/v2/driver/memory"
 )
@@ -238,5 +239,51 @@ func TestMaintenanceRunRetentionElectsOneLeader(t *testing.T) {
 	m := goncordia.NewMaintenance(d, goncordia.MaintenanceConfig{Clock: clk})
 	if err := m.RunRetention(context.Background(), goncordia.RetentionRunConfig{Interval: -time.Second}); err == nil {
 		t.Fatal("negative Interval accepted")
+	}
+}
+
+func TestWorkerPoolPrunesByDefault(t *testing.T) {
+	clk := clock.NewManual(time.Date(2026, 8, 16, 8, 0, 0, 0, time.UTC))
+	d := memory.New(memory.WithClock(clk))
+	client := goncordia.NewClient(d, goncordia.ClientConfig{Clock: clk})
+	exec := d.Executor()
+	old := insertTerminalJob(t, context.Background(), client, exec, driver.JobStateCompleted)
+	if err := exec.JobResultPut(context.Background(), old, []byte(`1`)); err != nil {
+		t.Fatal(err)
+	}
+	kept := insertTerminalJob(t, context.Background(), client, exec, driver.JobStateDiscarded)
+
+	start := func(cfg goncordia.WorkerConfig) func() {
+		cfg.Clock = clk
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan struct{})
+		pool := goncordia.NewWorkerPool(d, core.NewRegistry(), cfg)
+		go func() {
+			defer close(done)
+			_ = pool.Start(ctx)
+		}()
+		return func() { cancel(); <-done }
+	}
+
+	stop := start(goncordia.WorkerConfig{RetentionInterval: -1})
+	clk.Advance(25 * time.Hour)
+	waitForCondition(t, time.Second, func() bool { return clk.ActiveTimers() >= 2 }, "pool tickers")
+	clk.Advance(10 * time.Minute)
+	if _, err := exec.JobGetByID(context.Background(), old); err != nil {
+		t.Fatalf("disabled retention pruned a job: %v", err)
+	}
+	stop()
+
+	stop = start(goncordia.WorkerConfig{}) // defaults: completed 24h, discarded 7d
+	defer stop()
+	waitForCondition(t, time.Second, func() bool {
+		_, err := exec.JobGetByID(context.Background(), old)
+		return errors.Is(err, driver.ErrNotFound)
+	}, "default retention of an old completed job")
+	if _, err := exec.JobResultGet(context.Background(), old); !errors.Is(err, driver.ErrNotFound) {
+		t.Fatalf("result survived: %v", err)
+	}
+	if _, err := exec.JobGetByID(context.Background(), kept); err != nil {
+		t.Fatalf("discarded job pruned before 7 days: %v", err)
 	}
 }

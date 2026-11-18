@@ -6,8 +6,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/redis/go-redis/v9"
+
 	redisdriver "github.com/kirimatt/goncordia/driver/redis/v2"
 	"github.com/kirimatt/goncordia/v2"
+	"github.com/kirimatt/goncordia/v2/clock"
 	"github.com/kirimatt/goncordia/v2/core"
 	"github.com/kirimatt/goncordia/v2/driver"
 	"github.com/kirimatt/goncordia/v2/future"
@@ -173,5 +176,92 @@ func TestRedis_MigrateRejectsAllkeysEviction(t *testing.T) {
 	allowed := redisdriver.New(rdb, redisdriver.WithAllowEviction())
 	if err := allowed.Migrate(ctx); err != nil {
 		t.Fatalf("Migrate with WithAllowEviction: %v", err)
+	}
+}
+
+// finishJob inserts a job, claims it, optionally stores a result, and moves
+// it to state.
+func finishJob(t *testing.T, exec driver.Executor, state driver.JobState, result bool) string {
+	t.Helper()
+	ctx := context.Background()
+	if _, err := exec.JobInsertMany(ctx, []driver.JobInsertParams{{Queue: "retention", Kind: "k", Args: []byte(`{}`), MaxRetry: 1}}); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := exec.JobFetchBatch(ctx, driver.FetchParams{Queue: "retention", Limit: 1, WorkerID: "w", LeaseDuration: time.Minute})
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("fetch = %+v, %v", rows, err)
+	}
+	if result {
+		if err := exec.JobResultPut(ctx, rows[0].ID, []byte(`1`)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := exec.JobSetStateIfRunning(ctx, driver.JobSetStateParams{
+		ID: rows[0].ID, State: state, ExpectedWorkerID: "w", ExpectedAttempt: rows[0].AttemptNum,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return rows[0].ID
+}
+
+func TestRedis_RetentionIndexes(t *testing.T) {
+	d, rdb := newDriver(t)
+	ctx := context.Background()
+	exec := d.Executor()
+	inIndex := func(key, id string) bool {
+		t.Helper()
+		err := rdb.ZScore(ctx, key, id).Err()
+		if err != nil && !errors.Is(err, redis.Nil) {
+			t.Fatal(err)
+		}
+		return err == nil
+	}
+
+	done := finishJob(t, exec, driver.JobStateCompleted, true)
+	failed := finishJob(t, exec, driver.JobStateDiscarded, false)
+	if !inIndex("goncordia:final:completed", done) || !inIndex("goncordia:results", done) || !inIndex("goncordia:final:discarded", failed) {
+		t.Fatal("finalization did not index the jobs")
+	}
+	// Retrying a discarded job takes it out of the terminal index.
+	if err := exec.JobReschedule(ctx, driver.RescheduleParams{ID: failed, RunAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	if inIndex("goncordia:final:discarded", failed) {
+		t.Fatal("rescheduled job is still indexed as discarded")
+	}
+
+	// Jobs written before v2.5.0 have no index entries until Migrate.
+	if err := rdb.Del(ctx, "goncordia:final:completed", "goncordia:results").Err(); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !inIndex("goncordia:final:completed", done) || !inIndex("goncordia:results", done) {
+		t.Fatal("Migrate did not backfill the retention indexes")
+	}
+	// A stale entry is dropped without being counted.
+	if err := rdb.ZAdd(ctx, "goncordia:final:completed", redis.Z{Score: 1, Member: "ghost"}).Err(); err != nil {
+		t.Fatal(err)
+	}
+
+	later := clock.NewManual(time.Now().Add(48 * time.Hour))
+	m := goncordia.NewMaintenance(d, goncordia.MaintenanceConfig{Clock: later})
+	result, err := m.Prune(ctx, goncordia.RetentionPolicy{Results: time.Hour})
+	if err != nil || result.ResultsDeleted != 1 || result.Deleted != 0 {
+		t.Fatalf("results pass = %+v, %v", result, err)
+	}
+	if _, err := exec.JobResultGet(ctx, done); !errors.Is(err, driver.ErrNotFound) || errors.Is(err, driver.ErrResultLost) {
+		t.Fatalf("pruned result err = %v, want ErrNotFound without ErrResultLost", err)
+	}
+	result, err = m.Prune(ctx, goncordia.RetentionPolicy{Completed: time.Hour})
+	if err != nil || result.Deleted != 1 {
+		t.Fatalf("completed pass = %+v, %v", result, err)
+	}
+	if n := rdb.ZCard(ctx, "goncordia:final:completed").Val(); n != 0 {
+		t.Fatalf("completed index keeps %d entries", n)
+	}
+	if _, err := exec.JobGetByID(ctx, failed); err != nil {
+		t.Fatalf("rescheduled job was pruned: %v", err)
 	}
 }

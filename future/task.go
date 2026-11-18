@@ -70,14 +70,21 @@ func (f *Func[A, R]) Enqueue(ctx context.Context, args A) (*Future[R], error) {
 
 // Call inserts a job and waits for its result. If ctx ends first, Call
 // returns ctx's error and the job keeps running; use Enqueue and Future.ID to
-// follow it later.
+// follow it later. After a value is returned, Call deletes the job and its
+// result, because the job ID never left Call; unique jobs, which other
+// callers may share, and failed jobs stay for retention. Set
+// Config.KeepCalledJobs to keep them all.
 func (f *Func[A, R]) Call(ctx context.Context, args A) (R, error) {
 	future, err := f.Enqueue(ctx, args)
 	if err != nil {
 		var zero R
 		return zero, err
 	}
-	return future.Await(ctx)
+	value, err := future.Await(ctx)
+	if err == nil {
+		f.m.release(ctx, future.id, future.unique)
+	}
+	return value, err
 }
 
 // Of returns a Future for an existing job of this task.

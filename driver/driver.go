@@ -124,6 +124,28 @@ type JobResultStore interface {
 	JobResultDelete(ctx context.Context, jobID string) error
 }
 
+// JobPruner is an optional executor capability for drivers that can find old
+// terminal jobs and results without scanning every job, for example through
+// an index. Maintenance retention uses it when present and falls back to
+// JobList otherwise.
+type JobPruner interface {
+	// JobPruneFinalized deletes up to Limit jobs in State finalized at or
+	// before Before, together with their results, and returns how many it
+	// deleted.
+	JobPruneFinalized(ctx context.Context, params JobPruneParams) (int, error)
+	// JobResultPrune deletes up to Limit stored results of jobs in
+	// JobStateCompleted finalized at or before Before, keeping the jobs, and
+	// returns how many it deleted.
+	JobResultPrune(ctx context.Context, params JobPruneParams) (int, error)
+}
+
+// JobPruneParams selects terminal jobs for JobPruner.
+type JobPruneParams struct {
+	State  JobState
+	Before time.Time
+	Limit  int
+}
+
 // AdminExecutor is an optional executor capability used by the admin HTTP API
 // for filtered job inspection and queue-depth metrics.
 type AdminExecutor interface {

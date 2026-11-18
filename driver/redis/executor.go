@@ -26,13 +26,38 @@ const (
 	jobsIndexKey = "goncordia:jobs:created"
 )
 
-func availKey(q string) string      { return "goncordia:q:" + q + ":avail" }
-func schedKey(q string) string      { return "goncordia:q:" + q + ":sched" }
-func runKey(q string) string        { return "goncordia:q:" + q + ":run" }
-func metaKey(q string) string       { return "goncordia:q:" + q + ":meta" }
-func jobKey(id string) string       { return jobKeyPrefix + id }
-func uniqKey(k string) string       { return "goncordia:uniq:" + k }
-func resultKey(id string) string    { return "goncordia:result:" + id }
+func availKey(q string) string   { return "goncordia:q:" + q + ":avail" }
+func schedKey(q string) string   { return "goncordia:q:" + q + ":sched" }
+func runKey(q string) string     { return "goncordia:q:" + q + ":run" }
+func metaKey(q string) string    { return "goncordia:q:" + q + ":meta" }
+func jobKey(id string) string    { return jobKeyPrefix + id }
+func uniqKey(k string) string    { return "goncordia:uniq:" + k }
+func resultKey(id string) string { return "goncordia:result:" + id }
+
+// finalKey indexes terminal jobs of one state by finalization time and
+// resultsIndexKey indexes stored results by write time, so retention reads
+// only expired entries instead of every job.
+func finalKey(state driver.JobState) string { return "goncordia:final:" + string(state) }
+
+const resultsIndexKey = "goncordia:results"
+
+var terminalStates = []driver.JobState{driver.JobStateCompleted, driver.JobStateDiscarded, driver.JobStateCancelled}
+
+func isTerminal(state string) bool {
+	for _, s := range terminalStates {
+		if string(s) == state {
+			return true
+		}
+	}
+	return false
+}
+
+// unindexFinal removes id from every terminal-state index.
+func unindexFinal(ctx context.Context, pipe redis.Pipeliner, id string) {
+	for _, state := range terminalStates {
+		pipe.ZRem(ctx, finalKey(state), id)
+	}
+}
 func leaderKey(n string) string     { return "goncordia:leader:" + n }
 func notifyChannel(q string) string { return "goncordia:notify:" + q }
 
@@ -261,6 +286,7 @@ return 1
 
 // putResultScript stores a result only while the job exists and marks the job
 // with has_result in the same atomic step.
+// KEYS: job, result, results index. ARGV: value, now_ms, job id.
 var putResultScript = redis.NewScript(`
 local raw = redis.call('GET', KEYS[1])
 if not raw then return 0 end
@@ -274,13 +300,16 @@ if job.has_result ~= true then
   redis.call('SET', KEYS[1], cjson.encode(job))
 end
 redis.call('SET', KEYS[2], ARGV[1])
+redis.call('ZADD', KEYS[3], ARGV[2], ARGV[3])
 return 1
 `)
 
 // deleteResultScript removes a result and clears has_result, so a deliberate
 // delete is not reported as a lost result.
+// KEYS: job, result, results index. ARGV: job id.
 var deleteResultScript = redis.NewScript(`
 redis.call('DEL', KEYS[2])
+redis.call('ZREM', KEYS[3], ARGV[1])
 local raw = redis.call('GET', KEYS[1])
 if not raw then return 0 end
 local ok, job = pcall(cjson.decode, raw)
@@ -396,7 +425,7 @@ func (e *executor) JobCancel(ctx context.Context, id string) error {
 
 // JobResultPut stores a result only while the job key exists.
 func (e *executor) JobResultPut(ctx context.Context, jobID string, value []byte) error {
-	stored, err := putResultScript.Run(ctx, e.rdb, []string{jobKey(jobID), resultKey(jobID)}, value).Int()
+	stored, err := putResultScript.Run(ctx, e.rdb, resultKeys(jobID), value, e.clk.Now().UnixMilli(), jobID).Int()
 	if err != nil {
 		return err
 	}
@@ -428,7 +457,73 @@ func (e *executor) JobResultGet(ctx context.Context, jobID string) ([]byte, erro
 
 // JobResultDelete removes a stored result. Missing results are ignored.
 func (e *executor) JobResultDelete(ctx context.Context, jobID string) error {
-	return deleteResultScript.Run(ctx, e.rdb, []string{jobKey(jobID), resultKey(jobID)}).Err()
+	return deleteResultScript.Run(ctx, e.rdb, resultKeys(jobID), jobID).Err()
+}
+
+// resultKeys are the KEYS of putResultScript and deleteResultScript.
+func resultKeys(jobID string) []string {
+	return []string{jobKey(jobID), resultKey(jobID), resultsIndexKey}
+}
+
+// JobPruneFinalized deletes jobs of params.State finalized at or before
+// params.Before, reading only the expired range of the state index.
+func (e *executor) JobPruneFinalized(ctx context.Context, params driver.JobPruneParams) (int, error) {
+	ids, err := e.expired(ctx, finalKey(params.State), params)
+	if err != nil {
+		return 0, err
+	}
+	deleted := 0
+	for _, id := range ids {
+		raw, err := e.rdb.Get(ctx, jobKey(id)).Bytes()
+		if err != nil && !errors.Is(err, redis.Nil) {
+			return deleted, err
+		}
+		var job redisJob
+		if err == nil {
+			if err := json.Unmarshal(raw, &job); err != nil {
+				return deleted, fmt.Errorf("decode job %s: %w", id, err)
+			}
+		}
+		if err != nil || job.State != string(params.State) {
+			// Stale entry: the job is gone or left the state. It is not
+			// counted, so a page with stale entries ends this pass early and
+			// the next pass continues.
+			if err := e.rdb.ZRem(ctx, finalKey(params.State), id).Err(); err != nil {
+				return deleted, err
+			}
+			continue
+		}
+		if err := jobDelete(ctx, e.rdb, id); err != nil && !errors.Is(err, driver.ErrNotFound) {
+			return deleted, err
+		}
+		deleted++
+	}
+	return deleted, nil
+}
+
+// JobResultPrune deletes results stored at or before params.Before. A
+// result is written moments before its job is finalized.
+func (e *executor) JobResultPrune(ctx context.Context, params driver.JobPruneParams) (int, error) {
+	ids, err := e.expired(ctx, resultsIndexKey, params)
+	if err != nil {
+		return 0, err
+	}
+	for i, id := range ids {
+		if err := deleteResultScript.Run(ctx, e.rdb, resultKeys(id), id).Err(); err != nil {
+			return i, err
+		}
+	}
+	return len(ids), nil
+}
+
+func (e *executor) expired(ctx context.Context, key string, params driver.JobPruneParams) ([]string, error) {
+	limit := params.Limit
+	if limit <= 0 {
+		limit = 500
+	}
+	return e.rdb.ZRangeArgs(ctx, redis.ZRangeArgs{
+		Key: key, ByScore: true, Start: "-inf", Stop: params.Before.UnixMilli(), Count: int64(limit),
+	}).Result()
 }
 
 func (e *executor) JobDelete(ctx context.Context, id string) error {
@@ -780,8 +875,11 @@ func jobSetStateIfRunning(ctx context.Context, rdb *redis.Client, clk clock.Cloc
 					} else {
 						pipe.ZAdd(ctx, availKey(job.Queue), redis.Z{Score: priorityScore(job.Priority, retryAt), Member: params.ID})
 					}
-				case job.UniqueKey != "" && !driver.IsPermanentUniqueKey(job.UniqueKey):
-					pipe.Del(ctx, uniqKey(job.UniqueKey))
+				default:
+					pipe.ZAdd(ctx, finalKey(params.State), redis.Z{Score: float64(job.FinalizedAtMs), Member: params.ID})
+					if job.UniqueKey != "" && !driver.IsPermanentUniqueKey(job.UniqueKey) {
+						pipe.Del(ctx, uniqKey(job.UniqueKey))
+					}
 				}
 				return nil
 			})
@@ -823,6 +921,7 @@ func jobCancel(ctx context.Context, rdb *redis.Client, clk clock.Clock, id strin
 	pipe.ZRem(ctx, schedKey(job.Queue), id)
 	updated, _ := json.Marshal(job)
 	pipe.Set(ctx, jobKey(id), updated, 0)
+	pipe.ZAdd(ctx, finalKey(driver.JobStateCancelled), redis.Z{Score: float64(job.FinalizedAtMs), Member: id})
 	_, err = pipe.Exec(ctx)
 	return err
 }
@@ -845,6 +944,8 @@ func jobDelete(ctx context.Context, rdb *redis.Client, id string) error {
 	pipe.ZRem(ctx, schedKey(job.Queue), id)
 	pipe.HDel(ctx, runKey(job.Queue), id)
 	pipe.ZRem(ctx, jobsIndexKey, id)
+	pipe.ZRem(ctx, resultsIndexKey, id)
+	unindexFinal(ctx, pipe, id)
 	if job.UniqueKey != "" {
 		pipe.Del(ctx, uniqKey(job.UniqueKey))
 	}
@@ -872,6 +973,7 @@ func jobReschedule(ctx context.Context, rdb *redis.Client, params driver.Resched
 	pipe.ZAdd(ctx, schedKey(job.Queue), redis.Z{Score: float64(params.RunAt.UnixMilli()), Member: params.ID})
 	updated, _ := json.Marshal(job)
 	pipe.Set(ctx, jobKey(params.ID), updated, 0)
+	unindexFinal(ctx, pipe, params.ID)
 	_, err = pipe.Exec(ctx)
 	return err
 }
@@ -1099,6 +1201,7 @@ func (l *listener) Close() error {
 
 // compile-time checks
 var _ driver.Executor = (*executor)(nil)
+var _ driver.JobPruner = (*executor)(nil)
 var _ driver.ExecutorTx = (*txExecutor)(nil)
 
 var (
