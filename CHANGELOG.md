@@ -11,6 +11,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [v2.7.0] — 2026-11-18
+
+### Added
+- The retention conformance suite (`drivertest.RunRetention`) checks that a
+  discarded job rescheduled by an operator survives retention.
+
+### Added (drivers v2.7.0)
+- Cassandra, ClickHouse, DynamoDB, and Firestore implement `driver.JobPruner`,
+  so every driver now prunes through an index instead of listing jobs:
+  - DynamoDB: sparse, 16-way sharded GSI `gsi_retention` on terminal jobs.
+  - Firestore: query on `state`, `finalized_at`; needs the composite index
+    `state ASC, finalized_at ASC` on `goncordia_jobs`.
+  - Cassandra: lookup tables `goncordia_jobs_finalized` and
+    `goncordia_results_written`, walked from a stored watermark.
+  - ClickHouse: skip indexes on `state`, `finalized_at`, `id`, and result
+    `updated_at`; expired rows, and rows `JobDelete` marked deleted, are
+    removed with lightweight `DELETE`.
+
+### Upgrading (drivers v2.7.0)
+- These drivers do not migrate existing data. A DynamoDB jobs table created
+  before v2.7.0 has no `gsi_retention`, so retention fails until you add it
+  (key `rt_pk` HASH, `rt_at` RANGE, keys-only projection) or recreate the
+  table. Cassandra and DynamoDB prune only jobs finalized after the upgrade.
+  ClickHouse tables keep working without the skip indexes, but each pass
+  scans the table; add them with `ALTER TABLE … ADD INDEX`.
+
+---
+
 ## [v2.6.0] — 2026-11-18
 
 ### Added

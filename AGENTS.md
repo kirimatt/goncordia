@@ -203,7 +203,7 @@ Workers on these backends must be **idempotent** — a job may be executed more 
 - **Futures cleanup**: `Func.Call` deletes its job and result after returning a value (not unique or failed jobs); `future.Config.KeepCalledJobs` keeps them.
 - **MongoDB**: requires a replica set; standalone MongoDB will fail at `New()`.
 - **SQLite**: set `db.SetMaxOpenConns(1)` — SQLite allows only one writer.
-- **Firestore**: `Migrate` is a no-op; create the composite index manually in Firebase console: collection `goncordia_jobs`, fields `queue ASC, state ASC, run_at ASC`.
+- **Firestore**: `Migrate` is a no-op; create the composite indexes manually in Firebase console: collection `goncordia_jobs`, fields `queue ASC, state ASC, run_at ASC` (fetching) and `state ASC, finalized_at ASC` (retention).
 
 ## Injected time
 
@@ -220,7 +220,8 @@ futures metrics with `admin.WithMetrics(futureMetrics)`, where
 `future.Config.Observer` (combine observers with `future.Observers`).
 Retention metrics come from `retention := goncordia.NewRetentionMetrics()`,
 passed as `WorkerConfig.Observer` (via `goncordia.WorkerObservers`) and to
-`admin.WithMetrics`; on SQL, MongoDB, and Redis, retention deletes through an
-index created by `Migrate`. Workers
+`admin.WithMetrics`; every driver except memory prunes through an index
+(created by `Migrate`, except the Firestore composite index
+`state ASC, finalized_at ASC`, which you create). Workers
 automatically rescue stale running jobs; tune `StuckJobTimeout` and
 `RescueInterval` in `WorkerConfig`.
