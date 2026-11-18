@@ -1,0 +1,128 @@
+---
+title: "Observability"
+description: "OpenTelemetry tracing and metrics"
+---
+
+```bash
+go get github.com/kirimatt/goncordia/otel/v2@v2.6.0
+```
+
+```go
+import otelgoncordia "github.com/kirimatt/goncordia/otel/v2"
+
+instrumentation := otelgoncordia.NewInstrumentation(
+    otelgoncordia.WithTracerProvider(tp),
+    otelgoncordia.WithMeterProvider(mp),
+    otelgoncordia.WithClock(clk),
+)
+
+client := pgxdriver.NewClient(d, goncordia.ClientConfig{
+    Observer: instrumentation,
+})
+
+wp := pgxdriver.NewWorkerPool(d, registry, goncordia.WorkerConfig{
+    Queues:      []string{"default"},
+    Concurrency: 10,
+    Observer:    instrumentation,
+    Middleware: []goncordia.JobMiddleware{
+        otelgoncordia.NewMiddleware(
+            // optional — defaults to otel.GetTracerProvider() / otel.GetMeterProvider()
+            otelgoncordia.WithTracerProvider(tp),
+            otelgoncordia.WithMeterProvider(mp),
+            otelgoncordia.WithClock(clk), // optional; use the same Manual clock in tests
+        ),
+    },
+})
+```
+
+The instrumentation produces:
+
+- **Span** `goncordia.enqueue` with driver, batch, queue/kind, and outcome attributes
+- **Span** `goncordia.process` with job, worker, and pipeline attributes
+- **Histogram** `goncordia.enqueue.duration` (seconds) — storage latency by driver/status
+- **Histogram** `goncordia.job.duration` (seconds) — labelled by kind, queue, status
+- **Histogram** `goncordia.job.queue_time` (seconds) — time from eligibility
+  (`max(created_at, run_at)`) to handler start; scheduled waiting is excluded
+- **Histogram** `goncordia.job.schedule_lag` (seconds) — scheduled `run_at` to claim
+- **Histogram** `goncordia.job.claim_wait` (seconds) — claim to handler start
+- **Histogram** `goncordia.job.rate_limit_wait` (seconds) — local/global policy delay
+- **Counter** `goncordia.job.started` — handler starts by kind and queue
+- **Counter** `goncordia.job.finished` — selected durable outcomes
+- **Counter** `goncordia.job.heartbeat.count` — heartbeat outcomes (`ok`/`stale`/`error`)
+- **Counter** `goncordia.job.lease_rescued` — expired claims returned to queues
+- **Counter** `goncordia.retention.passes` — retention passes by `status`
+- **Counter** `goncordia.retention.deleted` — jobs and results deleted, by `what` (`jobs`/`results`)
+- **Histogram** `goncordia.retention.duration` (seconds) — retention pass duration by `status`
+- **Counter** `goncordia.job.count` — labelled by kind, queue, status (`ok` / `error`)
+
+Panics are recovered, converted to errors, recorded on the span, and persisted
+with their stack trace in `driver.AttemptError.Trace` before retry/discard. The
+worker pool always stays alive.
+
+## Futures
+
+`NewFutureInstrumentation` implements `future.Observer`:
+
+```go
+m, err := future.New(d, future.Config{
+    Observer: otelgoncordia.NewFutureInstrumentation(
+        otelgoncordia.WithTracerProvider(tp), otelgoncordia.WithMeterProvider(mp),
+    ),
+})
+```
+
+| Signal | Name | Attributes |
+|---|---|---|
+| span | `goncordia.future.await` | job id, kind, queue, state, outcome, polls, wakeups, result bytes |
+| span | `goncordia.future.store` | job id, kind, queue, attempt, result bytes; child of `goncordia.process` |
+| histogram (s) | `goncordia.future.await.duration` | kind, outcome, blocking |
+| counter | `goncordia.future.await.polls` | kind |
+| counter | `goncordia.future.await.wakeups` | kind |
+| histogram (By) | `goncordia.future.result.size` | kind |
+| histogram (s) | `goncordia.future.store.duration` | kind, status |
+
+Combine it with the Prometheus-text `future.Metrics` through
+`future.Observers` to serve the same signals from the admin `/metrics`
+endpoint (see [Admin dashboard](/admin)).
+
+Outcomes are `completed`, `discarded`, `cancelled`, `no_result`, `not_found`,
+`pending` (TryGet only), `abandoned` (caller context ended), and `error`.
+Few wakeups relative to polls mean producers and workers run in different
+processes, and await latency is bounded by `PollInterval`.
+
+## Custom observers
+
+`WorkerConfig.Observer` receives every worker lifecycle event: claim, handler
+start and finish, rate-limit wait, heartbeat, and rescue. Embed
+`goncordia.NopWorkerObserver` to handle only the events you need, and combine
+observers with `goncordia.WorkerObservers`:
+
+```go
+type slowJobs struct{ goncordia.NopWorkerObserver }
+
+func (slowJobs) JobFinished(ctx context.Context, e goncordia.JobFinishedEvent) {
+    if e.FinishedAt.Sub(e.StartedAt) > time.Minute {
+        slog.WarnContext(ctx, "slow job", "kind", e.Job.Kind, "id", e.Job.ID)
+    }
+}
+
+Observer: goncordia.WorkerObservers(instrumentation, futures, slowJobs{}),
+```
+
+You can also add your own middleware for logging or custom metrics:
+
+```go
+func loggingMiddleware(ctx context.Context, job *core.RawJob, next func(context.Context, *core.RawJob) error) error {
+    slog.InfoContext(ctx, "job started", "kind", job.Kind, "id", job.ID)
+    err := next(ctx, job)
+    slog.InfoContext(ctx, "job finished", "kind", job.Kind, "err", err)
+    return err
+}
+
+goncordia.WorkerConfig{
+    Middleware: []goncordia.JobMiddleware{
+        otelgoncordia.NewMiddleware(),
+        loggingMiddleware,
+    },
+}
+```

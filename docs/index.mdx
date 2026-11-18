@@ -1,0 +1,50 @@
+---
+title: "Introduction"
+description: "Background job queue for Go on the database you already use"
+---
+
+**A background job queue for Go that runs on the database you already have.**
+Enqueue jobs in the same transaction as your data, process them with retries,
+schedules, and priorities, and await a job's typed result when you need it —
+on Postgres, MySQL, SQLite, MongoDB, Redis, Cassandra, ClickHouse, DynamoDB,
+Firestore, or in memory. No new broker to run.
+
+Use it for the jobs a Go service sends to the background: emails and
+notifications, webhooks, report and thumbnail generation, syncing with
+external APIs, and periodic cleanups. It covers the role of Sidekiq or Celery
+in Go, plus the transactional outbox pattern.
+
+One `Driver[TTx]` interface, parameterized by your database library's native
+transaction type (`pgx.Tx`, `*sql.Tx`, `*gorm.DB`, `bun.Tx`, `*mongo.Session`,
+…), connects the client and workers to storage without an adapter layer.
+
+`EnqueueTx` implements the [transactional outbox pattern](https://microservices.io/patterns/data/transactional-outbox.html): the job is written inside your existing transaction and becomes visible to workers only after commit. If the transaction rolls back, the job disappears — no separate relay process, no dual-write risk.
+
+```go
+tx, _ := pool.Begin(ctx)
+_, _ = queries.CreateOrder(ctx, tx, order)
+_, _ = client.EnqueueTx(ctx, tx, SendConfirmationArgs{OrderID: order.ID}, nil)
+tx.Commit(ctx)  // job and order appear atomically
+```
+
+## Features
+
+- **Transactional inserts** — `EnqueueTx` shares your existing transaction; the job appears if and only if that transaction commits
+- **Scheduled jobs** — `InsertOpts.RunAt` for future execution
+- **Priority queues** — higher priority processed first within a queue
+- **Unique jobs** — deduplicate by kind, args, queue, or time window
+- **Retry with backoff** — exponential (default), fixed, or custom `RetryPolicy`
+- **Crash recovery** — abandoned `running` jobs are automatically returned to the queue
+- **Execution controls** — global and per-kind concurrency, per-job timeouts, stable worker IDs
+- **Pipelines** — serialize jobs sharing a `PipelineID` locally or, optionally, across worker processes
+- **Fair multi-queue scheduling** — weighted round-robin with per-queue concurrency and composable local/global execution rate limits
+- **Payload evolution** — versioned payloads with ordered upcasters and permanent decode failures
+- **Batch enqueue** — shared options or independent per-item options, with transactional variants
+- **Futures** — enqueue a job and `Await` the value its handler returns, with local wake-up and polling fallback; `Call` runs a one-shot job like a function call
+- **Retention by default** — old completed, cancelled, and discarded jobs and future results are pruned under a leader lease
+- **Queue pause/resume** — drain a queue without stopping workers
+- **Push notifications** — LISTEN/NOTIFY (Postgres), Change Streams (MongoDB), Pub/Sub (Redis); polling fallback elsewhere
+- **SKIP LOCKED** — lock-free concurrent fetching on Postgres and MySQL
+- **Periodic / cron jobs** — lease-based single-leader scheduling across multiple instances
+- **Admin and metrics** — embeddable dashboard, JSON API, health probes, and Prometheus endpoint
+- **`clock.Manual`** — injected deterministic time for clients, workers, schedulers, and drivers

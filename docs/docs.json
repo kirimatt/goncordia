@@ -1,0 +1,43 @@
+{
+  "$schema": "https://context7.com/schema/docs7.json",
+  "name": "goncordia",
+  "colors": {
+    "primary": "#0E7490"
+  },
+  "navigation": {
+    "groups": [
+      {
+        "group": "Get started",
+        "pages": [
+          "index",
+          "installation",
+          "quickstart",
+          "drivers",
+          "backends",
+          "comparison"
+        ]
+      },
+      {
+        "group": "Guides",
+        "pages": [
+          "jobs",
+          "workers",
+          "futures",
+          "cron",
+          "retention",
+          "admin",
+          "testing",
+          "observability"
+        ]
+      },
+      {
+        "group": "Reference",
+        "pages": [
+          "custom-driver",
+          "benchmarks",
+          "migrating-to-v2"
+        ]
+      }
+    ]
+  }
+}
