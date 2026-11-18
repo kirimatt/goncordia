@@ -131,8 +131,18 @@ func Run(t *testing.T, exec driver.Executor) {
 	if err != nil || row == nil || row.PipelineID != "entity-1" || row.Timeout != time.Second {
 		t.Fatalf("get inserted job: row=%+v err=%v", row, err)
 	}
-	if missing, err := exec.JobGetByID(ctx, "missing-"+queue); !errors.Is(err, driver.ErrNotFound) {
-		t.Fatalf("get missing job: row=%+v err=%v, want ErrNotFound", missing, err)
+	// A deleted job gives a well-formed ID that no longer exists.
+	gone, err := exec.JobInsertMany(ctx, []driver.JobInsertParams{{
+		Queue: queue + "-gone", Kind: "conformance", Args: []byte(`{}`), MaxRetry: 1,
+	}})
+	if err != nil || len(gone) != 1 || gone[0].Job == nil {
+		t.Fatalf("insert job to delete: %+v, %v", gone, err)
+	}
+	if err := exec.JobDelete(ctx, gone[0].Job.ID); err != nil {
+		t.Fatalf("delete job: %v", err)
+	}
+	if missing, err := exec.JobGetByID(ctx, gone[0].Job.ID); !errors.Is(err, driver.ErrNotFound) {
+		t.Fatalf("get deleted job: row=%+v err=%v, want ErrNotFound", missing, err)
 	}
 
 	adminExec, ok := exec.(driver.AdminExecutor)
