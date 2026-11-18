@@ -16,6 +16,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - The retention conformance suite (`drivertest.RunRetention`) checks that a
   discarded job rescheduled by an operator survives retention.
+- `drivertest.RunScheduled` checks `JobReschedule`: the job is not claimable
+  at its old `run_at` and is claimable at the new one.
 
 ### Added (drivers v2.7.0)
 - Cassandra, ClickHouse, DynamoDB, and Firestore implement `driver.JobPruner`,
@@ -28,6 +30,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - ClickHouse: skip indexes on `state`, `finalized_at`, `id`, and result
     `updated_at`; expired rows, and rows `JobDelete` marked deleted, are
     removed with lightweight `DELETE`.
+
+### Fixed (drivers v2.7.0)
+- Cassandra: `JobReschedule` (admin "retry" of a discarded job) always failed
+  with `Invalid operation (version = version + 1)`. It now updates the
+  version conditionally and moves the job's `run_at` lookup entry, so the
+  rescheduled job is claimed at its new time.
 
 ### Upgrading (drivers v2.7.0)
 - These drivers do not migrate existing data. A DynamoDB jobs table created
