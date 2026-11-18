@@ -129,7 +129,7 @@ go get github.com/kirimatt/goncordia/driver/clickhouse/v2@v2.2.0
 go get github.com/kirimatt/goncordia/driver/dynamodb/v2@v2.2.0
 
 # Cloud Firestore
-go get github.com/kirimatt/goncordia/driver/firestore/v2@v2.2.0
+go get github.com/kirimatt/goncordia/driver/firestore/v2@v2.5.1
 ```
 
 The root v1 module intentionally does not download every database SDK. Driver,
