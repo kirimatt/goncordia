@@ -24,8 +24,8 @@ import (
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
 	tcredis "github.com/testcontainers/testcontainers-go/modules/redis"
 	"github.com/testcontainers/testcontainers-go/wait"
-	"go.mongodb.org/mongo-driver/mongo"
-	mongoopts "go.mongodb.org/mongo-driver/mongo/options"
+	"go.mongodb.org/mongo-driver/v2/mongo"
+	mongoopts "go.mongodb.org/mongo-driver/v2/mongo/options"
 
 	"cloud.google.com/go/firestore"
 
@@ -33,7 +33,7 @@ import (
 	clickhousedriver "github.com/kirimatt/goncordia/driver/clickhouse/v2"
 	dynamodbdriver "github.com/kirimatt/goncordia/driver/dynamodb/v2"
 	firestoredriver "github.com/kirimatt/goncordia/driver/firestore/v2"
-	mongodriver "github.com/kirimatt/goncordia/driver/mongodb/v2"
+	mongodriver "github.com/kirimatt/goncordia/driver/mongodbv2/v2"
 	pgxv5driver "github.com/kirimatt/goncordia/driver/pgxv5/v2"
 	redisdriver "github.com/kirimatt/goncordia/driver/redis/v2"
 	"github.com/kirimatt/goncordia/v2/driver"
@@ -41,7 +41,7 @@ import (
 
 var (
 	benchPgxDriver        driver.Driver[pgx.Tx]
-	benchMongoDriver      driver.Driver[mongo.SessionContext]
+	benchMongoDriver      driver.Driver[*mongo.Session]
 	benchRedisDriver      driver.Driver[redisdriver.NoTx]
 	benchCassandraDriver  driver.Driver[cassandradriver.NoTx]
 	benchClickHouseDriver driver.Driver[clickhousedriver.NoTx]
@@ -127,7 +127,7 @@ func startPostgres(ctx context.Context) (driver.Driver[pgx.Tx], func()) {
 	}
 }
 
-func startMongo(ctx context.Context) (driver.Driver[mongo.SessionContext], func()) {
+func startMongo(ctx context.Context) (driver.Driver[*mongo.Session], func()) {
 	ctr, err := tcmongo.Run(ctx, "mongo:8.0", tcmongo.WithReplicaSet("rs0"))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "bench: skip mongodb benchmarks: %v\n", err)
@@ -143,7 +143,7 @@ func startMongo(ctx context.Context) (driver.Driver[mongo.SessionContext], func(
 	} else {
 		uri += "?directConnection=true"
 	}
-	client, err := mongo.Connect(ctx, mongoopts.Client().ApplyURI(uri))
+	client, err := mongo.Connect(mongoopts.Client().ApplyURI(uri))
 	if err != nil {
 		ctr.Terminate(ctx) //nolint:errcheck
 		return nil, nil
