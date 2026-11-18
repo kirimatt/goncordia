@@ -49,6 +49,8 @@ const (
 	tableCursors  = "goncordia_schedule_cursors"
 	tableResults  = "goncordia_job_results"
 	gsiQueueState = "gsi_queue_state"
+	// gsiRetention indexes terminal jobs by rt_pk (bucket#shard) and rt_at.
+	gsiRetention = "gsi_retention"
 )
 
 // NoTx is the transaction type for the DynamoDB driver.
@@ -88,11 +90,14 @@ func (d *Driver) Migrate(ctx context.Context) error {
 				{AttributeName: aws.String("id"), AttributeType: types.ScalarAttributeTypeS},
 				{AttributeName: aws.String("queue_state"), AttributeType: types.ScalarAttributeTypeS},
 				{AttributeName: aws.String("run_at"), AttributeType: types.ScalarAttributeTypeS},
+				{AttributeName: aws.String("rt_pk"), AttributeType: types.ScalarAttributeTypeS},
+				{AttributeName: aws.String("rt_at"), AttributeType: types.ScalarAttributeTypeS},
 			},
 			KeySchema: []types.KeySchemaElement{
 				{AttributeName: aws.String("id"), KeyType: types.KeyTypeHash},
 			},
 			GlobalSecondaryIndexes: []types.GlobalSecondaryIndex{
+				retentionIndex(),
 				{
 					IndexName: aws.String(gsiQueueState),
 					KeySchema: []types.KeySchemaElement{
@@ -167,7 +172,7 @@ func (d *Driver) Migrate(ctx context.Context) error {
 			return fmt.Errorf("dynamodb migrate: wait %s: %w", *input.TableName, err)
 		}
 	}
-	return nil
+	return d.migrateRetention(ctx)
 }
 
 func (d *Driver) Name() string { return "dynamodb" }

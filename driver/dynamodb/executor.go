@@ -72,11 +72,13 @@ func (e *executor) JobResultPut(ctx context.Context, jobID string, value []byte)
 	}
 	_, err := e.svc.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{
 		TransactItems: []types.TransactWriteItem{
-			{ConditionCheck: &types.ConditionCheck{
-				TableName:                aws.String(tableJobs),
-				Key:                      map[string]types.AttributeValue{"id": &types.AttributeValueMemberS{Value: jobID}},
-				ConditionExpression:      aws.String("attribute_exists(#id)"),
-				ExpressionAttributeNames: map[string]string{"#id": "id"},
+			{Update: &types.Update{
+				TableName:                 aws.String(tableJobs),
+				Key:                       map[string]types.AttributeValue{"id": &types.AttributeValueMemberS{Value: jobID}},
+				UpdateExpression:          aws.String("SET #hr = :true"),
+				ConditionExpression:       aws.String("attribute_exists(#id)"),
+				ExpressionAttributeNames:  map[string]string{"#id": "id", "#hr": "has_result"},
+				ExpressionAttributeValues: map[string]types.AttributeValue{":true": &types.AttributeValueMemberBOOL{Value: true}},
 			}},
 			{Put: &types.Put{
 				TableName: aws.String(tableResults),
@@ -236,6 +238,10 @@ type dynamoJob struct {
 	ErrorsJSON     string   `dynamodbav:"errors_json"`
 	Version        int64    `dynamodbav:"version"`
 	PipelineID     string   `dynamodbav:"pipeline_id"`
+	// Retention index keys, set only on terminal jobs (see retention.go).
+	RetentionPK string `dynamodbav:"rt_pk,omitempty"`
+	RetentionAt string `dynamodbav:"rt_at,omitempty"`
+	HasResult   bool   `dynamodbav:"has_result,omitempty"`
 }
 
 const timeFmt = time.RFC3339Nano
@@ -949,10 +955,14 @@ func jobSetStateIfRunning(ctx context.Context, svc *dynamodb.Client, clk clock.C
 		updateExpr = `SET #state = :state, #qs = :qs, #wid = :empty, #errj = :errj, #run_at = :run_at, #ver = #ver + :one REMOVE #lease`
 	} else {
 		exprNames["#fat"] = "finalized_at"
+		exprNames["#rtpk"] = "rt_pk"
+		exprNames["#rtat"] = "rt_at"
 		exprVals[":state"] = &types.AttributeValueMemberS{Value: string(params.State)}
 		exprVals[":qs"] = &types.AttributeValueMemberS{Value: qsKey(j.Queue, string(params.State))}
 		exprVals[":fat"] = &types.AttributeValueMemberS{Value: now.UTC().Format(timeFmt)}
-		updateExpr = `SET #state = :state, #qs = :qs, #wid = :empty, #errj = :errj, #fat = :fat, #ver = #ver + :one REMOVE #lease`
+		exprVals[":rtpk"] = &types.AttributeValueMemberS{Value: retentionPK(retentionBucket(params.State, j.HasResult), params.ID)}
+		exprVals[":rtat"] = &types.AttributeValueMemberS{Value: retentionTime(now)}
+		updateExpr = `SET #state = :state, #qs = :qs, #wid = :empty, #errj = :errj, #fat = :fat, #rtpk = :rtpk, #rtat = :rtat, #ver = #ver + :one REMOVE #lease`
 	}
 
 	_, err = svc.UpdateItem(ctx, &dynamodb.UpdateItemInput{
@@ -1005,19 +1015,23 @@ func jobCancel(ctx context.Context, svc *dynamodb.Client, clk clock.Clock, id st
 			"id": &types.AttributeValueMemberS{Value: id},
 		},
 		UpdateExpression: aws.String(
-			`SET #state = :cancelled, #qs = :qs, #fat = :fat, #ver = #ver + :one`,
+			`SET #state = :cancelled, #qs = :qs, #fat = :fat, #rtpk = :rtpk, #rtat = :rtat, #ver = #ver + :one`,
 		),
 		ConditionExpression: aws.String("#state IN (:avail, :sched)"),
 		ExpressionAttributeNames: map[string]string{
 			"#state": "state",
 			"#qs":    "queue_state",
 			"#fat":   "finalized_at",
+			"#rtpk":  "rt_pk",
+			"#rtat":  "rt_at",
 			"#ver":   "version",
 		},
 		ExpressionAttributeValues: map[string]types.AttributeValue{
 			":cancelled": &types.AttributeValueMemberS{Value: string(driver.JobStateCancelled)},
 			":qs":        &types.AttributeValueMemberS{Value: qsKey(j.Queue, string(driver.JobStateCancelled))},
 			":fat":       &types.AttributeValueMemberS{Value: now.UTC().Format(timeFmt)},
+			":rtpk":      &types.AttributeValueMemberS{Value: retentionPK(string(driver.JobStateCancelled), id)},
+			":rtat":      &types.AttributeValueMemberS{Value: retentionTime(now)},
 			":one":       &types.AttributeValueMemberN{Value: "1"},
 			":avail":     &types.AttributeValueMemberS{Value: string(driver.JobStateAvailable)},
 			":sched":     &types.AttributeValueMemberS{Value: string(driver.JobStateScheduled)},
@@ -1089,12 +1103,14 @@ func jobReschedule(ctx context.Context, svc *dynamodb.Client, params driver.Resc
 		Key: map[string]types.AttributeValue{
 			"id": &types.AttributeValueMemberS{Value: params.ID},
 		},
-		UpdateExpression: aws.String(`SET #state = :sched, #qs = :qs, #run_at = :run_at, #ver = #ver + :one`),
+		UpdateExpression: aws.String(`SET #state = :sched, #qs = :qs, #run_at = :run_at, #ver = #ver + :one REMOVE #rtpk, #rtat`),
 		ExpressionAttributeNames: map[string]string{
 			"#state":  "state",
 			"#qs":     "queue_state",
 			"#run_at": "run_at",
 			"#ver":    "version",
+			"#rtpk":   "rt_pk",
+			"#rtat":   "rt_at",
 		},
 		ExpressionAttributeValues: map[string]types.AttributeValue{
 			":sched":  &types.AttributeValueMemberS{Value: string(driver.JobStateScheduled)},
