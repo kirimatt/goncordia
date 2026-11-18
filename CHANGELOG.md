@@ -11,6 +11,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [v2.6.0] — 2026-11-18
+
+### Added
+- Retention metrics: `goncordia.NewRetentionMetrics()` renders
+  `goncordia_retention_passes_total`, `_jobs_deleted_total`,
+  `_results_deleted_total`, `_last_success_timestamp_seconds`, and
+  `_last_pass_duration_seconds` for `admin.WithMetrics`.
+- `goncordia.RetentionObserver` and `RetentionPassEvent`: a worker observer
+  that implements it receives every retention pass; `WorkerObservers`
+  forwards it, and `RetentionRunConfig.Observer` does the same for
+  `RunRetention`.
+
+### Added (drivers v2.6.0)
+- pgxv5, stdlib (Postgres, MySQL, SQLite), gorm, bun, mongodb, and mongodbv2
+  implement `driver.JobPruner`: retention deletes expired jobs and results in
+  batches through new indexes instead of listing every job. `Migrate` adds
+  `idx_goncordia_jobs_finalized` and `idx_goncordia_job_results_updated`; on
+  a large Postgres table, create them `CONCURRENTLY` first (see README).
+
+### Changed
+- README: the two Testing sections are merged.
+
+---
+
 ## [v2.5.1] — 2026-11-18
 
 ### Fixed

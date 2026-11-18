@@ -3,12 +3,25 @@
 [![CI](https://github.com/kirimatt/goncordia/actions/workflows/ci.yml/badge.svg)](https://github.com/kirimatt/goncordia/actions/workflows/ci.yml)
 [![Go Reference](https://pkg.go.dev/badge/github.com/kirimatt/goncordia/v2.svg)](https://pkg.go.dev/github.com/kirimatt/goncordia/v2)
 [![GitHub release](https://img.shields.io/github/v/tag/kirimatt/goncordia?label=version)](https://github.com/kirimatt/goncordia/releases)
+[![Go version](https://img.shields.io/github/go-mod/go-version/kirimatt/goncordia)](go.mod)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-[Changelog](CHANGELOG.md)
+[Changelog](CHANGELOG.md) · [API reference](https://pkg.go.dev/github.com/kirimatt/goncordia/v2) · [Migrating to v2](MIGRATING_TO_V2.md)
 
-A job queue engine for Go that works with the database you already have.
+**A background job queue for Go that runs on the database you already have.**
+Enqueue jobs in the same transaction as your data, process them with retries,
+schedules, and priorities, and await a job's typed result when you need it —
+on Postgres, MySQL, SQLite, MongoDB, Redis, Cassandra, ClickHouse, DynamoDB,
+Firestore, or in memory. No new broker to run.
 
-One `Driver[TTx]` interface parameterized by your library's native transaction type covers Postgres, MySQL, SQLite, MongoDB, Redis, Cassandra, ClickHouse, DynamoDB, Firestore, and in-memory — without forcing you to adopt a new dependency.
+Use it for the jobs a Go service sends to the background: emails and
+notifications, webhooks, report and thumbnail generation, syncing with
+external APIs, and periodic cleanups. It covers the role of Sidekiq or Celery
+in Go, plus the transactional outbox pattern.
+
+One `Driver[TTx]` interface, parameterized by your database library's native
+transaction type (`pgx.Tx`, `*sql.Tx`, `*gorm.DB`, `bun.Tx`, `*mongo.Session`,
+…), connects the client and workers to storage without an adapter layer.
 
 `EnqueueTx` implements the [transactional outbox pattern](https://microservices.io/patterns/data/transactional-outbox.html): the job is written inside your existing transaction and becomes visible to workers only after commit. If the transaction rolls back, the job disappears — no separate relay process, no dual-write risk.
 
@@ -95,26 +108,26 @@ tx.Commit(ctx)  // job and order appear atomically
 Requires Go 1.26 or newer.
 
 ```bash
-go get github.com/kirimatt/goncordia/v2@v2.5.1
+go get github.com/kirimatt/goncordia/v2@v2.6.0
 ```
 
 Pick a driver:
 
 ```bash
 # PostgreSQL via pgx v5
-go get github.com/kirimatt/goncordia/driver/pgxv5/v2@v2.2.0
+go get github.com/kirimatt/goncordia/driver/pgxv5/v2@v2.6.0
 
 # PostgreSQL / MySQL / SQLite via database/sql
-go get github.com/kirimatt/goncordia/driver/stdlib/v2@v2.2.0
+go get github.com/kirimatt/goncordia/driver/stdlib/v2@v2.6.0
 
 # gorm adapter
-go get github.com/kirimatt/goncordia/driver/gorm/v2@v2.2.0
+go get github.com/kirimatt/goncordia/driver/gorm/v2@v2.6.0
 
 # bun adapter
-go get github.com/kirimatt/goncordia/driver/bun/v2@v2.2.0
+go get github.com/kirimatt/goncordia/driver/bun/v2@v2.6.0
 
 # MongoDB (replica set required)
-go get github.com/kirimatt/goncordia/driver/mongodbv2/v2@v2.3.0
+go get github.com/kirimatt/goncordia/driver/mongodbv2/v2@v2.6.0
 
 # Redis
 go get github.com/kirimatt/goncordia/driver/redis/v2@v2.5.1
@@ -895,9 +908,54 @@ result, err := maintenance.Prune(ctx, goncordia.RetentionPolicy{
 ```
 
 Zero durations in `Prune` and `RunRetention` skip that state; negative ones
-other than `KeepForever` are rejected. Drivers implementing `driver.JobPruner`
-read only expired jobs from an index; Redis does. Others list terminal jobs
-page by page, so a pass costs time proportional to retained jobs.
+other than `KeepForever` are rejected.
+
+How a pass finds expired jobs depends on the driver:
+
+| Driver | How retention finds expired jobs |
+|---|---|
+| pgxv5, stdlib (Postgres, MySQL, SQLite), gorm, bun, MongoDB, Redis | index on state and finalization time, batched deletes (`driver.JobPruner`) |
+| Cassandra, ClickHouse, DynamoDB, Firestore | lists terminal jobs page by page; each page currently reads all retained jobs, so a pass grows quadratically. Indexed pruning for these drivers is planned for the next release |
+| memory | scans in process memory |
+
+On SQL and MongoDB, `Migrate` creates the retention indexes
+(`idx_goncordia_jobs_finalized`, `idx_goncordia_job_results_updated`). Building
+an index on a large Postgres table blocks writes to it while the index is
+built. To avoid that, create the indexes yourself before upgrading; `Migrate`
+then skips them:
+
+```sql
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_goncordia_jobs_finalized ON goncordia_jobs (state, finalized_at);
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_goncordia_job_results_updated ON goncordia_job_results (updated_at);
+```
+
+#### Retention metrics
+
+`goncordia.NewRetentionMetrics()` counts passes and deletions. Use it as the
+pool's observer and serve it from the admin `/metrics` endpoint:
+
+```go
+retention := goncordia.NewRetentionMetrics()
+wp := goncordia.NewWorkerPool(d, registry, goncordia.WorkerConfig{
+    Observer: goncordia.WorkerObservers(futureManager, retention),
+})
+handler := admin.New(d, admin.WithMetrics(futureMetrics, retention))
+```
+
+| Metric | Type | Labels |
+|---|---|---|
+| `goncordia_retention_passes_total` | counter | `status` (`ok`, `error`) |
+| `goncordia_retention_jobs_deleted_total` | counter | — |
+| `goncordia_retention_results_deleted_total` | counter | — |
+| `goncordia_retention_last_success_timestamp_seconds` | gauge | — |
+| `goncordia_retention_last_pass_duration_seconds` | gauge | — |
+
+Only the instance holding the lease runs passes, so sum across instances.
+Alert on `time() - max(goncordia_retention_last_success_timestamp_seconds)`
+growing past a few intervals. `otelgoncordia.NewInstrumentation` records the
+same data as `goncordia.retention.passes`, `goncordia.retention.deleted`, and
+`goncordia.retention.duration`. A custom `WorkerObserver` receives passes by
+implementing `goncordia.RetentionObserver`.
 
 ---
 
@@ -1008,30 +1066,6 @@ type MyPolicy struct{}
 func (MyPolicy) NextRetryAt(attempt int, err error, clk clock.Clock) time.Time {
     return clk.Now().Add(time.Duration(attempt) * time.Minute)
 }
-```
-
----
-
-## Testing
-
-Use the in-memory driver — no database, no Docker, deterministic time:
-
-```go
-import (
-    "github.com/kirimatt/goncordia/v2/clock"
-    "github.com/kirimatt/goncordia/v2/driver/memory"
-)
-
-clk := clock.NewManual(time.Now())
-d   := memory.New(memory.WithClock(clk))
-
-client := goncordia.NewClient[memory.NoTx](d, goncordia.ClientConfig{Clock: clk})
-wp     := goncordia.NewWorkerPool[memory.NoTx](d, registry, goncordia.WorkerConfig{Clock: clk})
-
-go wp.Start(ctx)
-clk.Advance(time.Hour)  // trigger scheduled jobs instantly
-
-jobs := d.AllJobs()  // inspect state without a real database
 ```
 
 ---
@@ -1184,6 +1218,26 @@ clk.Advance(25 * time.Hour)
 // now start the pool — the job will be picked up immediately
 ```
 
+**Drive the in-memory driver directly** — no database, no Docker, deterministic time:
+
+```go
+import (
+    "github.com/kirimatt/goncordia/v2/clock"
+    "github.com/kirimatt/goncordia/v2/driver/memory"
+)
+
+clk := clock.NewManual(time.Now())
+d   := memory.New(memory.WithClock(clk))
+
+client := goncordia.NewClient[memory.NoTx](d, goncordia.ClientConfig{Clock: clk})
+wp     := goncordia.NewWorkerPool[memory.NoTx](d, registry, goncordia.WorkerConfig{Clock: clk})
+
+go wp.Start(ctx)
+clk.Advance(time.Hour)  // trigger scheduled jobs instantly
+
+jobs := d.AllJobs()  // inspect state without a real database
+```
+
 **Run an end-to-end flow in memory:**
 
 ```go
@@ -1207,7 +1261,7 @@ _ = pool.Shutdown(context.Background())
 ## Observability (OpenTelemetry)
 
 ```bash
-go get github.com/kirimatt/goncordia/otel/v2@v2.2.0
+go get github.com/kirimatt/goncordia/otel/v2@v2.6.0
 ```
 
 ```go
@@ -1253,6 +1307,9 @@ The instrumentation produces:
 - **Counter** `goncordia.job.finished` — selected durable outcomes
 - **Counter** `goncordia.job.heartbeat.count` — heartbeat outcomes (`ok`/`stale`/`error`)
 - **Counter** `goncordia.job.lease_rescued` — expired claims returned to queues
+- **Counter** `goncordia.retention.passes` — retention passes by `status`
+- **Counter** `goncordia.retention.deleted` — jobs and results deleted, by `what` (`jobs`/`results`)
+- **Histogram** `goncordia.retention.duration` (seconds) — retention pass duration by `status`
 - **Counter** `goncordia.job.count` — labelled by kind, queue, status (`ok` / `error`)
 
 Panics are recovered, converted to errors, recorded on the span, and persisted

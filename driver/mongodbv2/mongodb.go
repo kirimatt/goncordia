@@ -119,6 +119,11 @@ func (d *Driver) Migrate(ctx context.Context) error {
 			},
 			Options: options.Index().SetName("goncordia_jobs_running_lease"),
 		},
+		{
+			// Retention reads expired terminal jobs through this index.
+			Keys:    bson.D{{Key: "state", Value: 1}, {Key: "finalized_at", Value: 1}},
+			Options: options.Index().SetName("goncordia_jobs_finalized"),
+		},
 	}
 	if _, err := jobs.Indexes().CreateMany(ctx, jobIndexes); err != nil {
 		return fmt.Errorf("create jobs indexes: %w", err)
@@ -130,6 +135,14 @@ func (d *Driver) Migrate(ctx context.Context) error {
 		Options: options.Index().SetName("goncordia_queues_name").SetUnique(true),
 	}); err != nil {
 		return fmt.Errorf("create queues index: %w", err)
+	}
+
+	results := d.db.Collection(resultsCollection)
+	if _, err := results.Indexes().CreateOne(ctx, mongo.IndexModel{
+		Keys:    bson.D{{Key: "updated_at", Value: 1}},
+		Options: options.Index().SetName("goncordia_job_results_updated"),
+	}); err != nil {
+		return fmt.Errorf("create results index: %w", err)
 	}
 
 	leaders := d.db.Collection(leadersCollection)

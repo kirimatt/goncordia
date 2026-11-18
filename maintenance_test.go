@@ -3,6 +3,7 @@ package goncordia_test
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -285,5 +286,52 @@ func TestWorkerPoolPrunesByDefault(t *testing.T) {
 	}
 	if _, err := exec.JobGetByID(context.Background(), kept); err != nil {
 		t.Fatalf("discarded job pruned before 7 days: %v", err)
+	}
+}
+
+func TestRetentionMetricsFromWorkerPool(t *testing.T) {
+	clk := clock.NewManual(time.Date(2026, 8, 16, 8, 0, 0, 0, time.UTC))
+	d := memory.New(memory.WithClock(clk))
+	client := goncordia.NewClient(d, goncordia.ClientConfig{Clock: clk})
+	insertTerminalJob(t, context.Background(), client, d.Executor(), driver.JobStateCompleted)
+	clk.Advance(25 * time.Hour)
+
+	metrics := goncordia.NewRetentionMetrics()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	pool := goncordia.NewWorkerPool(d, core.NewRegistry(), goncordia.WorkerConfig{
+		Clock:    clk,
+		Observer: goncordia.WorkerObservers(goncordia.NopWorkerObserver{}, metrics),
+	})
+	go func() {
+		defer close(done)
+		_ = pool.Start(ctx)
+	}()
+	defer func() { cancel(); <-done }()
+
+	render := func() string {
+		var b strings.Builder
+		if err := metrics.WritePrometheus(&b); err != nil {
+			t.Fatal(err)
+		}
+		return b.String()
+	}
+	waitForCondition(t, time.Second, func() bool {
+		return strings.Contains(render(), `goncordia_retention_passes_total{status="ok"} 1`)
+	}, "first retention pass")
+	body := render()
+	for _, line := range []string{
+		"goncordia_retention_jobs_deleted_total 1",
+		"goncordia_retention_results_deleted_total 0",
+		`goncordia_retention_passes_total{status="error"} 0`,
+		"goncordia_retention_last_pass_duration_seconds 0",
+		"# TYPE goncordia_retention_jobs_deleted_total counter",
+	} {
+		if !strings.Contains(body, line+"\n") {
+			t.Errorf("missing %q in:\n%s", line, body)
+		}
+	}
+	if strings.Contains(body, "goncordia_retention_last_success_timestamp_seconds 0\n") {
+		t.Errorf("last success not recorded:\n%s", body)
 	}
 }

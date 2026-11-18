@@ -618,6 +618,13 @@ func (p *WorkerPool[TTx]) Start(ctx context.Context) error {
 	return p.runWithPolling(ctx)
 }
 
+func retentionObserver(o WorkerObserver) RetentionObserver {
+	if r, ok := o.(RetentionObserver); ok {
+		return r
+	}
+	return nil
+}
+
 // startRetention runs RunRetention beside the pool and returns a function
 // that stops it. It returns nil when retention is disabled or the driver
 // cannot list jobs.
@@ -640,6 +647,7 @@ func (p *WorkerPool[TTx]) startRetention(ctx context.Context) func() {
 			Policy:   p.config.Retention,
 			Interval: p.config.RetentionInterval,
 			WorkerID: p.config.WorkerID,
+			Observer: retentionObserver(p.config.Observer),
 			OnPrune: func(_ PruneResult, err error) {
 				if err != nil {
 					p.reportError(fmt.Errorf("retention: %w", err))

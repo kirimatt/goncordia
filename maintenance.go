@@ -253,6 +253,9 @@ type RetentionRunConfig struct {
 	// OnPrune receives the outcome of every pass this instance runs as
 	// leader. Default: log errors with slog.
 	OnPrune func(PruneResult, error)
+	// Observer also receives every pass, with its timing, for metrics such
+	// as RetentionMetrics.
+	Observer RetentionObserver
 }
 
 // RunRetention prunes on a schedule until ctx ends. Run it in every instance:
@@ -302,8 +305,16 @@ func (m *Maintenance[TTx]) RunRetention(ctx context.Context, cfg RetentionRunCon
 			}
 			return
 		}
-		if elected {
-			cfg.OnPrune(m.Prune(ctx, cfg.Policy))
+		if !elected {
+			return
+		}
+		started := m.clock.Now()
+		result, err := m.Prune(ctx, cfg.Policy)
+		cfg.OnPrune(result, err)
+		if cfg.Observer != nil {
+			cfg.Observer.RetentionPassed(ctx, RetentionPassEvent{
+				Result: result, Err: err, StartedAt: started, FinishedAt: m.clock.Now(),
+			})
 		}
 	}
 	ticker := m.clock.NewTicker(cfg.Interval)

@@ -973,3 +973,74 @@ var (
 	_ driver.JobResultStore = (*executor)(nil)
 	_ driver.JobResultStore = (*txExecutor)(nil)
 )
+
+// JobPruneFinalized deletes jobs of params.State finalized at or before
+// params.Before, oldest first, through idx_goncordia_jobs_finalized.
+func (e *executor) JobPruneFinalized(ctx context.Context, params driver.JobPruneParams) (int, error) {
+	ids, err := pruneCandidates(ctx, e.db, e.dialect,
+		`SELECT id FROM goncordia_jobs WHERE state = ? AND finalized_at <= ? ORDER BY finalized_at LIMIT ?`,
+		string(params.State), params.Before.UTC(), pruneLimit(params.Limit))
+	if err != nil || len(ids) == 0 {
+		return 0, err
+	}
+	tx, err := e.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback() //nolint:errcheck
+	args := append([]any{string(params.State), params.Before.UTC()}, ids...)
+	// The state and time guard skips jobs revived since they were selected.
+	result, err := tx.ExecContext(ctx, e.dialect.q(`DELETE FROM goncordia_jobs WHERE state = ? AND finalized_at <= ? AND id IN (`+repeatIN(len(ids))+`)`), args...)
+	if err != nil {
+		return 0, fmt.Errorf("prune jobs: %w", err)
+	}
+	deleted, _ := result.RowsAffected()
+	if _, err := tx.ExecContext(ctx, e.dialect.q(`DELETE FROM goncordia_job_results WHERE job_id IN (`+repeatIN(len(ids))+`)
+AND NOT EXISTS (SELECT 1 FROM goncordia_jobs j WHERE j.id = goncordia_job_results.job_id)`), ids...); err != nil {
+		return 0, fmt.Errorf("prune results of deleted jobs: %w", err)
+	}
+	return int(deleted), tx.Commit()
+}
+
+// JobResultPrune deletes results written at or before params.Before, oldest
+// first, through idx_goncordia_job_results_updated. A result is written
+// moments before its job is finalized.
+func (e *executor) JobResultPrune(ctx context.Context, params driver.JobPruneParams) (int, error) {
+	ids, err := pruneCandidates(ctx, e.db, e.dialect,
+		`SELECT job_id FROM goncordia_job_results WHERE updated_at <= ? ORDER BY updated_at LIMIT ?`,
+		params.Before.UTC(), pruneLimit(params.Limit))
+	if err != nil || len(ids) == 0 {
+		return 0, err
+	}
+	result, err := e.db.ExecContext(ctx, e.dialect.q(`DELETE FROM goncordia_job_results WHERE job_id IN (`+repeatIN(len(ids))+`)`), ids...)
+	if err != nil {
+		return 0, fmt.Errorf("prune results: %w", err)
+	}
+	deleted, _ := result.RowsAffected()
+	return int(deleted), nil
+}
+
+func pruneLimit(limit int) int {
+	if limit <= 0 {
+		return 500
+	}
+	return limit
+}
+
+func pruneCandidates(ctx context.Context, db *sql.DB, d Dialect, query string, args ...any) ([]any, error) {
+	rows, err := db.QueryContext(ctx, d.q(query), args...)
+	if err != nil {
+		return nil, fmt.Errorf("select expired rows: %w", err)
+	}
+	ids, err := scanIDs(rows)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]any, len(ids))
+	for i, id := range ids {
+		out[i] = id
+	}
+	return out, nil
+}
+
+var _ driver.JobPruner = (*executor)(nil)
