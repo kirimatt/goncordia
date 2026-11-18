@@ -97,7 +97,10 @@ func (d *Driver) Migrate(ctx context.Context) error {
 			tags         Array(String),
 			errors_json  String,
 			version      Int64,
-			pipeline_id  String
+			pipeline_id  String,
+			INDEX idx_id id TYPE bloom_filter GRANULARITY 1,
+			INDEX idx_state state TYPE set(16) GRANULARITY 1,
+			INDEX idx_finalized finalized_at TYPE minmax GRANULARITY 1
 		) ENGINE = ReplacingMergeTree(version)
 		ORDER BY (queue, id)
 		SETTINGS index_granularity = 8192`,
@@ -135,7 +138,8 @@ func (d *Driver) Migrate(ctx context.Context) error {
 			value      String,
 			deleted    UInt8,
 			updated_at DateTime64(3, 'UTC'),
-			version    Int64
+			version    Int64,
+			INDEX idx_updated updated_at TYPE minmax GRANULARITY 1
 		) ENGINE = ReplacingMergeTree(version)
 		ORDER BY job_id`,
 

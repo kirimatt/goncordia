@@ -51,11 +51,17 @@ func RunRetention[TTx any](t *testing.T, d driver.Driver[TTx]) {
 	}
 	completed := []driver.JobRow{finish(driver.JobStateCompleted, true), finish(driver.JobStateCompleted, true)}
 	discarded := finish(driver.JobStateDiscarded, false)
+	// A discarded job retried by an operator is no longer terminal and must
+	// survive retention, even though its finalized time is old.
+	revived := finish(driver.JobStateDiscarded, false)
+	if err := exec.JobReschedule(ctx, driver.RescheduleParams{ID: revived.ID, RunAt: revived.FinalizedAt.Add(24 * time.Hour)}); err != nil {
+		t.Fatalf("reschedule discarded job: %v", err)
+	}
 
 	// Retention runs two hours after the last finalization, whatever clock
 	// the driver itself uses.
 	latest := *completed[0].FinalizedAt
-	for _, row := range append(completed[1:], discarded) {
+	for _, row := range append(completed[1:], discarded, revived) {
 		if row.FinalizedAt.After(latest) {
 			latest = *row.FinalizedAt
 		}
@@ -131,5 +137,8 @@ func RunRetention[TTx any](t *testing.T, d driver.Driver[TTx]) {
 	}
 	if exists(discarded.ID) {
 		t.Fatal("discarded job survived RunRetention")
+	}
+	if !exists(revived.ID) {
+		t.Fatal("rescheduled job was pruned as discarded")
 	}
 }
