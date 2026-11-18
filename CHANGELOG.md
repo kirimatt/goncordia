@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+---
+
+## [v2.7.2] — 2026-11-18
+
 ### Fixed
 - Stopping a worker pool (or the context of `RunRetention`) during a
   retention pass no longer reports `retention: ... context canceled` to

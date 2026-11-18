@@ -109,7 +109,7 @@ tx.Commit(ctx)  // job and order appear atomically
 Requires Go 1.26 or newer.
 
 ```bash
-go get github.com/kirimatt/goncordia/v2@v2.7.1
+go get github.com/kirimatt/goncordia/v2@v2.7.2
 ```
 
 Pick a driver:
