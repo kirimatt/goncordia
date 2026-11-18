@@ -91,7 +91,7 @@ tx.Commit(ctx)  // job and order appear atomically
 Requires Go 1.26 or newer.
 
 ```bash
-go get github.com/kirimatt/goncordia/v2@v2.2.0
+go get github.com/kirimatt/goncordia/v2@v2.3.0
 ```
 
 Pick a driver:
@@ -729,6 +729,32 @@ return `admin.ErrUnauthenticated` for HTTP 401 and any other error for HTTP 403.
 checks that the backing driver can answer a query and returns HTTP 503 when it
 cannot. Metrics are buffered until all queue statistics have been collected, so
 a collection failure returns 503 without a misleading partial Prometheus body.
+
+To serve futures metrics from the same endpoint, aggregate them with
+`future.NewMetrics` and pass it to `admin.WithMetrics` (any value with
+`WritePrometheus(io.Writer) error` works):
+
+```go
+futureMetrics := future.NewMetrics(nil) // or the clock.Manual used in tests
+m, err := future.New(d, future.Config{
+    Observer: future.Observers(futureMetrics, otelgoncordia.NewFutureInstrumentation()),
+})
+handler := admin.New(d, admin.WithMetrics(futureMetrics))
+```
+
+| Metric | Type | Labels |
+|---|---|---|
+| `goncordia_future_awaits_in_flight` | gauge | — |
+| `goncordia_future_await_duration_seconds` | histogram | `kind`, `outcome` |
+| `goncordia_future_await_polls_total` | counter | `kind` |
+| `goncordia_future_await_wakeups_total` | counter | `kind` |
+| `goncordia_future_store_duration_seconds` | histogram | `kind`, `status` |
+| `goncordia_future_result_size_bytes` | histogram | `kind` |
+
+These values describe the process that runs the `Manager`: awaits are counted
+where producers wait, stores where workers run. Expose the admin handler in
+each instance and let Prometheus aggregate. Queue gauges, by contrast, come
+from storage and are the same in every instance.
 The embedded dashboard serves script and style assets separately under a strict
 Content Security Policy.
 
@@ -1168,6 +1194,10 @@ m, err := future.New(d, future.Config{
 | counter | `goncordia.future.await.wakeups` | kind |
 | histogram (By) | `goncordia.future.result.size` | kind |
 | histogram (s) | `goncordia.future.store.duration` | kind, status |
+
+Combine it with the Prometheus-text `future.Metrics` through
+`future.Observers` to serve the same signals from the admin `/metrics`
+endpoint (see [Admin dashboard](#admin-dashboard-health-and-metrics)).
 
 Outcomes are `completed`, `discarded`, `cancelled`, `no_result`, `not_found`,
 `pending` (TryGet only), `abandoned` (caller context ended), and `error`.

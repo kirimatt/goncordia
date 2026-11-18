@@ -9,12 +9,15 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/kirimatt/goncordia/v2"
 	"github.com/kirimatt/goncordia/v2/admin"
+	"github.com/kirimatt/goncordia/v2/clock"
 	"github.com/kirimatt/goncordia/v2/core"
 	"github.com/kirimatt/goncordia/v2/driver"
 	"github.com/kirimatt/goncordia/v2/driver/memory"
+	"github.com/kirimatt/goncordia/v2/future"
 )
 
 type args struct{ Value string }
@@ -332,5 +335,59 @@ func TestMetricsFailureReturnsNoPartialMetrics(t *testing.T) {
 	}
 	if strings.Contains(string(body), "goncordia_queue_jobs") {
 		t.Fatalf("metrics response contains partial samples: %s", body)
+	}
+}
+
+func TestMetricsIncludesFutures(t *testing.T) {
+	clk := clock.NewManual(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
+	d := memory.New(memory.WithClock(clk))
+	futureMetrics := future.NewMetrics(clk)
+	m, err := future.New(d, future.Config{Clock: clk, Observer: futureMetrics})
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry := core.NewRegistry()
+	future.RegisterWorker(registry, m, func(_ context.Context, job *core.Job[args]) (string, error) {
+		return "done:" + job.Args.Value, nil
+	}, core.WorkerOpts{})
+	ctx, cancel := context.WithCancel(context.Background())
+	pool := goncordia.NewWorkerPool(d, registry, goncordia.WorkerConfig{Clock: clk, PollInterval: time.Hour, Observer: m})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = pool.Start(ctx)
+	}()
+	defer func() {
+		cancel()
+		<-done
+	}()
+	client := goncordia.NewClient(d, goncordia.ClientConfig{Clock: clk})
+	f, err := future.Enqueue[string](context.Background(), m, client, args{Value: "x"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := f.Await(context.Background()); err != nil || got != "done:x" {
+		t.Fatalf("Await = %q, %v", got, err)
+	}
+
+	server := httptest.NewServer(admin.New(d, admin.WithMetrics(futureMetrics, nil)))
+	defer server.Close()
+	response, err := http.Get(server.URL + "/metrics")
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, _ := io.ReadAll(response.Body)
+	response.Body.Close()
+	body := string(data)
+	for _, want := range []string{
+		`goncordia_queue_jobs{queue="default",state="completed"} 1`,
+		`goncordia_future_awaits_in_flight 0`,
+		`goncordia_future_await_duration_seconds_count{kind="admin_test",outcome="completed"} 1`,
+		`goncordia_future_store_duration_seconds_count{kind="admin_test",status="ok"} 1`,
+		`goncordia_future_result_size_bytes_sum{kind="admin_test"} 8`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("metrics missing %q:\n%s", want, body)
+		}
 	}
 }
