@@ -1,0 +1,62 @@
+name: Add me to adopters
+description: Tell us you use goncordia, to be listed in ADOPTERS.md.
+title: "[Adopter]: "
+labels:
+  - adopter
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for using goncordia! Only what you write here is published, so share what you are comfortable with.
+  - type: input
+    id: name
+    attributes:
+      label: Organization or project
+      description: The name to show in ADOPTERS.md.
+    validations:
+      required: true
+  - type: input
+    id: url
+    attributes:
+      label: Website or repository
+  - type: dropdown
+    id: backend
+    attributes:
+      label: Backend
+      multiple: true
+      options:
+        - Postgres (pgxv5)
+        - Postgres (database/sql)
+        - MySQL
+        - MariaDB
+        - SQLite
+        - gorm
+        - bun
+        - MongoDB
+        - Redis
+        - Cassandra / ScyllaDB
+        - ClickHouse
+        - DynamoDB
+        - Firestore
+    validations:
+      required: true
+  - type: textarea
+    id: usage
+    attributes:
+      label: What runs on goncordia
+      description: Kinds of jobs, rough volume, and whether it is in production.
+      placeholder: Order emails and webhook delivery, ~50k jobs/day, in production since 2026-11.
+    validations:
+      required: true
+  - type: textarea
+    id: quote
+    attributes:
+      label: Anything you would like to say about it (optional)
+      description: Why you picked it, what worked well, what could be better.
+  - type: checkboxes
+    id: consent
+    attributes:
+      label: Consent
+      options:
+        - label: The details above may be published in ADOPTERS.md and in the project's documentation.
+          required: true
