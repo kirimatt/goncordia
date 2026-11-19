@@ -7,7 +7,7 @@
 [![Go version](https://img.shields.io/github/go-mod/go-version/kirimatt/goncordia)](go.mod)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-[Documentation](https://goncordia.docs7.io) · [Changelog](CHANGELOG.md) · [API reference](https://pkg.go.dev/github.com/kirimatt/goncordia/v2) · [Migrating to v2](MIGRATING_TO_V2.md)
+[Documentation](https://goncordia.docs7.io) · [Changelog](CHANGELOG.md) · [API reference](https://pkg.go.dev/github.com/kirimatt/goncordia/v2) · [Migrating to v2](MIGRATING_TO_V2.md) · [Who uses it](ADOPTERS.md)
 
 **A background job queue for Go that runs on the database you already have.**
 Enqueue jobs in the same transaction as your data, process them with retries,
@@ -1444,6 +1444,8 @@ goncordia/
 
 ## Community and security
 
+- Using goncordia? Add yourself to [ADOPTERS.md](ADOPTERS.md) with a pull
+  request or the [adopter form](https://github.com/kirimatt/goncordia/issues/new?template=adopter.yml).
 - Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening an issue or pull request.
 - Follow the [Code of Conduct](CODE_OF_CONDUCT.md) in all project spaces.
 - Report vulnerabilities privately according to [SECURITY.md](SECURITY.md).
