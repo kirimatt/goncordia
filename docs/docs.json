@@ -31,6 +31,14 @@
         ]
       },
       {
+        "group": "Migrating",
+        "pages": [
+          "migrating-from-asynq",
+          "migrating-from-river",
+          "migrating-from-machinery"
+        ]
+      },
+      {
         "group": "Reference",
         "pages": [
           "custom-driver",
