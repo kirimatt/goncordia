@@ -103,6 +103,8 @@ tx.Commit(ctx)  // job and order appear atomically
 
 **Choose Machinery** if you need Celery-style workflow primitives (chains, chords, groups) across RabbitMQ or SQS.
 
+Moving over from one of them? Migration guides: [Asynq](https://goncordia.docs7.io/migrating-from-asynq), [River](https://goncordia.docs7.io/migrating-from-river), [Machinery](https://goncordia.docs7.io/migrating-from-machinery).
+
 ---
 
 ## Installation

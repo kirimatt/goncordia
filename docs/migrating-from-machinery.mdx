@@ -1,0 +1,196 @@
+---
+title: "Migrating from Machinery"
+description: "Move Machinery tasks, signatures, retries, results, and periodic tasks to goncordia"
+---
+
+Machinery sends task signatures through a broker (Redis, AMQP, SQS, or Pub/Sub)
+and keeps results in a separate backend. goncordia keeps jobs and their results
+in one store, which can be the database your application already uses. That
+removes the broker from your infrastructure and, on transactional databases,
+lets you enqueue inside the business transaction with `EnqueueTx`.
+
+Machinery has workflow primitives that goncordia does not: chains, groups, and
+chords. If your code depends on them heavily, read
+[Workflows](#chains-groups-and-chords) before you start.
+
+## Concept map
+
+| Machinery | goncordia |
+|---|---|
+| task name + `[]tasks.Arg{{Type, Value}}` | a typed args struct with `Kind() string` |
+| task function `func(args...) (results..., error)` | `core.WorkerFunc[T]`, or `future.Define[Args, Result]` when the caller needs the result |
+| `server.RegisterTask(name, fn)` | `core.RegisterWorker(registry, worker, opts)` |
+| `server.NewWorker(tag, concurrency).Launch()` | `NewWorkerPool(d, registry, goncordia.WorkerConfig{...})` + `Start(ctx)` |
+| `server.NewCustomQueueWorker(tag, n, queue)` | `WorkerConfig.Queues` |
+| `server.SendTask(signature)` | `client.Enqueue(ctx, args, opts)` |
+| `Signature.RoutingKey` | `InsertOpts.Queue` |
+| `Signature.ETA` | `InsertOpts.RunAt` |
+| `Signature.Priority` | `InsertOpts.Priority` (works on every backend) |
+| `Signature.RetryCount` | `MaxRetry`, set to **RetryCount + 1** |
+| `Signature.RetryTimeout` (Fibonacci seconds) | `WorkerConfig.RetryPolicy` |
+| `tasks.NewErrRetryTaskLater(msg, d)` | `core.RetryAfter(d, err)` |
+| `AsyncResult.Get(sleep)` | `future.Func.Call` or `Future.Await` |
+| `server.RegisterPeriodicTask(spec, name, sig)` | `NewCronScheduler` with `PeriodicJob` |
+| `SendChain` / `SendGroup` / `SendChord` | no built-in equivalent, see below |
+| broker + result backend config | one driver |
+
+## Signatures become typed args
+
+Machinery:
+
+```go
+signature := &tasks.Signature{
+    Name: "resize",
+    Args: []tasks.Arg{
+        {Type: "string", Value: "img-42"},
+        {Type: "int", Value: 320},
+    },
+    RoutingKey: "images",
+    RetryCount: 3,
+}
+asyncResult, err := server.SendTask(signature)
+```
+
+goncordia:
+
+```go
+type ResizeArgs struct {
+    ImageID string `json:"image_id"`
+    Width   int    `json:"width"`
+}
+
+func (ResizeArgs) Kind() string { return "resize" }
+
+maxRetry := 4 // Machinery RetryCount 3 = 1 run + 3 retries
+res, err := client.Enqueue(ctx, ResizeArgs{ImageID: "img-42", Width: 320}, &core.InsertOpts{
+    Queue:    "images",
+    MaxRetry: &maxRetry,
+})
+```
+
+Named fields replace positional `Arg` values, so adding a field later does not
+break tasks already in the queue. For incompatible changes, see
+[versioned payloads](/jobs#versioned-payloads).
+
+> **Retry counts differ by one, and the defaults differ.** Machinery's
+> `RetryCount` counts retries and defaults to 0, so a task without it runs once.
+> goncordia's `MaxRetry` counts attempts including the first run and defaults
+> to 3. To keep "run once, never retry", set `MaxRetry: 1`.
+
+## Task functions become workers
+
+Machinery:
+
+```go
+server.RegisterTask("resize", func(imageID string, width int) error {
+    return resize(imageID, width)
+})
+
+worker := server.NewWorker("resizer", 10)
+if err := worker.Launch(); err != nil {
+    log.Fatal(err)
+}
+```
+
+goncordia:
+
+```go
+registry := core.NewRegistry()
+core.RegisterWorker(registry, core.WorkerFunc[ResizeArgs](
+    func(ctx context.Context, job *core.Job[ResizeArgs]) error {
+        return resize(ctx, job.Args.ImageID, job.Args.Width)
+    },
+), core.WorkerOpts{MaxRetry: 4})
+
+pool := pgxdriver.NewWorkerPool(d, registry, goncordia.WorkerConfig{
+    Queues:      []string{"images"},
+    Concurrency: 10,
+})
+go pool.Start(ctx)
+```
+
+The handler always receives a context. It is cancelled on timeout
+(`WorkerOpts.Timeout`) and when the pool shuts down.
+
+To fail permanently, return `core.Discard(err)`. To try again at a specific
+time, return `core.RetryAfter(d, err)` or `core.RetryAt(t, err)`; both count as
+an attempt.
+
+## Results
+
+Machinery stores return values in its result backend, and the caller polls
+`AsyncResult.Get`. In goncordia, declare the result type once and let the caller
+wait for it:
+
+```go
+// Shared by producer and worker.
+var Resize = future.Define[ResizeArgs, Thumbnail]()
+
+// Worker process.
+m, _ := future.New(d, future.Config{})
+Resize.Register(registry, m, func(ctx context.Context, job *core.Job[ResizeArgs]) (Thumbnail, error) {
+    return makeThumbnail(ctx, job.Args.ImageID, job.Args.Width)
+}, core.WorkerOpts{})
+
+// Producer.
+resize := future.Bind(m, client, Resize)
+thumb, err := resize.Call(ctx, ResizeArgs{ImageID: "img-42", Width: 320})
+```
+
+The result is a typed value, not `[]reflect.Value`. `Call` enqueues, waits, and
+cleans up. To wait later, use `Enqueue` and then `Await`. See [Futures](/futures).
+
+## Periodic tasks
+
+Machinery:
+
+```go
+server.RegisterPeriodicTask("0 3 * * *", "nightly-report", &tasks.Signature{Name: "report"})
+```
+
+goncordia:
+
+```go
+nightly, err := core.Cron("0 3 * * *", time.UTC)
+if err != nil {
+    log.Fatal(err)
+}
+cs := goncordia.NewCronScheduler(d, []goncordia.PeriodicJob{{
+    ID:       "nightly-report",
+    StartAt:  time.Now(),
+    Schedule: nightly,
+    Args:     ReportArgs{},
+}}, goncordia.CronConfig{LeaderName: "reports"})
+go cs.Start(ctx)
+```
+
+The scheduler can run in every process. One instance holds the lease, and a
+stable `ID` keeps an occurrence from being enqueued twice. See [Cron](/cron).
+
+## Chains, groups, and chords
+
+goncordia has no workflow engine. Common replacements:
+
+- **Chain** (A, then B with A's result): have A's worker enqueue B when it
+  succeeds. On a transactional driver, do it with `EnqueueTx` in the same
+  transaction as A's writes, so B exists only if A's work committed.
+- **Group** (run in parallel): `EnqueueBatch` or `EnqueueMany`. If the caller
+  needs all results, enqueue futures and `Await` each one.
+- **Chord** (group, then a callback): enqueue the group as futures, `Await`
+  them, and run or enqueue the callback. For a long-running group, record
+  completion in your own table and let the last job enqueue the callback.
+- **Run one at a time per key**: give the jobs the same `PipelineID`.
+
+If chains and chords are central to your design, Machinery may still fit
+better, or you may want a workflow engine.
+
+## Switching over
+
+goncordia does not read Machinery's broker queues, so run both for a while:
+
+1. Deploy goncordia workers for every task next to the Machinery workers.
+2. Switch producers from `SendTask` to `Enqueue`, task by task if you prefer.
+3. Keep the Machinery workers until the broker queues are empty, including tasks
+   with a future `ETA`.
+4. Move periodic tasks in one deploy, then remove Machinery, its broker, and
+   its result backend.

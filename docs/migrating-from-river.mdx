@@ -1,0 +1,240 @@
+---
+title: "Migrating from River"
+description: "Move River jobs, workers, insert options, and periodic jobs to goncordia"
+---
+
+River and goncordia are close relatives: typed args with `Kind()`, generic
+workers, and transactional inserts. River is Postgres-only and has a mature
+ecosystem, including River UI and a Pro tier. Move to goncordia when you need
+the same model on another database (MySQL, SQLite, MongoDB and others), a typed
+result the caller can wait for, or unit tests without Postgres.
+
+Most code changes are renames. The few semantic differences are listed under
+[Things that behave differently](#things-that-behave-differently).
+
+## Concept map
+
+| River | goncordia |
+|---|---|
+| `JobArgs` with `Kind() string` | the same interface: `core.JobArgs` |
+| `river.Job[T]`, `job.Args` | `core.Job[T]`, `job.Args` |
+| worker struct with `river.WorkerDefaults[T]` and `Work` | `core.WorkerFunc[T]`, or a type with `Process(ctx, *core.Job[T]) error` |
+| `river.NewWorkers()` + `river.AddWorker` | `core.NewRegistry()` + `core.RegisterWorker` |
+| `river.NewClient(riverpgxv5.New(pool), &river.Config{...})` | `pgxdriver.New(pool)`, then `NewClient` and `NewWorkerPool` |
+| `client.Insert` / `client.InsertTx` | `client.Enqueue` / `client.EnqueueTx` |
+| `client.InsertMany` / `InsertManyTx` | `EnqueueBatch` / `EnqueueBatchTx` |
+| `InsertOpts.Queue`, `Tags` | the same fields |
+| `InsertOpts.ScheduledAt` | `InsertOpts.RunAt` |
+| `InsertOpts.Priority` (1 is highest) | `InsertOpts.Priority` (**higher runs first**) |
+| `InsertOpts.MaxAttempts` | `InsertOpts.MaxRetry` (also counts attempts) |
+| `UniqueOpts{ByArgs, ByQueue, ByPeriod}` | `core.UniqueOpts{ByArgs, ByQueue, ByPeriod}` |
+| `Config.Queues: map[string]river.QueueConfig{...: {MaxWorkers: n}}` | `WorkerConfig.Queues` + `QueuePolicies[...].Concurrency` |
+| `Config.RetryPolicy` / worker `NextRetry` | `WorkerConfig.RetryPolicy` / `core.RetryAfter` |
+| worker `Timeout` / `Config.JobTimeout` | `WorkerOpts.Timeout` / `InsertOpts.Timeout` |
+| `river.JobCancel(err)` | `core.Discard(err)` |
+| `river.JobSnooze(d)` | `core.RetryAfter(d, err)` (uses an attempt, see below) |
+| `client.JobCancel(ctx, id)` | `client.Cancel(ctx, id)` (jobs not yet running) |
+| `river.NewPeriodicJob(river.PeriodicInterval(d), ...)` | `NewCronScheduler` with `PeriodicJob{Schedule: core.Every(d)}` |
+| `rivertest` | `gontest` and the in-memory driver |
+| River UI | the embeddable [admin UI](/admin) |
+
+## Args stay the same
+
+River args already satisfy `core.JobArgs`. Keep the structs and their `Kind()`
+values:
+
+```go
+type SortArgs struct {
+    Strings []string `json:"strings"`
+}
+
+func (SortArgs) Kind() string { return "sort" }
+```
+
+## Workers
+
+River:
+
+```go
+type SortWorker struct {
+    river.WorkerDefaults[SortArgs]
+}
+
+func (w *SortWorker) Work(ctx context.Context, job *river.Job[SortArgs]) error {
+    sort.Strings(job.Args.Strings)
+    return nil
+}
+
+workers := river.NewWorkers()
+river.AddWorker(workers, &SortWorker{})
+```
+
+goncordia, as a function:
+
+```go
+registry := core.NewRegistry()
+core.RegisterWorker(registry, core.WorkerFunc[SortArgs](
+    func(ctx context.Context, job *core.Job[SortArgs]) error {
+        sort.Strings(job.Args.Strings)
+        return nil
+    },
+), core.WorkerOpts{MaxRetry: 25, Timeout: time.Minute})
+```
+
+Or keep the struct and rename `Work` to `Process`:
+
+```go
+type SortWorker struct{ /* dependencies */ }
+
+func (w *SortWorker) Process(ctx context.Context, job *core.Job[SortArgs]) error {
+    sort.Strings(job.Args.Strings)
+    return nil
+}
+
+core.RegisterWorker[SortArgs](registry, &SortWorker{}, core.WorkerOpts{MaxRetry: 25})
+```
+
+Per-worker settings that River reads from methods (`Timeout`, `NextRetry`) go
+into `core.WorkerOpts` or the returned error. River's default of 25 attempts
+becomes `MaxRetry: 25`; goncordia's own default is 3.
+
+## Client and worker pool
+
+River has one client that both inserts and works. goncordia splits them, so a
+web process can enqueue without running workers:
+
+```go
+import (
+    "github.com/kirimatt/goncordia/v2"
+    pgxdriver "github.com/kirimatt/goncordia/driver/pgxv5/v2"
+)
+
+d := pgxdriver.New(dbPool)
+if err := d.Migrate(ctx); err != nil { // creates goncordia_jobs and friends
+    log.Fatal(err)
+}
+
+client := pgxdriver.NewClient(d, goncordia.ClientConfig{})
+
+pool := pgxdriver.NewWorkerPool(d, registry, goncordia.WorkerConfig{
+    Queues:      []string{"default", "reports"},
+    Concurrency: 100,
+    QueuePolicies: map[string]goncordia.QueuePolicy{
+        "reports": {Concurrency: 5}, // River: QueueConfig{MaxWorkers: 5}
+    },
+})
+go pool.Start(ctx)
+
+// River: client.Stop(ctx)
+shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+defer cancel()
+_ = pool.Shutdown(shutdownCtx)
+```
+
+`Migrate` creates goncordia's own tables. They do not touch River's `river_job`
+table, so both can live in the same database during the switch.
+
+## Inserting
+
+River:
+
+```go
+tx, _ := dbPool.Begin(ctx)
+_, _ = riverClient.InsertTx(ctx, tx, SortArgs{Strings: names}, &river.InsertOpts{
+    Queue:       "reports",
+    Priority:    1,
+    ScheduledAt: time.Now().Add(time.Hour),
+    MaxAttempts: 5,
+})
+_ = tx.Commit(ctx)
+```
+
+goncordia:
+
+```go
+maxRetry := 5
+tx, _ := dbPool.Begin(ctx)
+_, _ = client.EnqueueTx(ctx, tx, SortArgs{Strings: names}, &core.InsertOpts{
+    Queue:    "reports",
+    Priority: 3, // River 1 (highest) → 3; River 4 (lowest) → 0
+    RunAt:    time.Now().Add(time.Hour),
+    MaxRetry: &maxRetry,
+})
+_ = tx.Commit(ctx)
+```
+
+The transaction type is still `pgx.Tx`. With `database/sql`, gorm, or bun, use
+the matching driver from [Drivers](/drivers); `EnqueueTx` then takes `*sql.Tx`,
+`*gorm.DB`, or `bun.Tx`.
+
+## Periodic jobs
+
+River:
+
+```go
+river.NewPeriodicJob(
+    river.PeriodicInterval(15*time.Minute),
+    func() (river.JobArgs, *river.InsertOpts) { return CleanupArgs{}, nil },
+    &river.PeriodicJobOpts{RunOnStart: true},
+)
+```
+
+goncordia:
+
+```go
+cs := goncordia.NewCronScheduler(d, []goncordia.PeriodicJob{{
+    ID:       "cleanup",
+    StartAt:  time.Now(),
+    Schedule: core.Every(15 * time.Minute),
+    Args:     CleanupArgs{},
+}}, goncordia.CronConfig{LeaderName: "maintenance"})
+go cs.Start(ctx)
+```
+
+`Args` is a value, not a constructor. If River's constructor computed arguments
+at run time (for example "yesterday's date"), compute them in the worker from
+`job.RunAt` instead. Cron expressions use `core.Cron("0 3 * * *", loc)`. See
+[Cron](/cron) for catch-up and leader election.
+
+## Tests
+
+`rivertest.RequireInserted` has a direct counterpart that needs no database:
+
+```go
+client, tracker := gontest.NewClient(t)
+_ = PlaceOrder(ctx, client, order)
+jobs := gontest.RequireEnqueued[SortArgs](t, tracker, 1)
+```
+
+Run a worker directly with `gontest.RequireWork(t, ctx, worker, args)`. See
+[Testing](/testing).
+
+## Things that behave differently
+
+- **Priority is inverted.** River runs 1 first and 4 last. goncordia runs the
+  highest number first and accepts any int.
+- **Snooze uses an attempt.** River's `JobSnooze` does not count toward
+  `MaxAttempts`. `core.RetryAfter` does. For a job that waits on something
+  external for a long time, raise `MaxRetry`, or enqueue a new job with `RunAt`
+  and return `nil`.
+- **Cancelling a running job.** River can cancel a job that is already running.
+  goncordia's `Cancel` works on jobs that are available or scheduled.
+- **Uniqueness by state.** River's `UniqueOpts.ByState` has no counterpart.
+  A goncordia key is held until the job is completed, discarded, or cancelled,
+  or forever with `Forever: true`.
+- **Push notifications** use LISTEN/NOTIFY on pgx, as in River. The stdlib
+  driver on Postgres polls.
+
+## Switching over
+
+1. Run `Migrate` and deploy goncordia workers for every kind next to the River
+   client.
+2. Change producers from `Insert`/`InsertTx` to `Enqueue`/`EnqueueTx`. New jobs
+   now go to goncordia.
+3. Keep the River client running until `river_job` has no `available`,
+   `scheduled`, `retryable`, or `running` rows.
+4. Remove River. Drop its tables with River's own migration tool when you no
+   longer need its history.
+
+Move periodic jobs in one deploy, so that River and goncordia do not both
+enqueue them.

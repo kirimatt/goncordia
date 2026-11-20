@@ -1,0 +1,246 @@
+---
+title: "Migrating from Asynq"
+description: "Move Asynq tasks, handlers, options, and schedules to goncordia"
+---
+
+Asynq stores tasks in Redis. goncordia can keep them in Redis too, or in the
+database your application already uses. On a database with transactions you also
+get `EnqueueTx`: the job is committed together with your business data, which
+Asynq cannot do.
+
+This page maps Asynq concepts to goncordia and shows a migration that does not
+lose in-flight tasks.
+
+## Concept map
+
+| Asynq | goncordia |
+|---|---|
+| `asynq.NewTask("email:welcome", payload)` | a typed args struct with `Kind() string` |
+| `json.Unmarshal(task.Payload(), &p)` in the handler | `job.Args` is already decoded |
+| `asynq.NewServeMux()` + `mux.HandleFunc` | `core.NewRegistry()` + `core.RegisterWorker` |
+| `asynq.NewServer(redis, asynq.Config{...})` + `srv.Run(mux)` | `NewWorkerPool(d, registry, goncordia.WorkerConfig{...})` + `Start(ctx)` |
+| `client.Enqueue(task, opts...)` | `client.Enqueue(ctx, args, &core.InsertOpts{...})` |
+| `asynq.Queue("critical")` | `InsertOpts.Queue` |
+| `asynq.ProcessIn(d)` / `asynq.ProcessAt(t)` | `InsertOpts.RunAt` |
+| `asynq.MaxRetry(n)` | `InsertOpts.MaxRetry` or `WorkerOpts.MaxRetry`, set to **n + 1** (see below) |
+| `asynq.Timeout(d)` | `InsertOpts.Timeout` or `WorkerOpts.Timeout` |
+| `asynq.Unique(ttl)` | `InsertOpts.UniqueOpts` |
+| `asynq.TaskID(id)` | `UniqueOpts{Key: id, Forever: true}` |
+| `asynq.Retention(d)` | `RetentionPolicy` (per state, not per task) |
+| `Config.Queues: map[string]int{"critical": 6}` | `WorkerConfig.QueuePolicies` with `Weight` |
+| `Config.RetryDelayFunc` | `WorkerConfig.RetryPolicy` |
+| `return asynq.SkipRetry` | `return core.Discard(err)` |
+| `asynq.NewScheduler` + `Register("@every 1h", task)` | `NewCronScheduler` with `PeriodicJob` |
+| asynqmon | the embeddable [admin UI](/admin) |
+| `asynq.Group(...)` aggregation | no equivalent |
+
+## Tasks become typed args
+
+Asynq:
+
+```go
+type WelcomePayload struct{ UserID int64 }
+
+payload, _ := json.Marshal(WelcomePayload{UserID: 42})
+task := asynq.NewTask("email:welcome", payload)
+info, err := client.Enqueue(task, asynq.Queue("critical"), asynq.MaxRetry(5))
+```
+
+goncordia:
+
+```go
+type WelcomeArgs struct {
+    UserID int64 `json:"user_id"`
+}
+
+func (WelcomeArgs) Kind() string { return "email:welcome" }
+
+maxRetry := 6 // Asynq MaxRetry(5) = 1 run + 5 retries
+res, err := client.Enqueue(ctx, WelcomeArgs{UserID: 42}, &core.InsertOpts{
+    Queue:    "critical",
+    MaxRetry: &maxRetry,
+})
+```
+
+You can keep the same type names as kinds (`email:welcome`) so logs and
+dashboards stay readable during the switch.
+
+> **Retry counts differ by one.** Asynq's `MaxRetry` counts **retries**:
+> `MaxRetry(5)` allows six runs, and the default of 25 allows 26. goncordia's
+> `MaxRetry` counts **attempts**, including the first run, and defaults to 3.
+> Add one when you copy the number over.
+
+## Handlers become workers
+
+Asynq:
+
+```go
+mux := asynq.NewServeMux()
+mux.HandleFunc("email:welcome", func(ctx context.Context, t *asynq.Task) error {
+    var p WelcomePayload
+    if err := json.Unmarshal(t.Payload(), &p); err != nil {
+        return fmt.Errorf("decode: %v: %w", err, asynq.SkipRetry)
+    }
+    return sendWelcome(ctx, p.UserID)
+})
+
+srv := asynq.NewServer(redisOpt, asynq.Config{
+    Concurrency: 10,
+    Queues:      map[string]int{"critical": 6, "default": 3},
+})
+if err := srv.Run(mux); err != nil {
+    log.Fatal(err)
+}
+```
+
+goncordia (Redis driver; other drivers have the same `NewWorkerPool`):
+
+```go
+registry := core.NewRegistry()
+core.RegisterWorker(registry, core.WorkerFunc[WelcomeArgs](
+    func(ctx context.Context, job *core.Job[WelcomeArgs]) error {
+        return sendWelcome(ctx, job.Args.UserID)
+    },
+), core.WorkerOpts{MaxRetry: 26}) // Asynq's default of 25 retries
+
+pool := redisdriver.NewWorkerPool(d, registry, goncordia.WorkerConfig{
+    Queues:      []string{"critical", "default"},
+    Concurrency: 10,
+    QueuePolicies: map[string]goncordia.QueuePolicy{
+        "critical": {Weight: 6},
+        "default":  {Weight: 3},
+    },
+})
+go pool.Start(ctx)
+```
+
+There is no decode step in the handler. A payload that cannot be decoded is a
+permanent failure and goes straight to `discarded` without using retries, as
+`SkipRetry` did. Return `core.Discard(err)` for other permanent failures.
+
+`Concurrency` is the total for the pool. A per-kind limit goes in
+`WorkerOpts.Concurrency`. Rate limits per queue, per kind, or per tag are in
+[Workers](/workers).
+
+## Choosing a backend
+
+You do not have to leave Redis:
+
+```go
+import redisdriver "github.com/kirimatt/goncordia/driver/redis/v2"
+
+rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379"})
+d := redisdriver.New(rdb)
+if err := d.Migrate(ctx); err != nil {
+    log.Fatal(err)
+}
+client := redisdriver.NewClient(d, goncordia.ClientConfig{})
+```
+
+Redis has no transactions in goncordia's sense, so the Redis driver has no
+`EnqueueTx`. If the reason you are migrating is "the email job was enqueued but
+the order insert rolled back", use the driver for your main database instead
+([Postgres](/quickstart), MySQL, SQLite, MongoDB and others in
+[Drivers](/drivers)) and enqueue inside the transaction:
+
+```go
+tx, _ := pool.Begin(ctx)
+orderID, _ := createOrder(ctx, tx, order)
+_, _ = client.EnqueueTx(ctx, tx, OrderConfirmationArgs{OrderID: orderID}, nil)
+_ = tx.Commit(ctx) // both or neither
+```
+
+## Unique tasks
+
+Asynq's `Unique(ttl)` blocks a duplicate (same type, payload, and queue) until
+the task succeeds or the TTL expires, and returns `asynq.ErrDuplicateTask`.
+
+```go
+_, err := client.Enqueue(ctx, WelcomeArgs{UserID: 42}, &core.InsertOpts{
+    UniqueOpts: &core.UniqueOpts{ByArgs: true, ByQueue: true},
+})
+```
+
+Two differences:
+
+- A duplicate is not an error. `Enqueue` returns a result with
+  `UniqueSkip: true`. Check it where you used to check `ErrDuplicateTask`.
+- The key is released when the job reaches a final state (completed, discarded,
+  or cancelled), not after a TTL. To limit to one job per time window, add
+  `ByPeriod`, which uses fixed UTC-aligned windows.
+
+`asynq.TaskID(id)` maps to a caller-defined key that survives completion:
+`UniqueOpts{Key: id, Forever: true}`.
+
+## Retries
+
+```go
+// Asynq: Config.RetryDelayFunc
+goncordia.WorkerConfig{
+    RetryPolicy: core.ExponentialRetry{Base: time.Second, Max: time.Hour, Jitter: 0.2},
+}
+
+// Per attempt, from the handler:
+return core.RetryAfter(30*time.Second, err)
+```
+
+`RetryAfter` and `RetryAt` count as an attempt. Once `MaxRetry` attempts are
+used, the job is discarded.
+
+## Periodic tasks
+
+Asynq:
+
+```go
+scheduler := asynq.NewScheduler(redisOpt, nil)
+scheduler.Register("0 * * * *", asynq.NewTask("report:hourly", nil))
+scheduler.Run()
+```
+
+goncordia:
+
+```go
+hourly, err := core.Cron("0 * * * *", time.UTC)
+if err != nil {
+    log.Fatal(err)
+}
+cs := goncordia.NewCronScheduler(d, []goncordia.PeriodicJob{{
+    ID:       "report-hourly",
+    StartAt:  time.Now(),
+    Schedule: hourly,
+    Args:     HourlyReportArgs{},
+}}, goncordia.CronConfig{LeaderName: "reports"})
+go cs.Start(ctx)
+```
+
+Run the scheduler in as many processes as you like: one holds the lease and
+enqueues; with a stable `ID` an occurrence is never enqueued twice, even after
+failover. See [Cron](/cron) for catch-up after downtime.
+
+## Switching over without losing tasks
+
+goncordia does not read Asynq's Redis keys, so the two run side by side for a
+while:
+
+1. Add goncordia workers for every task type next to the Asynq server. Deploy.
+2. Switch producers to goncordia's `Enqueue`, one task type at a time if you
+   prefer. New work now goes to goncordia.
+3. Watch the Asynq queues drain in asynqmon or with `asynq.Inspector`. Retries
+   and scheduled tasks can take a while, up to the longest `ProcessIn` you use.
+4. When every Asynq queue is empty, including the scheduled, retry, and archived
+   sets you care about, remove the Asynq server and scheduler.
+
+Move periodic tasks in one step: stop Asynq's scheduler and start goncordia's in
+the same deploy, otherwise both enqueue the same report.
+
+## What has no direct equivalent
+
+- **Task aggregation** (`asynq.Group` with a `GroupAggregator`). Enqueue one job
+  per batch yourself, or use `PipelineID` if you only need the tasks of a group
+  to run one at a time.
+- **Per-task retention** (`asynq.Retention`). Retention in goncordia is set per
+  final state for the whole store.
+- **Deadline** (`asynq.Deadline`). Use `Timeout`, or check the time in the
+  handler and return `core.Discard`.
+- **Task results** (`ResultWriter`). goncordia stores a typed result and lets
+  the caller wait for it: see [Futures](/futures).
