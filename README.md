@@ -6,6 +6,7 @@
 [![GitHub release](https://img.shields.io/github/v/tag/kirimatt/goncordia?label=version)](https://github.com/kirimatt/goncordia/releases)
 [![Go version](https://img.shields.io/github/go-mod/go-version/kirimatt/goncordia)](go.mod)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Mentioned in Awesome Go](https://awesome.re/mentioned-badge.svg)](https://github.com/avelino/awesome-go#messaging)
 
 [Documentation](https://goncordia.docs7.io) · [Changelog](CHANGELOG.md) · [API reference](https://pkg.go.dev/github.com/kirimatt/goncordia/v2) · [Migrating to v2](MIGRATING_TO_V2.md) · [Who uses it](ADOPTERS.md)
 
