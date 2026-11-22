@@ -21,6 +21,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Tests
 - The suite runs against an existing replica set when
   `GONCORDIA_TEST_MONGO_URI` is set (no Docker).
+
+---
+
 ## [drivers pgxv5, stdlib, gorm, bun v2.8.0] — 2026-11-22
 
 All four require root v2.8.0 (gorm and bun require stdlib v2.8.0).
