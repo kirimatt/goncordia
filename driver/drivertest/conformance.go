@@ -363,12 +363,16 @@ func Run(t *testing.T, exec driver.Executor) {
 		t.Fatalf("priority contract selected %+v", orderedClaim)
 	}
 	runBatchCapabilities(t, ctx, exec, queue+"-batch")
-	runConcurrentClaims(t, ctx, exec, queue+"-concurrent")
 }
 
-// runConcurrentClaims checks that concurrent fetchers never claim the same job.
-func runConcurrentClaims(t *testing.T, ctx context.Context, exec driver.Executor, queue string) {
+// RunConcurrentClaims checks that concurrent fetchers never claim the same
+// job. Run it for drivers that report Capabilities.LinearizableCAS; a driver
+// without compare-and-set (ClickHouse) may hand a job to two fetchers.
+func RunConcurrentClaims(t *testing.T, exec driver.Executor) {
 	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	queue := fmt.Sprintf("conformance-concurrent-%d", sequence.Add(1))
 	const jobs, fetchers = 60, 6
 	inserts := make([]driver.JobInsertParams, jobs)
 	for i := range inserts {
@@ -459,6 +463,13 @@ func runBatchCapabilities(t *testing.T, ctx context.Context, exec driver.Executo
 		rows = append(rows, got...)
 		return len(rows) == 3
 	}, "claim three batch jobs")
+	// Fetch order among equal jobs follows the driver's ids, so put the job
+	// holding the unique key first: the checks below complete rows[0].
+	for i := range rows {
+		if rows[i].UniqueKey == inserts[0].UniqueKey {
+			rows[0], rows[i] = rows[i], rows[0]
+		}
+	}
 
 	if canMark {
 		at := time.Now().UTC().Truncate(time.Millisecond)
