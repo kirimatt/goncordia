@@ -112,7 +112,7 @@ Moving over from one of them? Migration guides: [Asynq](https://goncordia.docs7.
 Requires Go 1.26 or newer.
 
 ```bash
-go get github.com/kirimatt/goncordia/v2@v2.8.0
+go get github.com/kirimatt/goncordia/v2@v2.9.0
 ```
 
 Pick a driver:

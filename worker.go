@@ -192,11 +192,14 @@ type WorkerPool[TTx any] struct {
 	registry  *core.Registry
 	config    WorkerConfig
 	configErr error
-	completer *batchCompleter // nil when the driver cannot batch completions
+	completer *batchCompleter   // nil when the driver cannot batch completions
+	starter   *batchStartMarker // nil when the driver cannot batch start marks
 
 	wg             sync.WaitGroup
 	sem            chan struct{}
 	pending        chan struct{}
+	wake           chan struct{} // buffered (1): fetch again before the next poll tick
+	backlog        atomic.Bool   // the last fetch pass suggests more ready jobs
 	shutdownOnce   sync.Once
 	shutdownCh     chan struct{}
 	shutdownDone   chan struct{}
@@ -449,6 +452,7 @@ func newWorkerPool[TTx any](d driver.Driver[TTx], registry *core.Registry, cfg W
 		configErr:      configErr,
 		sem:            make(chan struct{}, cfg.Concurrency),
 		pending:        make(chan struct{}, cfg.MaxPending),
+		wake:           make(chan struct{}, 1),
 		shutdownCh:     make(chan struct{}),
 		shutdownDone:   make(chan struct{}),
 		policyChanged:  make(chan struct{}),
@@ -460,6 +464,7 @@ func newWorkerPool[TTx any](d driver.Driver[TTx], registry *core.Registry, cfg W
 		kindSemaphores: make(map[string]chan struct{}),
 		keySemaphores:  make(map[string]*keySemaphore),
 		completer:      newPoolCompleter(d),
+		starter:        newPoolStartMarker(d),
 	}
 }
 
@@ -471,6 +476,18 @@ func newPoolCompleter[TTx any](d driver.Driver[TTx]) *batchCompleter {
 	}
 	if bc, ok := d.Executor().(driver.JobBatchCompleter); ok {
 		return newBatchCompleter(bc)
+	}
+	return nil
+}
+
+// newPoolStartMarker returns a batch start marker when the driver's executor
+// can persist many start instants in one call.
+func newPoolStartMarker[TTx any](d driver.Driver[TTx]) *batchStartMarker {
+	if d == nil {
+		return nil
+	}
+	if bm, ok := d.Executor().(driver.JobBatchStartMarker); ok {
+		return newBatchStartMarker(bm)
 	}
 	return nil
 }
@@ -738,6 +755,8 @@ func (p *WorkerPool[TTx]) runMainLoop(ctx context.Context, ticks <-chan time.Tim
 			return nil
 		case <-ticks:
 			p.fetchAndDispatch(ctx)
+		case <-p.wake:
+			p.fetchAndDispatch(ctx)
 		case <-rescue:
 			p.rescueStuck(ctx)
 		}
@@ -791,6 +810,18 @@ func (p *WorkerPool[TTx]) runWithNotifications(ctx context.Context, l driver.Lis
 	return p.runMainLoop(ctx, fallbackTicker.C())
 }
 
+// wakeOnBacklog asks the main loop for another fetch pass when the last pass
+// left ready jobs behind and half of the pending capacity is free again.
+func (p *WorkerPool[TTx]) wakeOnBacklog() {
+	if !p.backlog.Load() || len(p.pending) > cap(p.pending)/2 {
+		return
+	}
+	select {
+	case p.wake <- struct{}{}:
+	default:
+	}
+}
+
 // fetchAndDispatch claims a batch of jobs and starts a goroutine per job.
 func (p *WorkerPool[TTx]) fetchAndDispatch(ctx context.Context) {
 	p.fetchMu.Lock()
@@ -811,11 +842,17 @@ func (p *WorkerPool[TTx]) fetchAndDispatch(ctx context.Context) {
 	// queues keep their share (weights 3:1 still claim 3:1).
 	perSlot := max(1, free/len(p.queueSchedule))
 	misses := 0
+	// backlog records whether a queue may still hold ready jobs: a fetch came
+	// back full or a queue was skipped at its concurrency limit. Finishing
+	// jobs then wake the loop instead of waiting for the next poll tick.
+	backlog := false
+	defer func() { p.backlog.Store(backlog) }()
 	for free > 0 && misses < len(p.queueSchedule) {
 		index := int(p.queueCursor.Add(1)-1) % len(p.queueSchedule)
 		queue := p.queueSchedule[index]
 		limit := min(perSlot, free, p.queueClaimLimit(queue))
 		if limit <= 0 {
+			backlog = true
 			misses++
 			continue
 		}
@@ -835,6 +872,9 @@ func (p *WorkerPool[TTx]) fetchAndDispatch(ctx context.Context) {
 			continue
 		}
 		misses = 0
+		if len(rows) >= limit {
+			backlog = true
+		}
 		for range rows {
 			p.queueClaimed(queue)
 		}
@@ -862,7 +902,10 @@ func (p *WorkerPool[TTx]) fetchAndDispatch(ctx context.Context) {
 			p.wg.Add(1)
 			go func() {
 				defer p.wg.Done()
-				defer func() { <-p.pending }()
+				defer func() {
+					<-p.pending
+					p.wakeOnBacklog()
+				}()
 				defer p.queueDone(row.Queue)
 				defer pipelineDone()
 				claimCtx, stopHeartbeat := p.startHeartbeat(ctx, exec, row)
@@ -878,6 +921,8 @@ func (p *WorkerPool[TTx]) fetchAndDispatch(ctx context.Context) {
 						return
 					}
 				}
+				var slotOnce sync.Once
+				releaseSlot := func() { slotOnce.Do(func() { <-p.sem }) }
 				distributedCtx, releaseDistributed, acquired := p.acquireDistributedPipeline(claimCtx, exec, row)
 				if !acquired {
 					p.setState(context.Background(), exec, fencedStateParams(row, driver.JobSetStateParams{Yield: true}))
@@ -909,7 +954,10 @@ func (p *WorkerPool[TTx]) fetchAndDispatch(ctx context.Context) {
 				}
 				select {
 				case p.sem <- struct{}{}:
-					defer func() { <-p.sem }()
+					// The slot bounds running handlers; it is released as soon as
+					// the handler returns, so the state write overlaps the next
+					// handler. MaxPending still bounds the writes in flight.
+					defer releaseSlot()
 				case <-claimCtx.Done():
 					p.setState(ctx, exec, fencedStateParams(row, driver.JobSetStateParams{Yield: true}))
 					return
@@ -925,10 +973,18 @@ func (p *WorkerPool[TTx]) fetchAndDispatch(ctx context.Context) {
 				// reserved every configured rate permit.
 				releaseRateGate()
 				startedAt := p.config.Clock.Now()
-				if marker, ok := exec.(driver.JobStartMarker); ok {
-					marked, err := marker.JobMarkStarted(claimCtx, driver.JobMarkStartedParams{
-						ID: row.ID, WorkerID: row.WorkerID, Attempt: row.AttemptNum, At: startedAt,
-					})
+				markParams := driver.JobMarkStartedParams{
+					ID: row.ID, WorkerID: row.WorkerID, Attempt: row.AttemptNum, At: startedAt,
+				}
+				if p.starter != nil {
+					marked, err := p.starter.mark(markParams)
+					if err != nil {
+						p.reportError(fmt.Errorf("persist handler start for job %s: %w", row.ID, err))
+					} else if marked {
+						row.StartedAt = &startedAt
+					}
+				} else if marker, ok := exec.(driver.JobStartMarker); ok {
+					marked, err := marker.JobMarkStarted(claimCtx, markParams)
 					if err != nil {
 						p.reportError(fmt.Errorf("persist handler start for job %s: %w", row.ID, err))
 					} else if marked {
@@ -942,7 +998,7 @@ func (p *WorkerPool[TTx]) fetchAndDispatch(ctx context.Context) {
 					}
 					observer.JobStarted(claimCtx, JobStartedEvent{Job: row, StartedAt: startedAt, ClaimWait: claimWait})
 				}
-				state, jobErr := p.processRow(claimCtx, exec, row)
+				state, jobErr := p.processRow(claimCtx, exec, row, releaseSlot)
 				if observer := p.config.Observer; observer != nil {
 					observer.JobFinished(claimCtx, JobFinishedEvent{
 						Job: row, State: state, Err: jobErr, StartedAt: startedAt, FinishedAt: p.config.Clock.Now(),
@@ -1438,7 +1494,7 @@ func (p *WorkerPool[TTx]) kindSemaphore(kind string) chan struct{} {
 
 // processRow executes a single job, applies middleware, then updates its state.
 func (p *WorkerPool[TTx]) processRow(
-	ctx context.Context, exec driver.Executor, row driver.JobRow,
+	ctx context.Context, exec driver.Executor, row driver.JobRow, handlerDone func(),
 ) (driver.JobState, error) {
 	// Resolve effective MaxRetry: job-level overrides worker default; 0 means "use worker default".
 	maxRetry := row.MaxRetry
@@ -1500,6 +1556,7 @@ func (p *WorkerPool[TTx]) processRow(
 	}
 
 	jobErr := callHandler(jobCtx, raw, handler)
+	handlerDone()
 	// Losing the pool/claim context is not a job failure. Return the fenced
 	// claim to the queue without recording an error or consuming an attempt.
 	// A job-specific timeout only cancels jobCtx, so it still follows retry rules.

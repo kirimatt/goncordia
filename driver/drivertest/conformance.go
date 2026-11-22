@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -360,6 +361,150 @@ func Run(t *testing.T, exec driver.Executor) {
 	orderedClaim := fetchEventually(t, ctx, exec, queue)
 	if orderedClaim.Kind != "ordering-high" || orderedClaim.Priority != 100 {
 		t.Fatalf("priority contract selected %+v", orderedClaim)
+	}
+	runBatchCapabilities(t, ctx, exec, queue+"-batch")
+	runConcurrentClaims(t, ctx, exec, queue+"-concurrent")
+}
+
+// runConcurrentClaims checks that concurrent fetchers never claim the same job.
+func runConcurrentClaims(t *testing.T, ctx context.Context, exec driver.Executor, queue string) {
+	t.Helper()
+	const jobs, fetchers = 60, 6
+	inserts := make([]driver.JobInsertParams, jobs)
+	for i := range inserts {
+		inserts[i] = driver.JobInsertParams{
+			Queue: queue, Kind: "concurrent", Args: []byte(`{}`), MaxRetry: 3,
+			RunAt: time.Now().UTC().Add(-time.Second),
+		}
+	}
+	if _, err := exec.JobInsertMany(ctx, inserts); err != nil {
+		t.Fatalf("insert concurrent jobs: %v", err)
+	}
+	var (
+		mu      sync.Mutex
+		claimed = map[string]int{}
+		total   int
+		errs    []error
+		wg      sync.WaitGroup
+	)
+	deadline := time.Now().Add(15 * time.Second)
+	for w := range fetchers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for time.Now().Before(deadline) {
+				mu.Lock()
+				done := total >= jobs
+				mu.Unlock()
+				if done {
+					return
+				}
+				rows, err := exec.JobFetchBatch(ctx, driver.FetchParams{
+					Queue: queue, Limit: 5, WorkerID: fmt.Sprintf("fetcher-%d", w), LeaseDuration: time.Hour,
+				})
+				mu.Lock()
+				if err != nil {
+					errs = append(errs, err)
+				}
+				for _, r := range rows {
+					claimed[r.ID]++
+					total++
+				}
+				mu.Unlock()
+				if err != nil || len(rows) == 0 {
+					time.Sleep(5 * time.Millisecond)
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	for id, n := range claimed {
+		if n > 1 {
+			t.Fatalf("job %s claimed %d times by concurrent fetchers", id, n)
+		}
+	}
+	if len(claimed) != jobs {
+		t.Fatalf("claimed %d distinct jobs, want %d (errors: %v)", len(claimed), jobs, errs)
+	}
+}
+
+// runBatchCapabilities checks the optional batch writers (start marks and
+// completions) against the same fencing rules as their per-job forms.
+func runBatchCapabilities(t *testing.T, ctx context.Context, exec driver.Executor, queue string) {
+	t.Helper()
+	marker, canMark := exec.(driver.JobBatchStartMarker)
+	completer, canComplete := exec.(driver.JobBatchCompleter)
+	if !canMark && !canComplete {
+		return
+	}
+	inserts := make([]driver.JobInsertParams, 3)
+	for i := range inserts {
+		inserts[i] = driver.JobInsertParams{
+			Queue: queue, Kind: "batch", Args: []byte(`{}`), MaxRetry: 3,
+			RunAt: time.Now().UTC().Add(-time.Second),
+		}
+	}
+	inserts[0].UniqueKey = "batch-plain-" + queue
+	if _, err := exec.JobInsertMany(ctx, inserts); err != nil {
+		t.Fatalf("insert batch jobs: %v", err)
+	}
+	var rows []driver.JobRow
+	waitUntil(t, func() bool {
+		got, err := exec.JobFetchBatch(ctx, driver.FetchParams{
+			Queue: queue, Limit: 3 - len(rows), WorkerID: "batch-w", LeaseDuration: time.Hour,
+		})
+		if err != nil {
+			t.Fatalf("fetch batch jobs: %v", err)
+		}
+		rows = append(rows, got...)
+		return len(rows) == 3
+	}, "claim three batch jobs")
+
+	if canMark {
+		at := time.Now().UTC().Truncate(time.Millisecond)
+		got, err := marker.JobMarkStartedMany(ctx, []driver.JobMarkStartedParams{
+			{ID: rows[0].ID, WorkerID: "batch-w", Attempt: rows[0].AttemptNum, At: at},
+			{ID: rows[1].ID, WorkerID: "batch-w", Attempt: rows[1].AttemptNum, At: at},
+			{ID: rows[2].ID, WorkerID: "stale-worker", Attempt: rows[2].AttemptNum, At: at},
+		})
+		if err != nil || len(got) != 3 || !got[0] || !got[1] || got[2] {
+			t.Fatalf("mark started many: got=%v err=%v, want [true true false]", got, err)
+		}
+		for i, r := range rows {
+			row, err := exec.JobGetByID(ctx, r.ID)
+			if err != nil || row == nil {
+				t.Fatalf("read batch job %d: %v", i, err)
+			}
+			if marked := row.StartedAt != nil && absDuration(row.StartedAt.Sub(at)) <= time.Second; marked != (i < 2) {
+				t.Fatalf("batch job %d started_at=%v, want marked=%v", i, row.StartedAt, i < 2)
+			}
+		}
+	}
+	if canComplete {
+		got, err := completer.JobCompleteMany(ctx, []driver.JobSetStateParams{
+			{ID: rows[0].ID, ExpectedWorkerID: "batch-w", ExpectedAttempt: rows[0].AttemptNum},
+			{ID: rows[1].ID, ExpectedWorkerID: "batch-w", ExpectedAttempt: rows[1].AttemptNum + 1},
+			{ID: rows[2].ID, ExpectedWorkerID: "batch-w", ExpectedAttempt: rows[2].AttemptNum},
+		})
+		if err != nil || len(got) != 3 || !got[0] || got[1] || !got[2] {
+			t.Fatalf("complete many: got=%v err=%v, want [true false true]", got, err)
+		}
+		for i, want := range []driver.JobState{driver.JobStateCompleted, driver.JobStateRunning, driver.JobStateCompleted} {
+			row, err := exec.JobGetByID(ctx, rows[i].ID)
+			if err != nil || row == nil || row.State != want {
+				t.Fatalf("batch job %d: row=%+v err=%v, want state %s", i, row, err, want)
+			}
+			if want == driver.JobStateCompleted && (row.FinalizedAt == nil || row.WorkerID != "") {
+				t.Fatalf("batch job %d completed without finalized_at or kept worker: %+v", i, row)
+			}
+		}
+		// A completed job releases its plain unique key.
+		again, err := exec.JobInsertMany(ctx, []driver.JobInsertParams{{
+			Queue: queue, Kind: "batch", Args: []byte(`{}`), MaxRetry: 3, UniqueKey: inserts[0].UniqueKey,
+		}})
+		if err != nil || len(again) != 1 || again[0].UniqueSkip {
+			t.Fatalf("unique key not released by batch completion: res=%+v err=%v", again, err)
+		}
 	}
 }
 
