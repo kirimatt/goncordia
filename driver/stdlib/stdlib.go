@@ -256,7 +256,13 @@ func (d *Driver) Capabilities() driver.Capabilities {
 }
 
 func (d *Driver) Executor() driver.Executor {
-	return &executor{db: d.db, dialect: d.dialect, clk: d.clk}
+	e := &executor{db: d.db, dialect: d.dialect, clk: d.clk}
+	if d.dialect == MySQL {
+		// MySQL's UPDATE has no RETURNING, so a batch cannot tell which
+		// claims were stale; completions stay one statement per job.
+		return e
+	}
+	return &batchExecutor{executor: e}
 }
 
 func (d *Driver) UnwrapTx(tx *sql.Tx) driver.ExecutorTx {

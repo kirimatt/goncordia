@@ -17,8 +17,16 @@ import (
 	"github.com/kirimatt/goncordia/v2/driver/drivertest"
 )
 
+func skipWithoutMySQL(t *testing.T) {
+	t.Helper()
+	if mysqlDSN == "" {
+		t.Skip("no MySQL server (GONCORDIA_TEST_MYSQL_DSN unset)")
+	}
+}
+
 func newMySQLDriver(t *testing.T, opts ...stdlibdriver.Option) *stdlibdriver.Driver {
 	t.Helper()
+	skipWithoutMySQL(t)
 	ctx := context.Background()
 
 	db, err := sql.Open("mysql", mysqlDSN)
@@ -43,6 +51,7 @@ func newMySQLDriver(t *testing.T, opts ...stdlibdriver.Option) *stdlibdriver.Dri
 }
 
 func TestStdlibMySQL_ConcurrentMigrate(t *testing.T) {
+	skipWithoutMySQL(t)
 	ctx := context.Background()
 	db1, err := sql.Open("mysql", mysqlDSN)
 	if err != nil {
