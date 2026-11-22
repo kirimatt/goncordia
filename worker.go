@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"runtime/debug"
 	"sort"
 	"strconv"
@@ -791,17 +792,22 @@ func (p *WorkerPool[TTx]) fetchAndDispatch(ctx context.Context) {
 
 	exec := p.driver.Executor()
 
+	// Each pass over the weighted schedule claims up to perSlot jobs per
+	// slot, so one round trip can fill several free slots while weighted
+	// queues keep their share (weights 3:1 still claim 3:1).
+	perSlot := max(1, free/len(p.queueSchedule))
 	misses := 0
 	for free > 0 && misses < len(p.queueSchedule) {
 		index := int(p.queueCursor.Add(1)-1) % len(p.queueSchedule)
 		queue := p.queueSchedule[index]
-		if !p.queueCanClaim(queue) {
+		limit := min(perSlot, free, p.queueClaimLimit(queue))
+		if limit <= 0 {
 			misses++
 			continue
 		}
 		rows, err := exec.JobFetchBatch(ctx, driver.FetchParams{
 			Queue:         queue,
-			Limit:         1,
+			Limit:         limit,
 			WorkerID:      p.config.WorkerID,
 			LeaseDuration: p.config.StuckJobTimeout,
 		})
@@ -815,8 +821,10 @@ func (p *WorkerPool[TTx]) fetchAndDispatch(ctx context.Context) {
 			continue
 		}
 		misses = 0
-		p.queueClaimed(queue)
-		free--
+		for range rows {
+			p.queueClaimed(queue)
+		}
+		free -= len(rows)
 		sort.SliceStable(rows, func(i, j int) bool {
 			if rows[i].Priority != rows[j].Priority {
 				return rows[i].Priority > rows[j].Priority
@@ -931,7 +939,9 @@ func (p *WorkerPool[TTx]) fetchAndDispatch(ctx context.Context) {
 	}
 }
 
-func (p *WorkerPool[TTx]) queueCanClaim(queue string) bool {
+// queueClaimLimit returns how many more jobs the queue may claim under its
+// Concurrency policy (math.MaxInt when unlimited).
+func (p *WorkerPool[TTx]) queueClaimLimit(queue string) int {
 	p.queueStateMu.Lock()
 	defer p.queueStateMu.Unlock()
 	policy := p.queuePolicy(queue)
@@ -940,10 +950,10 @@ func (p *WorkerPool[TTx]) queueCanClaim(queue string) bool {
 		state = &queueRuntimeState{}
 		p.queueStates[queue] = state
 	}
-	if policy.Concurrency > 0 && state.active >= policy.Concurrency {
-		return false
+	if policy.Concurrency > 0 {
+		return max(0, policy.Concurrency-state.active)
 	}
-	return true
+	return math.MaxInt
 }
 
 func (p *WorkerPool[TTx]) queueClaimed(queue string) {

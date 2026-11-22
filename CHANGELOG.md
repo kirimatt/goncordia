@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Performance (drivers pgxv5, stdlib Postgres)
+### Performance (core, drivers pgxv5, stdlib Postgres)
 - Fetching jobs no longer sorts the whole backlog. The fetch query filters
   `state IN ('available', 'scheduled')`, and no index returned rows in fetch
   order for that predicate, so every fetch sorted all ready jobs. A new
@@ -20,8 +20,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - pgxv5 `EnqueueMany` / `JobInsertMany` sends all inserts in one pgx batch
   instead of one round trip per job: 100-job batches 28 ms → 6 ms
   (~3.5k → ~16.6k jobs/s). Unique-key behaviour is unchanged.
-- End-to-end worker pool throughput on Postgres: ~850 → ~2 150 jobs/s.
-  (Embedded Postgres 18 on Windows, localhost; relative numbers only.)
+- Worker pools claim jobs in batches. `fetchAndDispatch` fetched one job
+  per round trip under a mutex, so throughput stopped at one query latency
+  per job whatever the concurrency. Each slot of the weighted queue schedule
+  now claims up to `free / len(schedule)` jobs, capped by the queue's
+  `Concurrency` policy, so queue weights keep their share (3:1 still claims
+  3:1). Claim order inside a pass can differ from the one-by-one order.
+- End-to-end worker pool on Postgres, 5 000 jobs: c=4 ~850 → ~2 900 jobs/s,
+  c=32 ~880 → ~8 150 jobs/s. (Embedded Postgres 18 on Windows, localhost;
+  relative numbers only.)
 
 ### Fixed (drivers stdlib v2.7.2, gorm v2.7.2, bun v2.7.2; 2026-11-19)
 - The MySQL dialect works on MariaDB. Recording a job error used
