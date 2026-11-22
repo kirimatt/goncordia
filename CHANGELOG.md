@@ -21,6 +21,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Tests
 - The suite runs against an existing replica set when
   `GONCORDIA_TEST_MONGO_URI` is set (no Docker).
+## [drivers pgxv5, stdlib, gorm, bun v2.8.0] — 2026-11-22
+
+All four require root v2.8.0 (gorm and bun require stdlib v2.8.0).
+
+### Performance
+- pgxv5: partial fetch index (migration `010_fetch_ready_index.sql`),
+  `JobInsertMany` in one pgx batch, and `driver.JobBatchCompleter`
+  (one `UPDATE ... FROM unnest(...)` per batch of completions).
+- stdlib: partial fetch index for Postgres (`011_fetch_ready_index.sql`) and
+  `driver.JobBatchCompleter` for Postgres and SQLite
+  (`UPDATE ... FROM (VALUES ...) RETURNING id`). MySQL keeps one statement
+  per completion because its `UPDATE` has no `RETURNING`. gorm and bun use
+  the stdlib executor, so they batch on Postgres and SQLite too.
+
+### Tests
+- pgxv5 and stdlib suites run against an existing Postgres when
+  `GONCORDIA_TEST_PG_DSN` is set (no Docker); stdlib MySQL tests then need
+  `GONCORDIA_TEST_MYSQL_DSN`.
 
 ---
 
