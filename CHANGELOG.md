@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Performance (drivers pgxv5, stdlib Postgres)
+- Fetching jobs no longer sorts the whole backlog. The fetch query filters
+  `state IN ('available', 'scheduled')`, and no index returned rows in fetch
+  order for that predicate, so every fetch sorted all ready jobs. A new
+  partial index (migration `010_fetch_ready_index.sql` in pgxv5,
+  `011_fetch_ready_index.sql` in stdlib Postgres) lets `LIMIT` stop after the
+  first rows. With a 20k backlog: fetch query 4.9 ms → 0.05 ms,
+  fetch + complete 5.4 ms → 0.55 ms per job.
+- pgxv5 `EnqueueMany` / `JobInsertMany` sends all inserts in one pgx batch
+  instead of one round trip per job: 100-job batches 28 ms → 6 ms
+  (~3.5k → ~16.6k jobs/s). Unique-key behaviour is unchanged.
+- End-to-end worker pool throughput on Postgres: ~850 → ~2 150 jobs/s.
+  (Embedded Postgres 18 on Windows, localhost; relative numbers only.)
+
 ### Fixed (drivers stdlib v2.7.2, gorm v2.7.2, bun v2.7.2; 2026-11-19)
 - The MySQL dialect works on MariaDB. Recording a job error used
   `CAST(? AS JSON)`, which MariaDB rejects, so a failed job stayed running

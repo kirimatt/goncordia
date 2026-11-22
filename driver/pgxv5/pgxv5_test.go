@@ -3,12 +3,14 @@ package pgxv5_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/testcontainers/testcontainers-go"
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
@@ -58,9 +60,47 @@ func skipIfNoDocker(t *testing.T) {
 	}
 }
 
+// testDBSeq numbers the databases created on an external server.
+var testDBSeq atomic.Int64
+
+// newExternalTestPool creates a fresh database for one test on the server in
+// GONCORDIA_TEST_PG_DSN, for running the suite where Docker is unavailable.
+func newExternalTestPool(t *testing.T, adminDSN string) (*pgxpool.Pool, func()) {
+	t.Helper()
+	ctx := context.Background()
+	admin, err := pgx.Connect(ctx, adminDSN)
+	if err != nil {
+		t.Fatalf("connect admin: %v", err)
+	}
+	defer admin.Close(ctx) //nolint:errcheck
+	name := fmt.Sprintf("goncordia_t_%d_%d", os.Getpid(), testDBSeq.Add(1))
+	if _, err := admin.Exec(ctx, "CREATE DATABASE "+name); err != nil {
+		t.Fatalf("create database: %v", err)
+	}
+	cfg, err := pgxpool.ParseConfig(adminDSN)
+	if err != nil {
+		t.Fatalf("parse dsn: %v", err)
+	}
+	cfg.ConnConfig.Database = name
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		t.Fatalf("create pool: %v", err)
+	}
+	return pool, func() {
+		pool.Close()
+		if c, err := pgx.Connect(ctx, adminDSN); err == nil {
+			_, _ = c.Exec(ctx, "DROP DATABASE IF EXISTS "+name+" WITH (FORCE)")
+			_ = c.Close(ctx)
+		}
+	}
+}
+
 func newTestPool(t *testing.T) (*pgxpool.Pool, func()) {
 	t.Helper()
 	ctx := context.Background()
+	if dsn := os.Getenv("GONCORDIA_TEST_PG_DSN"); dsn != "" {
+		return newExternalTestPool(t, dsn)
+	}
 
 	ctr, err := tcpostgres.Run(ctx,
 		"postgres:17",
