@@ -150,3 +150,18 @@ func TestBatchCompleterConcurrentCallersAllServed(t *testing.T) {
 		t.Fatalf("completer not idle: leading=%v pending=%d", c.leading, len(c.pending))
 	}
 }
+
+type shortResultExec struct{}
+
+func (shortResultExec) JobCompleteMany(context.Context, []driver.JobSetStateParams) ([]bool, error) {
+	return nil, nil
+}
+
+func TestBatchCompleterRejectsShortDriverResult(t *testing.T) {
+	c := newBatchCompleter(shortResultExec{})
+	err := c.complete(driver.JobSetStateParams{ID: "1"})
+	if err == nil || errors.Is(err, driver.ErrStaleClaim) {
+		t.Fatalf("err=%v, want a driver contract error", err)
+	}
+	c.flush(nil) // an empty batch is a no-op
+}
