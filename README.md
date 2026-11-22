@@ -131,7 +131,7 @@ go get github.com/kirimatt/goncordia/driver/gorm/v2@v2.7.2
 go get github.com/kirimatt/goncordia/driver/bun/v2@v2.7.2
 
 # MongoDB (replica set required)
-go get github.com/kirimatt/goncordia/driver/mongodbv2/v2@v2.6.0
+go get github.com/kirimatt/goncordia/driver/mongodbv2/v2@v2.8.0
 
 # Redis
 go get github.com/kirimatt/goncordia/driver/redis/v2@v2.7.1

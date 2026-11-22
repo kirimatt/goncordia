@@ -28,6 +28,14 @@ func TestMain(m *testing.M) {
 	code := 0
 	defer func() { os.Exit(code) }()
 
+	// GONCORDIA_TEST_MONGO_URI runs the suite against an existing replica set
+	// instead of a container (no Docker).
+	if uri := os.Getenv("GONCORDIA_TEST_MONGO_URI"); uri != "" {
+		mongoURI = uri
+		code = m.Run()
+		return
+	}
+
 	ctr, err := tcmongo.Run(ctx, "mongo:8.0",
 		tcmongo.WithReplicaSet("rs0"),
 	)

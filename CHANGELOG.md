@@ -11,6 +11,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [driver mongodbv2 v2.8.0] — 2026-11-22
+
+### Performance
+- Implements `driver.JobBatchCompleter`: a batch of completions costs one
+  `find` and one unordered `bulkWrite` instead of a `findOne` and an
+  `updateOne` per job. Requires root v2.8.0.
+
+### Tests
+- The suite runs against an existing replica set when
+  `GONCORDIA_TEST_MONGO_URI` is set (no Docker).
+
+---
+
 ## [v2.8.0] — 2026-11-22
 
 Root module v2.8.0; drivers pgxv5 and stdlib follow with the driver-side
