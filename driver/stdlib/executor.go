@@ -1,11 +1,13 @@
 package stdlib
 
 import (
+	"cmp"
 	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -475,49 +477,89 @@ func jobFetchBatch(ctx context.Context, q querier, d Dialect, clk clock.Clock, p
 		params.Limit = 1
 	}
 	now := clk.Now()
-	if d.supportsSkipLocked() {
+	if d == MySQL {
+		return jobFetchMySQL(ctx, q, d, now, params)
+	}
+	return jobFetchReturning(ctx, q, d, now, params)
+}
+
+// jobFetchReturning claims jobs with one atomic UPDATE ... RETURNING
+// (Postgres, SQLite 3.35+). Postgres skips rows other fetchers have locked;
+// SQLite serialises writers, so the statement is atomic there as well.
+func jobFetchReturning(ctx context.Context, q querier, d Dialect, now time.Time, params driver.FetchParams) ([]driver.JobRow, error) {
+	lock := ""
+	if d == Postgres {
+		lock = " FOR UPDATE SKIP LOCKED"
+	}
+	var leaseExpiresAt *time.Time
+	if params.LeaseDuration > 0 {
+		expires := now.Add(params.LeaseDuration)
+		leaseExpiresAt = &expires
+	}
+	query := d.q(`UPDATE goncordia_jobs
+SET state = 'running', attempted_at = ?, started_at = NULL, lease_expires_at = ?,
+    attempt_num = attempt_num + 1, worker_id = ?
+WHERE id IN (
+    SELECT id FROM goncordia_jobs
+    WHERE queue = ?
+      AND state IN ('available', 'scheduled')
+      AND run_at <= ?
+    ORDER BY priority DESC, run_at, created_at, id
+    LIMIT ?` + lock + `
+)
+RETURNING ` + selectJobCols)
+	rows, err := q.QueryContext(ctx, query, now, leaseExpiresAt, params.WorkerID, params.Queue, now, params.Limit)
+	if err != nil {
+		return nil, fmt.Errorf("claim jobs: %w", err)
+	}
+	defer rows.Close()
+	claimed, err := scanJobRows(d, rows)
+	if err != nil {
+		return nil, err
+	}
+	sortByFetchOrder(claimed)
+	return claimed, nil
+}
+
+// sortByFetchOrder restores the fetch order, which RETURNING does not keep.
+func sortByFetchOrder(rows []driver.JobRow) {
+	slices.SortFunc(rows, func(a, b driver.JobRow) int {
+		if a.Priority != b.Priority {
+			return cmp.Compare(b.Priority, a.Priority)
+		}
+		if c := a.RunAt.Compare(b.RunAt); c != 0 {
+			return c
+		}
+		if c := a.CreatedAt.Compare(b.CreatedAt); c != 0 {
+			return c
+		}
+		ai, _ := strconv.ParseInt(a.ID, 10, 64)
+		bi, _ := strconv.ParseInt(b.ID, 10, 64)
+		return cmp.Compare(ai, bi)
+	})
+}
+
+// jobFetchMySQL claims jobs inside a transaction: MySQL has no UPDATE ...
+// RETURNING, and the SKIP LOCKED row locks must be held until the claiming
+// UPDATE commits, or two fetchers could claim the same rows.
+func jobFetchMySQL(ctx context.Context, q querier, d Dialect, now time.Time, params driver.FetchParams) ([]driver.JobRow, error) {
+	db, ok := q.(*sql.DB)
+	if !ok { // already inside the caller's transaction
 		return jobFetchSkipLocked(ctx, q, d, now, params)
 	}
-	return jobFetchSQLite(ctx, q, d, now, params)
-}
-
-func jobRescueStuck(ctx context.Context, q querier, d Dialect, params driver.JobRescueParams) (int64, error) {
-	query := `UPDATE goncordia_jobs
-SET state = 'available', attempted_at = NULL, started_at = NULL, lease_expires_at = NULL, worker_id = NULL
-WHERE queue = ? AND state = 'running'
-  AND ((lease_expires_at IS NOT NULL AND lease_expires_at <= ?)
-       OR (lease_expires_at IS NULL AND attempted_at <= ?))`
-	result, err := q.ExecContext(ctx, d.q(query), params.Queue, params.At, params.Before)
+	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
-		return 0, fmt.Errorf("rescue stuck jobs: %w", err)
+		return nil, fmt.Errorf("begin fetch: %w", err)
 	}
-	return result.RowsAffected()
-}
-
-func jobHeartbeat(ctx context.Context, q querier, d Dialect, params driver.JobHeartbeatParams) (bool, error) {
-	leaseExpiresAt := params.LeaseExpiresAt
-	if leaseExpiresAt.IsZero() {
-		leaseExpiresAt = params.At
-	}
-	result, err := q.ExecContext(ctx, d.q(`UPDATE goncordia_jobs SET lease_expires_at = ?
-WHERE id = ? AND state = 'running' AND worker_id = ? AND attempt_num = ?`),
-		leaseExpiresAt.UTC(), params.ID, params.WorkerID, params.Attempt)
+	rows, err := jobFetchSkipLocked(ctx, tx, d, now, params)
 	if err != nil {
-		return false, err
+		_ = tx.Rollback()
+		return nil, err
 	}
-	rows, err := result.RowsAffected()
-	return rows > 0, err
-}
-
-func jobMarkStarted(ctx context.Context, q querier, d Dialect, params driver.JobMarkStartedParams) (bool, error) {
-	result, err := q.ExecContext(ctx, d.q(`UPDATE goncordia_jobs SET started_at = ?
-WHERE id = ? AND state = 'running' AND worker_id = ? AND attempt_num = ?`),
-		params.At.UTC(), params.ID, params.WorkerID, params.Attempt)
-	if err != nil {
-		return false, err
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit fetch: %w", err)
 	}
-	rows, err := result.RowsAffected()
-	return rows == 1, err
+	return rows, nil
 }
 
 func jobFetchSkipLocked(ctx context.Context, q querier, d Dialect, now time.Time, params driver.FetchParams) ([]driver.JobRow, error) {
@@ -539,29 +581,12 @@ FOR UPDATE SKIP LOCKED`)
 	if len(ids) == 0 {
 		return nil, nil
 	}
-	return claimJobs(ctx, q, d, now, ids, params.WorkerID, params.LeaseDuration)
-}
-
-func jobFetchSQLite(ctx context.Context, q querier, d Dialect, now time.Time, params driver.FetchParams) ([]driver.JobRow, error) {
-	rows, err := q.QueryContext(ctx,
-		`SELECT id FROM goncordia_jobs
-WHERE queue = ?
-  AND state IN ('available', 'scheduled')
-  AND run_at <= ?
-ORDER BY priority DESC, run_at, created_at, id
-LIMIT ?`,
-		params.Queue, now, params.Limit)
+	claimed, err := claimJobs(ctx, q, d, now, ids, params.WorkerID, params.LeaseDuration)
 	if err != nil {
 		return nil, err
 	}
-	ids, err := scanIDs(rows)
-	if err != nil {
-		return nil, err
-	}
-	if len(ids) == 0 {
-		return nil, nil
-	}
-	return claimJobs(ctx, q, d, now, ids, params.WorkerID, params.LeaseDuration)
+	sortByFetchOrder(claimed)
+	return claimed, nil
 }
 
 func scanIDs(rows *sql.Rows) ([]int64, error) {
@@ -612,6 +637,45 @@ WHERE id IN (`+inList+`)`),
 	}
 	defer rows.Close()
 	return scanJobRows(d, rows)
+}
+
+func jobRescueStuck(ctx context.Context, q querier, d Dialect, params driver.JobRescueParams) (int64, error) {
+	query := `UPDATE goncordia_jobs
+SET state = 'available', attempted_at = NULL, started_at = NULL, lease_expires_at = NULL, worker_id = NULL
+WHERE queue = ? AND state = 'running'
+  AND ((lease_expires_at IS NOT NULL AND lease_expires_at <= ?)
+       OR (lease_expires_at IS NULL AND attempted_at <= ?))`
+	result, err := q.ExecContext(ctx, d.q(query), params.Queue, params.At, params.Before)
+	if err != nil {
+		return 0, fmt.Errorf("rescue stuck jobs: %w", err)
+	}
+	return result.RowsAffected()
+}
+
+func jobHeartbeat(ctx context.Context, q querier, d Dialect, params driver.JobHeartbeatParams) (bool, error) {
+	leaseExpiresAt := params.LeaseExpiresAt
+	if leaseExpiresAt.IsZero() {
+		leaseExpiresAt = params.At
+	}
+	result, err := q.ExecContext(ctx, d.q(`UPDATE goncordia_jobs SET lease_expires_at = ?
+WHERE id = ? AND state = 'running' AND worker_id = ? AND attempt_num = ?`),
+		leaseExpiresAt.UTC(), params.ID, params.WorkerID, params.Attempt)
+	if err != nil {
+		return false, err
+	}
+	rows, err := result.RowsAffected()
+	return rows > 0, err
+}
+
+func jobMarkStarted(ctx context.Context, q querier, d Dialect, params driver.JobMarkStartedParams) (bool, error) {
+	result, err := q.ExecContext(ctx, d.q(`UPDATE goncordia_jobs SET started_at = ?
+WHERE id = ? AND state = 'running' AND worker_id = ? AND attempt_num = ?`),
+		params.At.UTC(), params.ID, params.WorkerID, params.Attempt)
+	if err != nil {
+		return false, err
+	}
+	rows, err := result.RowsAffected()
+	return rows == 1, err
 }
 
 func jobSetStateIfRunning(ctx context.Context, q querier, d Dialect, clk clock.Clock, params driver.JobSetStateParams) error {

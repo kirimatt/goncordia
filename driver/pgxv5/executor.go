@@ -105,6 +105,59 @@ func (e *executor) JobCompleteMany(ctx context.Context, params []driver.JobSetSt
 // jobCompleteMany completes many running jobs in one UPDATE. The per-row
 // fencing and the unique-key release match jobSetStateIfRunning for
 // JobStateCompleted.
+// JobMarkStartedMany persists the start instant of many running jobs in one
+// statement; see driver.JobBatchStartMarker.
+func (e *executor) JobMarkStartedMany(ctx context.Context, params []driver.JobMarkStartedParams) ([]bool, error) {
+	return jobMarkStartedMany(ctx, poolQuerier{e.pool}, params)
+}
+
+func jobMarkStartedMany(ctx context.Context, q querier, params []driver.JobMarkStartedParams) ([]bool, error) {
+	ids := make([]int64, len(params))
+	workers := make([]string, len(params))
+	attempts := make([]int32, len(params))
+	ats := make([]time.Time, len(params))
+	for i, p := range params {
+		id, err := strconv.ParseInt(p.ID, 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("invalid job id %q: %w", p.ID, err)
+		}
+		ids[i], workers[i], attempts[i], ats[i] = id, p.WorkerID, int32(p.Attempt), p.At.UTC()
+	}
+	const sql = `
+UPDATE goncordia_jobs j SET started_at = c.at
+FROM unnest($1::bigint[], $2::text[], $3::int[], $4::timestamptz[]) AS c(id, worker_id, attempt, at)
+WHERE j.id = c.id AND j.state = 'running' AND j.worker_id = c.worker_id AND j.attempt_num = c.attempt
+RETURNING j.id`
+	rows, err := q.Query(ctx, sql, ids, workers, attempts, ats)
+	if err != nil {
+		return nil, fmt.Errorf("mark jobs started: %w", err)
+	}
+	return matchReturnedIDs(rows, ids, "mark jobs started")
+}
+
+// matchReturnedIDs maps the ids an UPDATE ... RETURNING id produced back onto
+// the request order.
+func matchReturnedIDs(rows pgx.Rows, ids []int64, op string) ([]bool, error) {
+	done := make(map[int64]bool, len(ids))
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("%s: %w", op, err)
+		}
+		done[id] = true
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("%s: %w", op, err)
+	}
+	out := make([]bool, len(ids))
+	for i, id := range ids {
+		out[i] = done[id]
+	}
+	return out, nil
+}
+
 func jobCompleteMany(ctx context.Context, q querier, clk clock.Clock, params []driver.JobSetStateParams) ([]bool, error) {
 	ids := make([]int64, len(params))
 	workers := make([]string, len(params))
@@ -132,24 +185,7 @@ RETURNING j.id`
 	if err != nil {
 		return nil, fmt.Errorf("complete jobs: %w", err)
 	}
-	done := make(map[int64]bool, len(params))
-	for rows.Next() {
-		var id int64
-		if err := rows.Scan(&id); err != nil {
-			rows.Close()
-			return nil, fmt.Errorf("complete jobs: %w", err)
-		}
-		done[id] = true
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("complete jobs: %w", err)
-	}
-	out := make([]bool, len(params))
-	for i, id := range ids {
-		out[i] = done[id]
-	}
-	return out, nil
+	return matchReturnedIDs(rows, ids, "complete jobs")
 }
 func (e *executor) JobCancel(ctx context.Context, id string) error {
 	return jobCancel(ctx, poolQuerier{e.pool}, e.clk, id)

@@ -91,9 +91,6 @@ func TestStdlibSQLite_JobCompleteMany(t *testing.T) {
 	testJobCompleteMany(t, d.Executor())
 }
 
-func TestStdlibMySQL_NoBatchCompleter(t *testing.T) {
-	d := newMySQLDriver(t)
-	if _, ok := d.Executor().(jobCompleter); ok {
-		t.Fatal("MySQL executor must not claim JobCompleteMany (no UPDATE ... RETURNING)")
-	}
+func TestStdlibMySQL_JobCompleteMany(t *testing.T) {
+	testJobCompleteMany(t, newMySQLDriver(t).Executor())
 }
