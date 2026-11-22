@@ -122,6 +122,15 @@ type JobStartMarker interface {
 	JobMarkStarted(context.Context, JobMarkStartedParams) (marked bool, err error)
 }
 
+// JobBatchStartMarker is an optional executor capability that persists the
+// start instant of many claimed jobs in one round trip. Each entry is checked
+// like JobMarkStarted (running, same worker and attempt); the result has one
+// entry per params entry, true when that job was marked. A non-nil error means
+// the whole call failed.
+type JobBatchStartMarker interface {
+	JobMarkStartedMany(ctx context.Context, params []JobMarkStartedParams) ([]bool, error)
+}
+
 // JobResultStore persists the value produced by a job handler, so that a
 // waiting producer can read it after the job completes. Every Executor
 // implements it; the future package can also use a separate store.

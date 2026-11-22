@@ -11,6 +11,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [v2.9.0] — 2026-11-23
+
+### Fixed
+- A worker pool with a backlog fetched at most `MaxPending` jobs per
+  `PollInterval`: after a full fetch it waited for the next tick, although
+  `PollInterval` is documented as the pause for an empty queue. With the
+  defaults (Concurrency 10, MaxPending 40, PollInterval 1s) a backlog drained
+  at about 40 jobs/s per process unless new inserts sent notifications. A pass
+  that comes back full (or stops at a queue concurrency limit) now marks a
+  backlog, and finishing jobs wake the loop once half of the pending capacity
+  is free.
+
+### Performance
+- The handler slot is released as soon as the handler returns, so the state
+  write overlaps the next handler (as river's async completer does).
+  `MaxPending` still bounds the writes in flight.
+- New optional `driver.JobBatchStartMarker`: concurrent `started_at` writes
+  share one `JobMarkStartedMany` call, like completions do with
+  `JobBatchCompleter`. The group commit behind both is now one generic type.
+- Measured on Postgres (pgxv5, embedded Postgres 18, localhost; ratios only):
+  5000 jobs at c=32 (5 ms poll) ~8 150 → ~15 500 jobs/s; c=4 ~2 400 →
+  ~4 200 jobs/s; c=10 with the default 1 s poll ~8 700 jobs/s.
+
+### Tests
+- `drivertest.Run` checks the batch writers (`JobMarkStartedMany`,
+  `JobCompleteMany`) against the per-job fencing rules, and that concurrent
+  fetchers never claim the same job.
+
+---
+
 ## [driver mongodbv2 v2.8.0] — 2026-11-22
 
 ### Performance

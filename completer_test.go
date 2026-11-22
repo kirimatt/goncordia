@@ -80,9 +80,9 @@ func TestBatchCompleterCoalescesDuringFlush(t *testing.T) {
 		go func() { errs <- c.complete(driver.JobSetStateParams{ID: strconv.Itoa(i)}) }()
 	}
 	waitUntil(t, func() bool {
-		c.mu.Lock()
-		defer c.mu.Unlock()
-		return len(c.pending) == 10
+		c.g.mu.Lock()
+		defer c.g.mu.Unlock()
+		return len(c.g.pending) == 10
 	})
 	close(f.gate)
 	for range 11 {
@@ -146,8 +146,8 @@ func TestBatchCompleterConcurrentCallersAllServed(t *testing.T) {
 			t.Fatalf("job %s written %d times", id, n)
 		}
 	}
-	if c.leading || len(c.pending) != 0 {
-		t.Fatalf("completer not idle: leading=%v pending=%d", c.leading, len(c.pending))
+	if c.g.leading || len(c.g.pending) != 0 {
+		t.Fatalf("completer not idle: leading=%v pending=%d", c.g.leading, len(c.g.pending))
 	}
 }
 
@@ -163,5 +163,33 @@ func TestBatchCompleterRejectsShortDriverResult(t *testing.T) {
 	if err == nil || errors.Is(err, driver.ErrStaleClaim) {
 		t.Fatalf("err=%v, want a driver contract error", err)
 	}
-	c.flush(nil) // an empty batch is a no-op
+	c.g.flush(nil) // an empty batch is a no-op
+}
+
+type fakeStartExec struct {
+	mu    sync.Mutex
+	calls int
+	stale map[string]bool
+}
+
+func (f *fakeStartExec) JobMarkStartedMany(_ context.Context, params []driver.JobMarkStartedParams) ([]bool, error) {
+	f.mu.Lock()
+	f.calls++
+	f.mu.Unlock()
+	out := make([]bool, len(params))
+	for i, p := range params {
+		out[i] = !f.stale[p.ID]
+	}
+	return out, nil
+}
+
+func TestBatchStartMarkerReportsPerJobResult(t *testing.T) {
+	f := &fakeStartExec{stale: map[string]bool{"old": true}}
+	m := newBatchStartMarker(f)
+	if ok, err := m.mark(driver.JobMarkStartedParams{ID: "new"}); err != nil || !ok {
+		t.Fatalf("new: ok=%v err=%v", ok, err)
+	}
+	if ok, err := m.mark(driver.JobMarkStartedParams{ID: "old"}); err != nil || ok {
+		t.Fatalf("old: ok=%v err=%v, want not marked", ok, err)
+	}
 }
