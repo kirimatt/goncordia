@@ -4,7 +4,7 @@ go 1.26.0
 
 require (
 	github.com/google/uuid v1.6.0
-	github.com/kirimatt/goncordia/v2 v2.9.0
+	github.com/kirimatt/goncordia/v2 v2.9.1
 	github.com/redis/go-redis/v9 v9.23.0
 	github.com/testcontainers/testcontainers-go/modules/redis v0.45.0
 )

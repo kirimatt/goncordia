@@ -13,8 +13,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [drivers pgxv5, stdlib, redis, mongodbv2, mongodb, cassandra, clickhouse, dynamodb, firestore v2.9.0] — 2026-11-23
 
-All require root v2.9.0, so their suites run the new conformance checks
-(concurrent fetchers never share a job; batch writers keep per-job fencing).
+All require root v2.9.1, so their suites run the new conformance checks
+(batch writers keep per-job fencing; drivers with `LinearizableCAS` also run
+`drivertest.RunConcurrentClaims`: concurrent fetchers never share a job).
 
 ### Fixed
 - stdlib: fetching ran `SELECT ... FOR UPDATE SKIP LOCKED` and the claiming
@@ -39,10 +40,20 @@ All require root v2.9.0, so their suites run the new conformance checks
 - mongodbv2: fetching more than one job takes three round trips (find ids,
   one `updateMany` that re-checks readiness and stamps a claim token, read
   back by token) instead of one `findOneAndUpdate` per job.
+- cassandra, dynamodb, firestore: a fetch claims its candidates in concurrent
+  waves (as many at once as jobs are still missing), so a batch costs about
+  one conditional write's latency instead of one per job. Each claim is still
+  its own LWT / conditional update / transaction. A fetch that fails after
+  claiming some jobs now returns them instead of leaving them to rescue.
+- clickhouse: `EnqueueMany` and a fetch write their rows with one INSERT
+  (one part) instead of one per job, and queue metadata once per queue.
 
 ### Tests
 - redis: the suite runs against an existing server when
   `GONCORDIA_TEST_REDIS_ADDR` is set.
+
+---
+
 ## [v2.9.1] — 2026-11-23
 
 ### Tests
