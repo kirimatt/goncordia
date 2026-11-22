@@ -14,11 +14,11 @@ require (
 	github.com/kirimatt/goncordia/driver/cassandra/v2 v2.2.0
 	github.com/kirimatt/goncordia/driver/clickhouse/v2 v2.2.0
 	github.com/kirimatt/goncordia/driver/dynamodb/v2 v2.2.0
-	github.com/kirimatt/goncordia/driver/firestore/v2 v2.5.1
+	github.com/kirimatt/goncordia/driver/firestore/v2 v2.7.1
 	github.com/kirimatt/goncordia/driver/pgxv5/v2 v2.6.0
 	github.com/kirimatt/goncordia/driver/redis/v2 v2.5.1
 	github.com/kirimatt/goncordia/driver/stdlib/v2 v2.6.0
-	github.com/kirimatt/goncordia/v2 v2.6.0
+	github.com/kirimatt/goncordia/v2 v2.7.1
 	github.com/redis/go-redis/v9 v9.23.0
 	github.com/testcontainers/testcontainers-go v0.45.0
 	github.com/testcontainers/testcontainers-go/modules/cassandra v0.45.0
@@ -83,7 +83,7 @@ require (
 	github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761 // indirect
 	github.com/jackc/puddle/v2 v2.2.3 // indirect
 	github.com/kirimatt/goncordia/driver/mongodbv2/v2 v2.6.0
-	github.com/klauspost/compress v1.20.3 // indirect
+	github.com/klauspost/compress v1.20.4 // indirect
 	github.com/lufia/plan9stats v0.0.0-20260330125221-c963978e514e // indirect
 	github.com/magiconair/properties v1.18.12 // indirect
 	github.com/mattn/go-isatty v0.0.24 // indirect
