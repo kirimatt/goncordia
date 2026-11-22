@@ -9,7 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Performance (core, drivers pgxv5, stdlib Postgres)
+---
+
+## [v2.8.0] — 2026-11-22
+
+Root module v2.8.0; drivers pgxv5 and stdlib follow with the driver-side
+changes and require v2.8.0.
+
+### Performance
 - Fetching jobs no longer sorts the whole backlog. The fetch query filters
   `state IN ('available', 'scheduled')`, and no index returned rows in fetch
   order for that predicate, so every fetch sorted all ready jobs. A new
@@ -37,7 +44,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   c=32 ~880 → ~8 150 jobs/s. (Embedded Postgres 18 on Windows, localhost;
   relative numbers only.)
 
-### Fixed (drivers stdlib v2.7.2, gorm v2.7.2, bun v2.7.2; 2026-11-19)
+---
+
+## [drivers stdlib, gorm, bun v2.7.2] — 2026-11-19
+
+### Fixed
 - The MySQL dialect works on MariaDB. Recording a job error used
   `CAST(? AS JSON)`, which MariaDB rejects, so a failed job stayed running
   until rescued. CI now runs the MySQL suite on MariaDB 11.4 as well.
