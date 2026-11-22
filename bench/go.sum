@@ -169,8 +169,8 @@ github.com/kirimatt/goncordia/driver/redis/v2 v2.5.1 h1:VBWA5s3H8mdefP4MtkBCcwur
 github.com/kirimatt/goncordia/driver/redis/v2 v2.5.1/go.mod h1:wHa776surWZV6Qbd017zP03+XMShOTha6jV+Qs+Q6pc=
 github.com/kirimatt/goncordia/driver/stdlib/v2 v2.6.0 h1:BuYXSG3p1UzcOnxFaVGLkKWGGRdI96T4KT9OY+pHtJs=
 github.com/kirimatt/goncordia/driver/stdlib/v2 v2.6.0/go.mod h1:N6f5gWs0+1zxPENAoiHt6rJRBr5vZ1Qy3sHh/rDDDd8=
-github.com/kirimatt/goncordia/v2 v2.6.0 h1:Gpkxbl9gLGsefvProuc1TsHS0M+av/Qobj8jSXUh5DA=
-github.com/kirimatt/goncordia/v2 v2.6.0/go.mod h1:9DGFKBiqNXbjvUB4SmCxZZOyBZ5gvFx1BvOT6ETkTRs=
+github.com/kirimatt/goncordia/v2 v2.7.2 h1:2n2Sosb87MjZVW080pZQEY1KGNsRvwgsoibr3o9NWSc=
+github.com/kirimatt/goncordia/v2 v2.7.2/go.mod h1:9DGFKBiqNXbjvUB4SmCxZZOyBZ5gvFx1BvOT6ETkTRs=
 github.com/klauspost/compress v1.20.3 h1:zWNoFqq/lSuYQRim3dUXlXeA0IqwuZGicdG5ZTfY5j4=
 github.com/klauspost/compress v1.20.3/go.mod h1:LUdAzn7YLVvxLpc7y3V1m40wESHTgc1422pwwBSKYuI=
 github.com/klauspost/cpuid/v2 v2.4.0 h1:S6Hrbc7+ywsr0r+RLapfGBHfyefhCTwEh3A0tV913Dw=
