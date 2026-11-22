@@ -43,6 +43,15 @@ All require root v2.9.0, so their suites run the new conformance checks
 ### Tests
 - redis: the suite runs against an existing server when
   `GONCORDIA_TEST_REDIS_ADDR` is set.
+## [v2.9.1] — 2026-11-23
+
+### Tests
+- The concurrent-claim check moved out of `drivertest.Run` into
+  `drivertest.RunConcurrentClaims`, for drivers that report
+  `LinearizableCAS`. ClickHouse does not (it claims by inserting a higher
+  version row) and can hand one job to two fetchers, as documented.
+- The batch-completion check completes the job holding the unique key
+  whatever the driver's fetch order among equal jobs (Redis ids are UUIDs).
 
 ---
 

@@ -10,6 +10,7 @@ import (
 func TestConformance(t *testing.T) {
 	d := memory.New()
 	drivertest.Run(t, d.Executor())
+	drivertest.RunConcurrentClaims(t, d.Executor())
 }
 
 func TestResultStoreConformance(t *testing.T) {
