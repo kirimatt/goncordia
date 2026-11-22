@@ -62,10 +62,10 @@ github.com/jinzhu/inflection v1.0.0 h1:K317FqzuhWc8YvSVlFMCCUb36O/S9MCKRDI7QkRKD
 github.com/jinzhu/inflection v1.0.0/go.mod h1:h+uFLlag+Qp1Va5pdKtLDYj+kHp5pxUVkryuEj+Srlc=
 github.com/jinzhu/now v1.1.5 h1:/o9tlHleP7gOFmsnYNz3RGnqzefHA47wQpKrrdTIwXQ=
 github.com/jinzhu/now v1.1.5/go.mod h1:d3SSVoowX0Lcu0IBviAWJpolVfI5UJVZZ7cO71lE/z8=
-github.com/kirimatt/goncordia/driver/stdlib/v2 v2.7.2 h1:Gxz2mu/N3atjdbhzM1VMjwZIK3/Sf85NEDfJkEKxN10=
-github.com/kirimatt/goncordia/driver/stdlib/v2 v2.7.2/go.mod h1:sx8bnuO9Y8V3vjfVC6KnwvQArskdU6PmwG6okwtxBwg=
-github.com/kirimatt/goncordia/v2 v2.7.1 h1:ZIyGOuG3WrXqDxoq+ryAIO6IiP0rsGGuGTH1RSV0szo=
-github.com/kirimatt/goncordia/v2 v2.7.1/go.mod h1:9DGFKBiqNXbjvUB4SmCxZZOyBZ5gvFx1BvOT6ETkTRs=
+github.com/kirimatt/goncordia/driver/stdlib/v2 v2.8.0 h1:2/rsBayHbCYp5IzwlqmV0xFiOJYJ+dOVC0vU1jA+g/E=
+github.com/kirimatt/goncordia/driver/stdlib/v2 v2.8.0/go.mod h1:RdC48BhFHcvSp0vETHxTU9Qz7MLVremFoeutX1C5chY=
+github.com/kirimatt/goncordia/v2 v2.8.0 h1:NPfVlYtn9/v8t0Wnw6hKEwkLCtsMk1yS6y6POwmQi1U=
+github.com/kirimatt/goncordia/v2 v2.8.0/go.mod h1:9DGFKBiqNXbjvUB4SmCxZZOyBZ5gvFx1BvOT6ETkTRs=
 github.com/klauspost/compress v1.20.4 h1:dD0v/bvxtjCBqQu6sx1TNWkalEY5lNTIe+HY9w8TeNI=
 github.com/klauspost/compress v1.20.4/go.mod h1:LUdAzn7YLVvxLpc7y3V1m40wESHTgc1422pwwBSKYuI=
 github.com/lufia/plan9stats v0.0.0-20260330125221-c963978e514e h1:Q6MvJtQK/iRcRtzAscm/zF23XxJlbECiGPyRicsX+Ak=
