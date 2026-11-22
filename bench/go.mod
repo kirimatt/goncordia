@@ -12,13 +12,13 @@ require (
 	github.com/gocql/gocql v1.7.0
 	github.com/jackc/pgx/v5 v5.13.0
 	github.com/kirimatt/goncordia/driver/cassandra/v2 v2.2.0
-	github.com/kirimatt/goncordia/driver/clickhouse/v2 v2.2.0
+	github.com/kirimatt/goncordia/driver/clickhouse/v2 v2.7.0
 	github.com/kirimatt/goncordia/driver/dynamodb/v2 v2.2.0
 	github.com/kirimatt/goncordia/driver/firestore/v2 v2.5.1
 	github.com/kirimatt/goncordia/driver/pgxv5/v2 v2.6.0
 	github.com/kirimatt/goncordia/driver/redis/v2 v2.5.1
 	github.com/kirimatt/goncordia/driver/stdlib/v2 v2.6.0
-	github.com/kirimatt/goncordia/v2 v2.6.0
+	github.com/kirimatt/goncordia/v2 v2.7.0
 	github.com/redis/go-redis/v9 v9.23.0
 	github.com/testcontainers/testcontainers-go v0.45.0
 	github.com/testcontainers/testcontainers-go/modules/cassandra v0.45.0
