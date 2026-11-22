@@ -26,6 +26,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now claims up to `free / len(schedule)` jobs, capped by the queue's
   `Concurrency` policy, so queue weights keep their share (3:1 still claims
   3:1). Claim order inside a pass can differ from the one-by-one order.
+- Successful completions are written in batches when the driver implements
+  the new optional `driver.JobBatchCompleter` (pgxv5 does). Completions that
+  finish while a write is in flight share the next `UPDATE` (group commit):
+  no added wait, and each job's completion still returns only after its row
+  is written, so observers, futures and pipelines see the same order. With
+  32 workers the database ran ~4× fewer transactions for the same 5 000 jobs
+  (~9 900 → ~2 350). Drivers without the interface are unchanged.
 - End-to-end worker pool on Postgres, 5 000 jobs: c=4 ~850 → ~2 900 jobs/s,
   c=32 ~880 → ~8 150 jobs/s. (Embedded Postgres 18 on Windows, localhost;
   relative numbers only.)

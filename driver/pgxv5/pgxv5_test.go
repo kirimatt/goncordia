@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -20,6 +22,7 @@ import (
 	"github.com/kirimatt/goncordia/v2"
 	"github.com/kirimatt/goncordia/v2/clock"
 	"github.com/kirimatt/goncordia/v2/core"
+	"github.com/kirimatt/goncordia/v2/driver"
 	"github.com/kirimatt/goncordia/v2/driver/drivertest"
 )
 
@@ -350,5 +353,86 @@ func TestPgxv5_RetryAndDiscard(t *testing.T) {
 	_ = workerPool.Shutdown(context.Background())
 	if got := attempts.Load(); got < 2 {
 		t.Errorf("expected >= 2 attempts, got %d", got)
+	}
+}
+
+func TestPgxv5_JobCompleteMany(t *testing.T) {
+	skipIfNoDocker(t)
+	pool, cleanup := newTestPool(t)
+	defer cleanup()
+	ctx := context.Background()
+	d := pgxdriver.New(pool)
+	if err := d.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	exec := d.Executor()
+	completer, ok := exec.(interface {
+		JobCompleteMany(context.Context, []driver.JobSetStateParams) ([]bool, error)
+	})
+	if !ok {
+		t.Fatal("pgxv5 executor does not implement JobCompleteMany")
+	}
+
+	params := []driver.JobInsertParams{
+		{Queue: "q", Kind: "k", Args: []byte(`{}`), MaxRetry: 3, UniqueKey: "plain-key"},
+		{Queue: "q", Kind: "k", Args: []byte(`{}`), MaxRetry: 3, UniqueKey: "uf2_forever"},
+		{Queue: "q", Kind: "k", Args: []byte(`{}`), MaxRetry: 3},
+		{Queue: "q", Kind: "k", Args: []byte(`{}`), MaxRetry: 3},
+	}
+	if _, err := exec.JobInsertMany(ctx, params); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := exec.JobFetchBatch(ctx, driver.FetchParams{Queue: "q", Limit: 3, WorkerID: "w1"})
+	if err != nil || len(rows) != 3 {
+		t.Fatalf("fetch: rows=%d err=%v", len(rows), err)
+	}
+	waiting, err := exec.JobFetchBatch(ctx, driver.FetchParams{Queue: "q", Limit: 1})
+	if err != nil || len(waiting) != 1 {
+		t.Fatalf("fetch 4th: rows=%d err=%v", len(waiting), err)
+	}
+	// Return the 4th job to available so it is not running.
+	if err := exec.JobSetStateIfRunning(ctx, driver.JobSetStateParams{ID: waiting[0].ID, Yield: true}); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := completer.JobCompleteMany(ctx, []driver.JobSetStateParams{
+		{ID: rows[0].ID, ExpectedWorkerID: "w1", ExpectedAttempt: rows[0].AttemptNum},
+		{ID: rows[1].ID, ExpectedWorkerID: "w1", ExpectedAttempt: rows[1].AttemptNum},
+		{ID: rows[2].ID, ExpectedWorkerID: "other", ExpectedAttempt: rows[2].AttemptNum}, // stale worker
+		{ID: waiting[0].ID}, // not running
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []bool{true, true, false, false}; !slices.Equal(got, want) {
+		t.Fatalf("completed=%v want %v", got, want)
+	}
+
+	byKey := map[string]*driver.JobRow{}
+	for _, r := range rows {
+		j, err := exec.JobGetByID(ctx, r.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		byKey[r.ID] = j
+	}
+	for i, r := range rows[:2] {
+		j := byKey[r.ID]
+		if j.State != driver.JobStateCompleted || j.FinalizedAt == nil || j.WorkerID != "" {
+			t.Fatalf("job %d: state=%s finalized=%v worker=%q", i, j.State, j.FinalizedAt, j.WorkerID)
+		}
+	}
+	if j := byKey[rows[2].ID]; j.State != driver.JobStateRunning {
+		t.Fatalf("stale job state=%s, want running", j.State)
+	}
+	// Completing releases a plain unique key but keeps a uf2_ key.
+	for _, r := range rows[:2] {
+		j := byKey[r.ID]
+		switch {
+		case strings.HasPrefix(r.UniqueKey, "uf2_") && j.UniqueKey != r.UniqueKey:
+			t.Fatalf("uf2_ key dropped: %q", j.UniqueKey)
+		case r.UniqueKey == "plain-key" && j.UniqueKey != "":
+			t.Fatalf("plain key kept: %q", j.UniqueKey)
+		}
 	}
 }

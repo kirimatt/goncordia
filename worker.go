@@ -192,6 +192,7 @@ type WorkerPool[TTx any] struct {
 	registry  *core.Registry
 	config    WorkerConfig
 	configErr error
+	completer *batchCompleter // nil when the driver cannot batch completions
 
 	wg             sync.WaitGroup
 	sem            chan struct{}
@@ -458,7 +459,20 @@ func newWorkerPool[TTx any](d driver.Driver[TTx], registry *core.Registry, cfg W
 		pipelineTails:  make(map[string]chan struct{}),
 		kindSemaphores: make(map[string]chan struct{}),
 		keySemaphores:  make(map[string]*keySemaphore),
+		completer:      newPoolCompleter(d),
 	}
+}
+
+// newPoolCompleter returns a batch completer when the driver's executor can
+// complete many jobs in one call, and nil otherwise.
+func newPoolCompleter[TTx any](d driver.Driver[TTx]) *batchCompleter {
+	if d == nil {
+		return nil
+	}
+	if bc, ok := d.Executor().(driver.JobBatchCompleter); ok {
+		return newBatchCompleter(bc)
+	}
+	return nil
 }
 
 func cloneQueuePolicies(source map[string]QueuePolicy) map[string]QueuePolicy {
@@ -1495,9 +1509,14 @@ func (p *WorkerPool[TTx]) processRow(
 	}
 
 	if jobErr == nil {
-		p.setState(ctx, exec, fencedStateParams(row, driver.JobSetStateParams{
-			State: driver.JobStateCompleted,
-		}))
+		params := fencedStateParams(row, driver.JobSetStateParams{State: driver.JobStateCompleted})
+		if p.completer != nil {
+			if err := p.completer.complete(params); err != nil && !errors.Is(err, driver.ErrStaleClaim) {
+				p.reportError(fmt.Errorf("set state for job %s: %w", params.ID, err))
+			}
+		} else {
+			p.setState(ctx, exec, params)
+		}
 		return driver.JobStateCompleted, nil
 	}
 
