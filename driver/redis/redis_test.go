@@ -27,6 +27,14 @@ func TestMain(m *testing.M) {
 	code := 0
 	defer func() { os.Exit(code) }()
 
+	// GONCORDIA_TEST_REDIS_ADDR runs the suite against an existing server
+	// instead of a container.
+	if addr := os.Getenv("GONCORDIA_TEST_REDIS_ADDR"); addr != "" {
+		redisAddr = addr
+		code = m.Run()
+		return
+	}
+
 	ctr, err := tcredis.Run(ctx, "redis:7")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "start redis container: %v\n", err)

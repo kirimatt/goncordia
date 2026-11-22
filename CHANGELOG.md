@@ -11,6 +11,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [drivers pgxv5, stdlib, redis, mongodbv2, mongodb, cassandra, clickhouse, dynamodb, firestore v2.9.0] — 2026-11-23
+
+All require root v2.9.0, so their suites run the new conformance checks
+(concurrent fetchers never share a job; batch writers keep per-job fencing).
+
+### Fixed
+- stdlib: fetching ran `SELECT ... FOR UPDATE SKIP LOCKED` and the claiming
+  `UPDATE` as separate autocommit statements, so the row locks were gone
+  before the claim and two workers could claim the same job (Postgres, MySQL;
+  SQLite had the same race between its two statements). Postgres and SQLite
+  now claim with one atomic `UPDATE ... WHERE id IN (SELECT ...) RETURNING`,
+  which is also one round trip instead of three; MySQL claims inside a
+  transaction. gorm and bun use the stdlib executor.
+
+### Performance
+- pgxv5, stdlib (Postgres, SQLite, MySQL), redis, mongodbv2: implement
+  `driver.JobBatchStartMarker`.
+- stdlib MySQL: implements `driver.JobBatchCompleter` (lock, check, update in
+  one transaction), so every SQL dialect batches completions.
+- redis: a fetch claims the whole batch in one script call (and reads the
+  pause flag in it) instead of one call per job plus a pause lookup;
+  `EnqueueMany` sends all inserts in one pipeline; completing a job is one
+  script instead of WATCH/GET/MULTI, and batches of completions and start
+  marks share one pipeline. Scripts go out as EVALSHA, falling back to EVAL
+  on NOSCRIPT.
+- mongodbv2: fetching more than one job takes three round trips (find ids,
+  one `updateMany` that re-checks readiness and stamps a claim token, read
+  back by token) instead of one `findOneAndUpdate` per job.
+
+### Tests
+- redis: the suite runs against an existing server when
+  `GONCORDIA_TEST_REDIS_ADDR` is set.
+
+---
+
 ## [v2.9.0] — 2026-11-23
 
 ### Fixed

@@ -430,16 +430,74 @@ func jobFetchBatch(ctx context.Context, db *mongo.Database, clk clock.Clock, par
 		SetSort(bson.D{{Key: "priority", Value: -1}, {Key: "run_at", Value: 1}, {Key: "created_at", Value: 1}, {Key: "_id", Value: 1}}).
 		SetReturnDocument(options.After)
 
-	var rows []driver.JobRow
-	for i := 0; i < params.Limit; i++ {
-		var doc jobDoc
-		if err := col.FindOneAndUpdate(ctx, filter, update, findOpts).Decode(&doc); err != nil {
-			if err == mongo.ErrNoDocuments {
-				break
-			}
-			return rows, err
+	if params.Limit > 1 {
+		return fetchMany(ctx, col, filter, update, params.Limit)
+	}
+	var doc jobDoc
+	if err := col.FindOneAndUpdate(ctx, filter, update, findOpts).Decode(&doc); err != nil {
+		if err == mongo.ErrNoDocuments {
+			return nil, nil
 		}
-		rows = append(rows, *docToRow(doc))
+		return nil, err
+	}
+	return []driver.JobRow{*docToRow(doc)}, nil
+}
+
+// fetchMany claims up to limit jobs in three round trips instead of one
+// findOneAndUpdate per job: read candidate ids in fetch order, claim them
+// with one updateMany that re-checks the ready filter (each document update
+// is atomic, so a job goes to exactly one fetcher) and stamps a per-call
+// claim token, then read back the documents carrying that token.
+func fetchMany(ctx context.Context, col *mongo.Collection, filter, update bson.M, limit int) ([]driver.JobRow, error) {
+	cur, err := col.Find(ctx, filter, options.Find().
+		SetSort(bson.D{{Key: "priority", Value: -1}, {Key: "run_at", Value: 1}, {Key: "created_at", Value: 1}, {Key: "_id", Value: 1}}).
+		SetLimit(int64(limit)).
+		SetProjection(bson.M{"_id": 1}))
+	if err != nil {
+		return nil, fmt.Errorf("find ready jobs: %w", err)
+	}
+	var candidates []struct {
+		ID bson.ObjectID `bson:"_id"`
+	}
+	if err := cur.All(ctx, &candidates); err != nil {
+		return nil, fmt.Errorf("find ready jobs: %w", err)
+	}
+	if len(candidates) == 0 {
+		return nil, nil
+	}
+	ids := make(bson.A, len(candidates))
+	for i, c := range candidates {
+		ids[i] = c.ID
+	}
+	token := bson.NewObjectID().Hex()
+	claimFilter := bson.M{"_id": bson.M{"$in": ids}}
+	for k, v := range filter {
+		claimFilter[k] = v
+	}
+	claimUpdate := bson.M{}
+	for k, v := range update {
+		claimUpdate[k] = v
+	}
+	set := bson.M{"claim_token": token}
+	for k, v := range update["$set"].(bson.M) {
+		set[k] = v
+	}
+	claimUpdate["$set"] = set
+	if _, err := col.UpdateMany(ctx, claimFilter, claimUpdate); err != nil {
+		return nil, fmt.Errorf("claim jobs: %w", err)
+	}
+	cur, err = col.Find(ctx, bson.M{"_id": bson.M{"$in": ids}, "claim_token": token, "state": string(driver.JobStateRunning)},
+		options.Find().SetSort(bson.D{{Key: "priority", Value: -1}, {Key: "run_at", Value: 1}, {Key: "created_at", Value: 1}, {Key: "_id", Value: 1}}))
+	if err != nil {
+		return nil, fmt.Errorf("read claimed jobs: %w", err)
+	}
+	var docs []jobDoc
+	if err := cur.All(ctx, &docs); err != nil {
+		return nil, fmt.Errorf("read claimed jobs: %w", err)
+	}
+	rows := make([]driver.JobRow, len(docs))
+	for i, doc := range docs {
+		rows[i] = *docToRow(doc)
 	}
 	return rows, nil
 }
