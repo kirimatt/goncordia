@@ -24,6 +24,17 @@ func TestMain(m *testing.M) {
 	code := 0
 	defer func() { os.Exit(code) }()
 
+	// GONCORDIA_TEST_PG_DSN runs the suite against existing servers instead of
+	// containers (no Docker). Point it at a dedicated database: tests drop and
+	// recreate goncordia tables there. MySQL tests skip unless
+	// GONCORDIA_TEST_MYSQL_DSN is set too.
+	if dsn := os.Getenv("GONCORDIA_TEST_PG_DSN"); dsn != "" {
+		postgresDSN = dsn
+		mysqlDSN = os.Getenv("GONCORDIA_TEST_MYSQL_DSN")
+		code = m.Run()
+		return
+	}
+
 	// --- MySQL ---
 	// GONCORDIA_MYSQL_IMAGE runs the MySQL dialect against another server,
 	// e.g. mariadb:11.4.
