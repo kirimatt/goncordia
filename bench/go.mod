@@ -31,6 +31,11 @@ require (
 )
 
 require (
+	github.com/go-sql-driver/mysql v1.10.2 // indirect
+	github.com/kr/text v0.2.0 // indirect
+)
+
+require (
 	cloud.google.com/go v0.123.0 // indirect
 	cloud.google.com/go/auth v0.24.1-0.20261001053825-dbc26066f70a // indirect
 	cloud.google.com/go/auth/oauth2adapt v0.3.0 // indirect
@@ -83,7 +88,7 @@ require (
 	github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761 // indirect
 	github.com/jackc/puddle/v2 v2.2.3 // indirect
 	github.com/kirimatt/goncordia/driver/mongodbv2/v2 v2.6.0
-	github.com/klauspost/compress v1.20.3 // indirect
+	github.com/klauspost/compress v1.20.4 // indirect
 	github.com/lufia/plan9stats v0.0.0-20260330125221-c963978e514e // indirect
 	github.com/magiconair/properties v1.18.12 // indirect
 	github.com/mattn/go-isatty v0.0.24 // indirect

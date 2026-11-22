@@ -3,7 +3,7 @@ module github.com/kirimatt/goncordia/driver/stdlib/v2
 go 1.26.0
 
 require (
-	github.com/go-sql-driver/mysql v1.10.1
+	github.com/go-sql-driver/mysql v1.10.2
 	github.com/jackc/pgx/v5 v5.13.0
 	github.com/kirimatt/goncordia/v2 v2.8.0
 	github.com/testcontainers/testcontainers-go v0.45.0
@@ -67,6 +67,8 @@ require (
 	go.opentelemetry.io/otel v1.47.0 // indirect
 	go.opentelemetry.io/otel/log v1.47.0 // indirect
 	go.opentelemetry.io/otel/metric v1.47.0 // indirect
+	go.opentelemetry.io/otel/sdk v1.47.0 // indirect
+	go.opentelemetry.io/otel/sdk/metric v1.47.0 // indirect
 	go.opentelemetry.io/otel/trace v1.47.0 // indirect
 	go.yaml.in/yaml/v3 v3.0.5 // indirect
 	golang.org/x/crypto v0.58.0 // indirect
