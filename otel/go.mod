@@ -3,7 +3,7 @@ module github.com/kirimatt/goncordia/otel/v2
 go 1.26.0
 
 require (
-	github.com/kirimatt/goncordia/v2 v2.6.0
+	github.com/kirimatt/goncordia/v2 v2.7.2
 	go.opentelemetry.io/otel v1.47.0
 	go.opentelemetry.io/otel/metric v1.47.0
 	go.opentelemetry.io/otel/sdk v1.47.0
