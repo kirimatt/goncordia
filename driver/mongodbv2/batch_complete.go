@@ -117,3 +117,64 @@ func (e *executor) JobCompleteMany(ctx context.Context, params []driver.JobSetSt
 	}
 	return out, nil
 }
+
+// JobMarkStartedMany persists the start instant of many running jobs with
+// one unordered bulkWrite; see driver.JobBatchStartMarker.
+func (e *executor) JobMarkStartedMany(ctx context.Context, params []driver.JobMarkStartedParams) ([]bool, error) {
+	out := make([]bool, len(params))
+	if len(params) == 0 {
+		return out, nil
+	}
+	oids := make([]bson.ObjectID, len(params))
+	models := make([]mongo.WriteModel, len(params))
+	for i, p := range params {
+		oid, err := bson.ObjectIDFromHex(p.ID)
+		if err != nil {
+			return nil, fmt.Errorf("invalid job id %q: %w", p.ID, err)
+		}
+		oids[i] = oid
+		models[i] = mongo.NewUpdateOneModel().SetFilter(bson.M{
+			"_id": oid, "state": string(driver.JobStateRunning),
+			"worker_id": p.WorkerID, "attempt_num": p.Attempt,
+		}).SetUpdate(bson.M{"$set": bson.M{"started_at": p.At.UTC()}})
+	}
+	jobs := e.db.Collection(jobsCollection)
+	res, err := jobs.BulkWrite(ctx, models, options.BulkWrite().SetOrdered(false))
+	if err != nil {
+		return nil, fmt.Errorf("mark jobs started: %w", err)
+	}
+	if res.MatchedCount == int64(len(models)) {
+		for i := range out {
+			out[i] = true
+		}
+		return out, nil
+	}
+	// Some claims did not match: report the jobs whose claim still matches.
+	cur, err := jobs.Find(ctx,
+		bson.M{"_id": bson.M{"$in": oids}, "state": string(driver.JobStateRunning)},
+		options.Find().SetProjection(bson.M{"worker_id": 1, "attempt_num": 1}))
+	if err != nil {
+		return nil, fmt.Errorf("mark jobs started: %w", err)
+	}
+	var claims []struct {
+		ID         bson.ObjectID `bson:"_id"`
+		WorkerID   string        `bson:"worker_id"`
+		AttemptNum int           `bson:"attempt_num"`
+	}
+	if err := cur.All(ctx, &claims); err != nil {
+		return nil, fmt.Errorf("mark jobs started: %w", err)
+	}
+	type claim struct {
+		workerID string
+		attempt  int
+	}
+	running := make(map[bson.ObjectID]claim, len(claims))
+	for _, c := range claims {
+		running[c.ID] = claim{c.WorkerID, c.AttemptNum}
+	}
+	for i, p := range params {
+		c, ok := running[oids[i]]
+		out[i] = ok && c.workerID == p.WorkerID && c.attempt == p.Attempt
+	}
+	return out, nil
+}

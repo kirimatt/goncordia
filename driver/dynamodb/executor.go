@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"sort"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -657,13 +658,8 @@ func jobFetchBatch(ctx context.Context, svc *dynamodb.Client, clk clock.Clock, p
 	})
 
 	qsRunning := qsKey(params.Queue, string(driver.JobStateRunning))
-	var claimed []driver.JobRow
-
-	for _, c := range candidates {
-		if len(claimed) >= params.Limit {
-			break
-		}
-
+	// claim tries one candidate with a conditional update.
+	claim := func(c dynamoJob) (*driver.JobRow, error) {
 		updateExpression := `SET #state = :running, #qs = :qs_running, #wid = :wid, ` +
 			`#aat = :now, #anum = #anum + :one, #ver = #ver + :one`
 		names := map[string]string{
@@ -697,7 +693,7 @@ func jobFetchBatch(ctx context.Context, svc *dynamodb.Client, clk clock.Clock, p
 		if claimErr != nil {
 			var cce *types.ConditionalCheckFailedException
 			if errors.As(claimErr, &cce) {
-				continue // another worker claimed it first
+				return nil, nil // another worker claimed it first
 			}
 			return nil, fmt.Errorf("claim update: %w", claimErr)
 		}
@@ -728,7 +724,43 @@ func jobFetchBatch(ctx context.Context, svc *dynamodb.Client, clk clock.Clock, p
 			WorkerID:       params.WorkerID,
 			PipelineID:     c.PipelineID,
 		}
-		claimed = append(claimed, row)
+		return &row, nil
+	}
+
+	// Claim in waves: each wave tries, concurrently, as many candidates as
+	// jobs are still missing, so a batch costs about one conditional write's
+	// latency instead of one per job. Results keep the candidate order.
+	var claimed []driver.JobRow
+	next := 0
+	for len(claimed) < params.Limit && next < len(candidates) {
+		wave := candidates[next:min(next+params.Limit-len(claimed), len(candidates))]
+		next += len(wave)
+		rows := make([]*driver.JobRow, len(wave))
+		errs := make([]error, len(wave))
+		var wg sync.WaitGroup
+		for i, c := range wave {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				rows[i], errs[i] = claim(c)
+			}()
+		}
+		wg.Wait()
+		var firstErr error
+		for i := range wave {
+			if rows[i] != nil {
+				claimed = append(claimed, *rows[i])
+			}
+			if errs[i] != nil && firstErr == nil {
+				firstErr = errs[i]
+			}
+		}
+		if firstErr != nil {
+			if len(claimed) > 0 {
+				return claimed, nil // the next fetch reports a persistent error
+			}
+			return nil, firstErr
+		}
 	}
 	return claimed, nil
 }

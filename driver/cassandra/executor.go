@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"sync"
 	"time"
 
 	"github.com/gocql/gocql"
@@ -520,18 +521,14 @@ func jobFetchBatch(ctx context.Context, session *gocql.Session, clk clock.Clock,
 		return candidates[i].id < candidates[j].id
 	})
 
-	var claimed []driver.JobRow
-	for _, c := range candidates {
-		if len(claimed) >= params.Limit {
-			break
-		}
-
+	// claim tries one candidate: read, LWT, running index, avail cleanup.
+	claim := func(c candidate) (*driver.JobRow, error) {
 		j, err := selectJob(ctx, session, c.id)
 		if err == gocql.ErrNotFound {
 			// Stale avail entry — clean up.
 			_ = session.Query(`DELETE FROM goncordia_jobs_avail WHERE queue=? AND run_at=? AND priority=? AND id=?`,
 				params.Queue, c.runAt, c.priority, c.id).WithContext(ctx).Exec()
-			continue
+			return nil, nil
 		}
 		if err != nil {
 			return nil, err
@@ -540,7 +537,7 @@ func jobFetchBatch(ctx context.Context, session *gocql.Session, clk clock.Clock,
 			// Already claimed by another worker.
 			_ = session.Query(`DELETE FROM goncordia_jobs_avail WHERE queue=? AND run_at=? AND priority=? AND id=?`,
 				params.Queue, c.runAt, c.priority, c.id).WithContext(ctx).Exec()
-			continue
+			return nil, nil
 		}
 
 		// Atomically claim with LWT.
@@ -555,7 +552,7 @@ func jobFetchBatch(ctx context.Context, session *gocql.Session, clk clock.Clock,
 			return nil, fmt.Errorf("claim LWT: %w", lwtErr)
 		}
 		if !applied {
-			continue // another worker claimed it first
+			return nil, nil // another worker claimed it first
 		}
 		if err := session.Query(
 			`INSERT INTO goncordia_jobs_running (queue, attempted_at, id) VALUES (?, ?, ?)`,
@@ -575,7 +572,45 @@ func jobFetchBatch(ctx context.Context, session *gocql.Session, clk clock.Clock,
 		j.LeaseExpiresAt = leaseExpiresAt
 		j.AttemptNum++
 		j.Version = newVersion
-		claimed = append(claimed, *jobToRow(j))
+		return jobToRow(j), nil
+	}
+
+	// Claim in waves: each wave tries, concurrently, as many candidates as
+	// jobs are still missing, so a batch costs about one claim's latency
+	// instead of one per job. Results keep the candidate order.
+	var claimed []driver.JobRow
+	next := 0
+	for len(claimed) < params.Limit && next < len(candidates) {
+		wave := candidates[next:min(next+params.Limit-len(claimed), len(candidates))]
+		next += len(wave)
+		rows := make([]*driver.JobRow, len(wave))
+		errs := make([]error, len(wave))
+		var wg sync.WaitGroup
+		for i, c := range wave {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				rows[i], errs[i] = claim(c)
+			}()
+		}
+		wg.Wait()
+		var firstErr error
+		for i := range wave {
+			if rows[i] != nil {
+				claimed = append(claimed, *rows[i])
+			}
+			if errs[i] != nil && firstErr == nil {
+				firstErr = errs[i]
+			}
+		}
+		if firstErr != nil {
+			if len(claimed) > 0 {
+				// Hand over what this call claimed; the next fetch reports
+				// the error again if it persists.
+				return claimed, nil
+			}
+			return nil, firstErr
+		}
 	}
 	return claimed, nil
 }

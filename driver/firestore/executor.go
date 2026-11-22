@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"sync"
 	"time"
 
 	"cloud.google.com/go/firestore"
@@ -557,12 +558,8 @@ func jobFetchBatch(ctx context.Context, client *firestore.Client, clk clock.Cloc
 		return candidates[i].j.ID < candidates[k].j.ID
 	})
 
-	var claimed []driver.JobRow
-	for _, c := range candidates {
-		if len(claimed) >= params.Limit {
-			break
-		}
-
+	// claim tries one candidate in its own transaction.
+	claim := func(c candidate) (*driver.JobRow, error) {
 		claimTime := clk.Now()
 		var leaseExpiresAt time.Time
 		if params.LeaseDuration > 0 {
@@ -591,7 +588,7 @@ func jobFetchBatch(ctx context.Context, client *firestore.Client, clk clock.Cloc
 			})
 		})
 		if errors.Is(err, errJobGone) {
-			continue
+			return nil, nil
 		}
 		if err != nil {
 			return nil, fmt.Errorf("claim job: %w", err)
@@ -620,7 +617,43 @@ func jobFetchBatch(ctx context.Context, client *firestore.Client, clk clock.Cloc
 		if !leaseExpiresAt.IsZero() {
 			row.LeaseExpiresAt = &leaseExpiresAt
 		}
-		claimed = append(claimed, row)
+		return &row, nil
+	}
+
+	// Claim in waves: each wave tries, concurrently, as many candidates as
+	// jobs are still missing, so a batch costs about one transaction's
+	// latency instead of one per job. Results keep the candidate order.
+	var claimed []driver.JobRow
+	next := 0
+	for len(claimed) < params.Limit && next < len(candidates) {
+		wave := candidates[next:min(next+params.Limit-len(claimed), len(candidates))]
+		next += len(wave)
+		rows := make([]*driver.JobRow, len(wave))
+		errs := make([]error, len(wave))
+		var wg sync.WaitGroup
+		for i, c := range wave {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				rows[i], errs[i] = claim(c)
+			}()
+		}
+		wg.Wait()
+		var firstErr error
+		for i := range wave {
+			if rows[i] != nil {
+				claimed = append(claimed, *rows[i])
+			}
+			if errs[i] != nil && firstErr == nil {
+				firstErr = errs[i]
+			}
+		}
+		if firstErr != nil {
+			if len(claimed) > 0 {
+				return claimed, nil // the next fetch reports a persistent error
+			}
+			return nil, firstErr
+		}
 	}
 	return claimed, nil
 }

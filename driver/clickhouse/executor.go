@@ -265,11 +265,42 @@ func insertJobRow(ctx context.Context, conn chdriver.Conn, j chJob) error {
 	)
 }
 
+// insertJobRows writes many job versions with one multi-row INSERT (one
+// part instead of one per row). It binds values exactly like insertJobRow,
+// so stored times compare the same way in later queries.
+func insertJobRows(ctx context.Context, conn chdriver.Conn, jobs []chJob) error {
+	if len(jobs) == 1 {
+		return insertJobRow(ctx, conn, jobs[0])
+	}
+	const row = "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+	values := make([]string, len(jobs))
+	args := make([]any, 0, 21*len(jobs))
+	for i, j := range jobs {
+		values[i] = row
+		args = append(args,
+			j.ID, j.Queue, j.Kind, j.Args, j.State, j.Priority,
+			j.RunAt, j.CreatedAt, j.AttemptedAt, j.StartedAt, j.LeaseExpiresAt, j.FinalizedAt,
+			j.AttemptNum, j.MaxRetry, j.TimeoutMs,
+			j.UniqueKey, j.WorkerID, j.Tags, j.ErrorsJSON, j.Version, j.PipelineID,
+		)
+	}
+	return conn.Exec(ctx, `INSERT INTO goncordia_jobs
+		(id,queue,kind,args,state,priority,run_at,created_at,
+		 attempted_at,started_at,lease_expires_at,finalized_at,attempt_num,max_retry,timeout_ms,
+		 unique_key,worker_id,tags,errors_json,version,pipeline_id)
+		VALUES `+strings.Join(values, ","), args...)
+}
+
 // ---- JobInsertMany ----
 
 func jobInsertMany(ctx context.Context, conn chdriver.Conn, clk clock.Clock, params []driver.JobInsertParams) ([]driver.JobInsertResult, error) {
 	now := clk.Now()
 	results := make([]driver.JobInsertResult, len(params))
+	var rows []chJob
+	var rowIndex []int
+	var queues []string
+	seenQueue := map[string]bool{}
+	seenKey := map[string]bool{} // unique keys taken earlier in this batch
 
 	for i, p := range params {
 		runAt := p.RunAt
@@ -289,6 +320,10 @@ func jobInsertMany(ctx context.Context, conn chdriver.Conn, clk clock.Clock, par
 
 		// Soft unique-key check: look for an existing available/running job with this key.
 		if p.UniqueKey != "" {
+			if seenKey[p.UniqueKey] {
+				results[i] = driver.JobInsertResult{UniqueSkip: true}
+				continue
+			}
 			var existing string
 			row := conn.QueryRow(ctx,
 				`SELECT id FROM goncordia_jobs FINAL
@@ -320,16 +355,32 @@ func jobInsertMany(ctx context.Context, conn chdriver.Conn, clk clock.Clock, par
 			PipelineID: p.PipelineID,
 		}
 
-		if err := insertJobRow(ctx, conn, j); err != nil {
-			return nil, fmt.Errorf("insert job: %w", err)
+		if p.UniqueKey != "" {
+			seenKey[p.UniqueKey] = true
 		}
-
-		// Upsert queue metadata (higher version wins in ReplacingMergeTree).
-		if err := upsertQueue(ctx, conn, clk, p.Queue); err != nil {
+		if !seenQueue[p.Queue] {
+			seenQueue[p.Queue] = true
+			queues = append(queues, p.Queue)
+		}
+		rows = append(rows, j)
+		rowIndex = append(rowIndex, i)
+	}
+	if len(rows) == 0 {
+		return results, nil
+	}
+	// One INSERT (one part) for the whole batch.
+	if err := insertJobRows(ctx, conn, rows); err != nil {
+		return nil, fmt.Errorf("insert job: %w", err)
+	}
+	// Upsert queue metadata once per queue (higher version wins in
+	// ReplacingMergeTree).
+	for _, q := range queues {
+		if err := upsertQueue(ctx, conn, clk, q); err != nil {
 			return nil, err
 		}
-
-		results[i] = driver.JobInsertResult{Job: j.toRow()}
+	}
+	for k, j := range rows {
+		results[rowIndex[k]] = driver.JobInsertResult{Job: j.toRow()}
 	}
 	return results, nil
 }
@@ -470,8 +521,9 @@ func jobFetchBatch(ctx context.Context, conn chdriver.Conn, clk clock.Clock, par
 		return nil, nil
 	}
 
-	// Claim each candidate by inserting a higher-version row.
+	// Claim the candidates by inserting higher-version rows in one INSERT.
 	var claimedIDs []string
+	claimRows := make([]chJob, 0, len(candidates))
 	for _, c := range candidates {
 		claimed := c
 		claimed.State = string(driver.JobStateRunning)
@@ -486,11 +538,11 @@ func jobFetchBatch(ctx context.Context, conn chdriver.Conn, clk clock.Clock, par
 		}
 		claimed.AttemptNum = c.AttemptNum + 1
 		claimed.Version = c.Version + 1
-
-		if err := insertJobRow(ctx, conn, claimed); err != nil {
-			return nil, fmt.Errorf("claim insert: %w", err)
-		}
+		claimRows = append(claimRows, claimed)
 		claimedIDs = append(claimedIDs, c.ID)
+	}
+	if err := insertJobRows(ctx, conn, claimRows); err != nil {
+		return nil, fmt.Errorf("claim insert: %w", err)
 	}
 
 	// Re-read with FINAL to confirm we own the jobs (highest version wins).

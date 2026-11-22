@@ -27,6 +27,14 @@ func TestMain(m *testing.M) {
 	code := 0
 	defer func() { os.Exit(code) }()
 
+	// GONCORDIA_TEST_REDIS_ADDR runs the suite against an existing server
+	// instead of a container.
+	if addr := os.Getenv("GONCORDIA_TEST_REDIS_ADDR"); addr != "" {
+		redisAddr = addr
+		code = m.Run()
+		return
+	}
+
 	ctr, err := tcredis.Run(ctx, "redis:7")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "start redis container: %v\n", err)
@@ -74,6 +82,7 @@ func newDriver(t *testing.T, opts ...redisdriver.Option) (*redisdriver.Driver, *
 func TestRedis_EnqueueAndProcess(t *testing.T) {
 	d, _ := newDriver(t)
 	drivertest.Run(t, d.Executor())
+	drivertest.RunConcurrentClaims(t, d.Executor())
 	drivertest.RunResults(t, d.Executor())
 	drivertest.RunRetention(t, d)
 	ctx := context.Background()
