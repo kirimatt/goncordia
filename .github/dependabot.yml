@@ -22,6 +22,10 @@ updates:
       - /otel
     schedule:
       interval: weekly
+    # Our own modules are linked through go.work; Dependabot cannot bump a
+    # module that is also in the workspace and fails the whole run.
+    ignore:
+      - dependency-name: github.com/kirimatt/goncordia/*
     groups:
       aws:
         patterns:
