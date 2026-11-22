@@ -104,6 +104,18 @@ type JobHeartbeater interface {
 	JobHeartbeat(ctx context.Context, params JobHeartbeatParams) (renewed bool, err error)
 }
 
+// JobBatchCompleter is an optional executor capability that marks many
+// running jobs completed in one round trip. Each params entry carries the ID
+// and the fencing preconditions (ExpectedWorkerID, ExpectedAttempt) that
+// JobSetStateIfRunning would check; State and the error fields are ignored.
+// The result has one entry per params entry: true when that job was
+// completed, false when its claim was stale (the same case in which
+// JobSetStateIfRunning returns ErrStaleClaim). A non-nil error means the
+// whole call failed and no job may be assumed completed.
+type JobBatchCompleter interface {
+	JobCompleteMany(ctx context.Context, params []JobSetStateParams) ([]bool, error)
+}
+
 // JobStartMarker is an optional executor capability that persists the instant
 // a claimed job begins handler execution.
 type JobStartMarker interface {

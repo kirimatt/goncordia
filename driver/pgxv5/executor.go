@@ -20,6 +20,7 @@ type querier interface {
 	Exec(ctx context.Context, sql string, args ...any) (pgconn interface{ RowsAffected() int64 }, err error)
 	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
 	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+	SendBatch(ctx context.Context, b *pgx.Batch) pgx.BatchResults
 }
 
 // poolQuerier wraps *pgxpool.Pool to satisfy querier.
@@ -35,6 +36,9 @@ func (q poolQuerier) Query(ctx context.Context, sql string, args ...any) (pgx.Ro
 func (q poolQuerier) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
 	return q.p.QueryRow(ctx, sql, args...)
 }
+func (q poolQuerier) SendBatch(ctx context.Context, b *pgx.Batch) pgx.BatchResults {
+	return q.p.SendBatch(ctx, b)
+}
 
 // txQuerier wraps pgx.Tx to satisfy querier.
 type txQuerier struct{ tx pgx.Tx }
@@ -48,6 +52,9 @@ func (q txQuerier) Query(ctx context.Context, sql string, args ...any) (pgx.Rows
 }
 func (q txQuerier) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
 	return q.tx.QueryRow(ctx, sql, args...)
+}
+func (q txQuerier) SendBatch(ctx context.Context, b *pgx.Batch) pgx.BatchResults {
+	return q.tx.SendBatch(ctx, b)
 }
 
 // executor is the non-transactional executor (uses pool).
@@ -90,6 +97,59 @@ func (e *executor) JobMarkStarted(ctx context.Context, params driver.JobMarkStar
 }
 func (e *executor) JobSetStateIfRunning(ctx context.Context, params driver.JobSetStateParams) error {
 	return jobSetStateIfRunning(ctx, poolQuerier{e.pool}, e.clk, params)
+}
+func (e *executor) JobCompleteMany(ctx context.Context, params []driver.JobSetStateParams) ([]bool, error) {
+	return jobCompleteMany(ctx, poolQuerier{e.pool}, e.clk, params)
+}
+
+// jobCompleteMany completes many running jobs in one UPDATE. The per-row
+// fencing and the unique-key release match jobSetStateIfRunning for
+// JobStateCompleted.
+func jobCompleteMany(ctx context.Context, q querier, clk clock.Clock, params []driver.JobSetStateParams) ([]bool, error) {
+	ids := make([]int64, len(params))
+	workers := make([]string, len(params))
+	attempts := make([]int32, len(params))
+	for i, p := range params {
+		id, err := strconv.ParseInt(p.ID, 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("invalid job id %q: %w", p.ID, err)
+		}
+		ids[i], workers[i], attempts[i] = id, p.ExpectedWorkerID, int32(p.ExpectedAttempt)
+	}
+	const sql = `
+UPDATE goncordia_jobs j SET
+    state            = 'completed',
+    worker_id        = NULL,
+    lease_expires_at = NULL,
+    finalized_at     = $4,
+    unique_key       = CASE WHEN j.unique_key NOT LIKE 'uf2_%' THEN NULL ELSE j.unique_key END
+FROM unnest($1::bigint[], $2::text[], $3::int[]) AS c(id, worker_id, attempt)
+WHERE j.id = c.id AND j.state = 'running'
+  AND (c.worker_id = '' OR j.worker_id = c.worker_id)
+  AND (c.attempt <= 0 OR j.attempt_num = c.attempt)
+RETURNING j.id`
+	rows, err := q.Query(ctx, sql, ids, workers, attempts, clk.Now())
+	if err != nil {
+		return nil, fmt.Errorf("complete jobs: %w", err)
+	}
+	done := make(map[int64]bool, len(params))
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("complete jobs: %w", err)
+		}
+		done[id] = true
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("complete jobs: %w", err)
+	}
+	out := make([]bool, len(params))
+	for i, id := range ids {
+		out[i] = done[id]
+	}
+	return out, nil
 }
 func (e *executor) JobCancel(ctx context.Context, id string) error {
 	return jobCancel(ctx, poolQuerier{e.pool}, e.clk, id)
@@ -212,10 +272,28 @@ func (t *txExecutor) ScheduleCursorAdvance(ctx context.Context, params driver.Sc
 
 // --- SQL implementations ---
 
-func jobInsertMany(ctx context.Context, q querier, clk clock.Clock, params []driver.JobInsertParams) ([]driver.JobInsertResult, error) {
-	results := make([]driver.JobInsertResult, 0, len(params))
-	now := clk.Now()
+// insertJobSQL inserts one job; a unique-key conflict returns no row.
+const insertJobSQL = `
+INSERT INTO goncordia_jobs
+    (queue, kind, args, state, priority, run_at, created_at, max_retry, timeout_ms, unique_key, tags, pipeline_id)
+VALUES
+    ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+ON CONFLICT (unique_key) WHERE unique_key IS NOT NULL
+DO NOTHING
+RETURNING id, queue, kind, args, state, priority, run_at, created_at,
+          attempted_at, started_at, lease_expires_at, finalized_at, attempt_num, max_retry, timeout_ms,
+          unique_key, worker_id, tags, errors, pipeline_id`
 
+// jobInsertMany sends all inserts in one pgx batch (a single network round
+// trip) instead of one round trip per job. Statements still run one by one
+// in order, so ON CONFLICT and duplicate keys inside the batch behave exactly
+// as with separate inserts.
+func jobInsertMany(ctx context.Context, q querier, clk clock.Clock, params []driver.JobInsertParams) ([]driver.JobInsertResult, error) {
+	if len(params) == 0 {
+		return []driver.JobInsertResult{}, nil
+	}
+	now := clk.Now()
+	batch := &pgx.Batch{}
 	for _, p := range params {
 		runAt := p.RunAt
 		if runAt.IsZero() {
@@ -236,37 +314,39 @@ func jobInsertMany(ctx context.Context, q querier, clk clock.Clock, params []dri
 			uniqueKey = &p.UniqueKey
 		}
 
-		const insertSQL = `
-INSERT INTO goncordia_jobs
-    (queue, kind, args, state, priority, run_at, created_at, max_retry, timeout_ms, unique_key, tags, pipeline_id)
-VALUES
-    ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-ON CONFLICT (unique_key) WHERE unique_key IS NOT NULL
-DO NOTHING
-RETURNING id, queue, kind, args, state, priority, run_at, created_at,
-          attempted_at, started_at, lease_expires_at, finalized_at, attempt_num, max_retry, timeout_ms,
-          unique_key, worker_id, tags, errors, pipeline_id`
-
-		row := q.QueryRow(ctx, insertSQL,
+		batch.Queue(insertJobSQL,
 			p.Queue, p.Kind, p.Args, string(state), p.Priority, runAt, now,
 			p.MaxRetry, p.Timeout.Milliseconds(),
 			uniqueKey, tags, p.PipelineID,
 		)
+	}
 
-		jobRow, err := scanJobRow(row)
+	results := make([]driver.JobInsertResult, len(params))
+	var skipped []int
+	br := q.SendBatch(ctx, batch)
+	for i := range params {
+		jobRow, err := scanJobRow(br.QueryRow())
 		if err != nil {
 			if isNoRows(err) {
-				// Duplicate — find the existing job
-				existing, ferr := findUniqueJob(ctx, q, p.UniqueKey)
-				if ferr != nil {
-					return nil, ferr
-				}
-				results = append(results, driver.JobInsertResult{Job: existing, UniqueSkip: true})
+				skipped = append(skipped, i)
 				continue
 			}
+			_ = br.Close()
 			return nil, fmt.Errorf("insert job: %w", err)
 		}
-		results = append(results, driver.JobInsertResult{Job: jobRow})
+		results[i] = driver.JobInsertResult{Job: jobRow}
+	}
+	if err := br.Close(); err != nil {
+		return nil, fmt.Errorf("insert job: %w", err)
+	}
+
+	// Duplicates: look up the job that already holds the unique key.
+	for _, i := range skipped {
+		existing, err := findUniqueJob(ctx, q, params[i].UniqueKey)
+		if err != nil {
+			return nil, err
+		}
+		results[i] = driver.JobInsertResult{Job: existing, UniqueSkip: true}
 	}
 	return results, nil
 }

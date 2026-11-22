@@ -495,8 +495,51 @@ func TestWeightedQueueFairnessAndConcurrencyLimit(t *testing.T) {
 	go pool.Start(context.Background()) //nolint:errcheck
 	waitForCondition(t, time.Second, func() bool { return len(recorder.snapshot()) == 6 }, "weighted claims")
 	got := recorder.snapshot()
-	if !slices.Equal(got, []string{"critical", "critical", "bulk", "critical", "critical", "critical"}) {
+	counts := map[string]int{}
+	for _, q := range got {
+		counts[q]++
+	}
+	// bulk is capped at Concurrency 1; critical fills the remaining slots.
+	if counts["critical"] != 5 || counts["bulk"] != 1 {
 		t.Fatalf("claim order=%v", got)
+	}
+	close(release)
+	_ = pool.Shutdown(context.Background())
+}
+
+func TestWeightedQueuesKeepShareWithBatchFetch(t *testing.T) {
+	d := memory.New()
+	client := goncordia.NewClient(d, goncordia.ClientConfig{})
+	registry := core.NewRegistry()
+	release := make(chan struct{})
+	core.RegisterWorker(registry, core.WorkerFunc[featureArgs](func(context.Context, *core.Job[featureArgs]) error {
+		<-release
+		return nil
+	}), core.WorkerOpts{})
+	for i := range 20 {
+		for _, queue := range []string{"critical", "bulk"} {
+			if _, err := client.Enqueue(context.Background(), featureArgs{N: i}, &core.InsertOpts{Queue: queue}); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	recorder := &claimRecorder{}
+	pool := goncordia.NewWorkerPool(d, registry, goncordia.WorkerConfig{
+		Queues: []string{"critical", "bulk"}, Concurrency: 8, MaxPending: 8,
+		PollInterval: time.Hour, Observer: recorder,
+		QueuePolicies: map[string]goncordia.QueuePolicy{
+			"critical": {Weight: 3},
+			"bulk":     {Weight: 1},
+		},
+	})
+	go pool.Start(context.Background()) //nolint:errcheck
+	waitForCondition(t, time.Second, func() bool { return len(recorder.snapshot()) == 8 }, "weighted claims")
+	counts := map[string]int{}
+	for _, q := range recorder.snapshot() {
+		counts[q]++
+	}
+	if counts["critical"] != 6 || counts["bulk"] != 2 {
+		t.Fatalf("claims=%v, want critical 6 bulk 2", counts)
 	}
 	close(release)
 	_ = pool.Shutdown(context.Background())
