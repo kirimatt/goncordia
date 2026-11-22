@@ -265,31 +265,30 @@ func insertJobRow(ctx context.Context, conn chdriver.Conn, j chJob) error {
 	)
 }
 
-// insertJobRows writes many job versions with one INSERT (one part instead
-// of one per row).
+// insertJobRows writes many job versions with one multi-row INSERT (one
+// part instead of one per row). It binds values exactly like insertJobRow,
+// so stored times compare the same way in later queries.
 func insertJobRows(ctx context.Context, conn chdriver.Conn, jobs []chJob) error {
 	if len(jobs) == 1 {
 		return insertJobRow(ctx, conn, jobs[0])
 	}
-	batch, err := conn.PrepareBatch(ctx, `INSERT INTO goncordia_jobs
-		(id,queue,kind,args,state,priority,run_at,created_at,
-		 attempted_at,started_at,lease_expires_at,finalized_at,attempt_num,max_retry,timeout_ms,
-		 unique_key,worker_id,tags,errors_json,version,pipeline_id)`)
-	if err != nil {
-		return err
-	}
-	for _, j := range jobs {
-		if err := batch.Append(
+	const row = "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+	values := make([]string, len(jobs))
+	args := make([]any, 0, 21*len(jobs))
+	for i, j := range jobs {
+		values[i] = row
+		args = append(args,
 			j.ID, j.Queue, j.Kind, j.Args, j.State, j.Priority,
 			j.RunAt, j.CreatedAt, j.AttemptedAt, j.StartedAt, j.LeaseExpiresAt, j.FinalizedAt,
 			j.AttemptNum, j.MaxRetry, j.TimeoutMs,
 			j.UniqueKey, j.WorkerID, j.Tags, j.ErrorsJSON, j.Version, j.PipelineID,
-		); err != nil {
-			_ = batch.Abort()
-			return err
-		}
+		)
 	}
-	return batch.Send()
+	return conn.Exec(ctx, `INSERT INTO goncordia_jobs
+		(id,queue,kind,args,state,priority,run_at,created_at,
+		 attempted_at,started_at,lease_expires_at,finalized_at,attempt_num,max_retry,timeout_ms,
+		 unique_key,worker_id,tags,errors_json,version,pipeline_id)
+		VALUES `+strings.Join(values, ","), args...)
 }
 
 // ---- JobInsertMany ----
