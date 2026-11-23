@@ -26,9 +26,11 @@ require (
 	github.com/testcontainers/testcontainers-go/modules/mongodb v0.45.0
 	github.com/testcontainers/testcontainers-go/modules/postgres v0.45.0
 	github.com/testcontainers/testcontainers-go/modules/redis v0.45.0
-	go.mongodb.org/mongo-driver/v2 v2.10.0
+	go.mongodb.org/mongo-driver/v2 v2.10.1
 	modernc.org/sqlite v1.62.0
 )
+
+require github.com/kr/text v0.2.0 // indirect
 
 require (
 	cloud.google.com/go v0.123.0 // indirect
