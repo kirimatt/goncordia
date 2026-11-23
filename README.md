@@ -7,6 +7,7 @@
 [![Go version](https://img.shields.io/github/go-mod/go-version/kirimatt/goncordia)](go.mod)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Mentioned in Awesome Go](https://awesome.re/mentioned-badge.svg)](https://github.com/avelino/awesome-go#messaging)
+[![Context7](https://img.shields.io/badge/Context7-%2Fkirimatt%2Fgoncordia-blue)](https://context7.com/kirimatt/goncordia)
 
 [Documentation](https://goncordia.docs7.io) · [Changelog](CHANGELOG.md) · [API reference](https://pkg.go.dev/github.com/kirimatt/goncordia/v2) · [Migrating to v2](MIGRATING_TO_V2.md) · [Who uses it](ADOPTERS.md)
 
@@ -139,6 +140,22 @@ only on Redis; their own numbers are in [Benchmarks](#benchmarks).
 Moving over from one of them? Migration guides: [Asynq](https://goncordia.docs7.io/migrating-from-asynq), [River](https://goncordia.docs7.io/migrating-from-river), [Machinery](https://goncordia.docs7.io/migrating-from-machinery).
 
 ---
+
+## Using goncordia with AI coding agents
+
+Up-to-date, version-specific docs for Cursor, Claude Code, Copilot, Windsurf
+and other agents:
+
+- **Context7 MCP**: library ID `/kirimatt/goncordia`. With the
+  [Context7 MCP server](https://github.com/upstash/context7) installed, add
+  `use context7` or `use library /kirimatt/goncordia` to your prompt.
+  Versions are indexed per release (`/kirimatt/goncordia/v2.10.1`).
+- **Plain text, no MCP**: [context7.com/kirimatt/goncordia/llms.txt](https://context7.com/kirimatt/goncordia/llms.txt)
+  (add `?topic=EnqueueTx` to narrow it) and
+  [goncordia.docs7.io/llms.txt](https://goncordia.docs7.io/llms.txt).
+- **In your repository**: copy the rules from [AGENTS.md](AGENTS.md) into
+  your own `AGENTS.md` / `CLAUDE.md` / `.cursor/rules`, so the agent uses
+  `EnqueueTx`, the `/v2` import paths and the in-memory test driver.
 
 ## Installation
 

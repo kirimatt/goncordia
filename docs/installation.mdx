@@ -46,3 +46,17 @@ go get github.com/kirimatt/goncordia/driver/firestore/v2@v2.10.0
 The root v1 module intentionally does not download every database SDK. Driver,
 OpenTelemetry, and testing dependencies arrive only when their submodule is
 selected. See [Migrating to v2](/migrating-to-v2) for upgrade commands.
+
+## AI coding agents
+
+goncordia's docs are indexed in [Context7](https://context7.com/kirimatt/goncordia)
+under the library ID `/kirimatt/goncordia`, one entry per release
+(`/kirimatt/goncordia/v2.10.1`). With the
+[Context7 MCP server](https://github.com/upstash/context7) in Cursor, Claude
+Code, Copilot or Windsurf, add `use library /kirimatt/goncordia` to a prompt.
+Without MCP, give the agent
+`https://context7.com/kirimatt/goncordia/llms.txt?topic=<topic>` or
+[/llms.txt](https://goncordia.docs7.io/llms.txt). To keep the key rules
+(`EnqueueTx`, `/v2` import paths, in-memory tests) in every session, copy
+[AGENTS.md](https://github.com/kirimatt/goncordia/blob/main/AGENTS.md) into
+your repository.
