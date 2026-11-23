@@ -143,6 +143,10 @@ Use `future.BindTx` for `EnqueueTx(ctx, tx, args)`; await only after commit. Aft
 Full runnable examples: `future/example_test.go` (memory) and
 `driver/pgxv5/example_future_test.go` (Postgres with `EnqueueTx`).
 
+Set `ClientConfig.ContextTags: otelgoncordia.TraceContextTags` to carry the
+trace context into jobs; `otelgoncordia.NewMiddleware` then continues the
+enqueuing trace in the worker.
+
 Use `goncordia.WorkerObservers(a, b)` to combine the Manager with OTel
 instrumentation, and `otelgoncordia.NewFutureInstrumentation()` as
 `future.Config.Observer` for await/store spans and metrics. Custom observers embed

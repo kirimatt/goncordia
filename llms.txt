@@ -46,7 +46,7 @@ Transactional inserts supported on: Postgres, MySQL, SQLite, MongoDB, Firestore 
 
 ## Documentation
 
-- [Context7](https://context7.com/kirimatt/goncordia): library ID `/kirimatt/goncordia` for the Context7 MCP server (`resolve-library-id` → `get-library-docs`); versions per release, e.g. `/kirimatt/goncordia/v2.10.1`. Plain text: https://context7.com/kirimatt/goncordia/llms.txt?topic=<topic>
+- [Context7](https://context7.com/kirimatt/goncordia): library ID `/kirimatt/goncordia` for the Context7 MCP server (`resolve-library-id` → `get-library-docs`); versions per release, e.g. `/kirimatt/goncordia/v2.11.0`. Plain text: https://context7.com/kirimatt/goncordia/llms.txt?topic=<topic>
 - [README](https://github.com/kirimatt/goncordia/blob/main/README.md): Full documentation — features, driver table, quick start per backend, benchmarks, retry policies, cron jobs, OpenTelemetry
 - [AGENTS.md](https://github.com/kirimatt/goncordia/blob/main/AGENTS.md): Concise reference for coding agents — driver selection, job definition, EnqueueTx, testing, common mistakes
 - [pkg.go.dev](https://pkg.go.dev/github.com/kirimatt/goncordia/v2): Go API reference

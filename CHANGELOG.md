@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+---
+
+## [otel v2.7.0] — 2026-11-23
+
+Requires root v2.11.0.
+
+### Added
+- `TraceContextTags` (set as `ClientConfig.ContextTags`) stores the W3C trace
+  context of the enqueue span on the job, and `NewMiddleware` continues it, so
+  the request that enqueued a job, the enqueue and every attempt share one
+  trace. `ExtractTraceContext` reads it back from a job's tags.
+
+## [v2.11.0] — 2026-11-23
+
 ### Added
 - `mcpserver` module (`github.com/kirimatt/goncordia/mcpserver/v2`): an MCP
   server so AI agents (Claude Code, Cursor, others) can inspect and operate
@@ -23,6 +37,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Observer.StartEnqueue`, so it sees the enqueue span; the `otel` module uses
   it to carry the W3C trace context from the producer to the worker. The
   caller's `InsertOpts.Tags` are copied, never modified.
+
+### Changed
+- `drivertest.RunConcurrentClaims` stops after 15 s without a claim instead
+  of a fixed 15 s window, so slow emulators (Firestore in CI) finish while a
+  lost job still fails the test.
 
 ---
 

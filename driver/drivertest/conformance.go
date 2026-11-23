@@ -370,7 +370,7 @@ func Run(t *testing.T, exec driver.Executor) {
 // without compare-and-set (ClickHouse) may hand a job to two fetchers.
 func RunConcurrentClaims(t *testing.T, exec driver.Executor) {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 	queue := fmt.Sprintf("conformance-concurrent-%d", sequence.Add(1))
 	const jobs, fetchers = 60, 6
@@ -390,15 +390,19 @@ func RunConcurrentClaims(t *testing.T, exec driver.Executor) {
 		total   int
 		errs    []error
 		wg      sync.WaitGroup
+		// lastClaim moves on every claim: the fetchers give up only after a
+		// stall of claimStall, so a slow emulator gets the time it needs while
+		// a lost job still fails the test.
+		lastClaim = time.Now()
 	)
-	deadline := time.Now().Add(15 * time.Second)
+	const claimStall = 15 * time.Second
 	for w := range fetchers {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for time.Now().Before(deadline) {
+			for ctx.Err() == nil {
 				mu.Lock()
-				done := total >= jobs
+				done := total >= jobs || time.Since(lastClaim) > claimStall
 				mu.Unlock()
 				if done {
 					return
@@ -413,6 +417,9 @@ func RunConcurrentClaims(t *testing.T, exec driver.Executor) {
 				for _, r := range rows {
 					claimed[r.ID]++
 					total++
+				}
+				if len(rows) > 0 {
+					lastClaim = time.Now()
 				}
 				mu.Unlock()
 				if err != nil || len(rows) == 0 {

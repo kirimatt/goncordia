@@ -149,7 +149,7 @@ and other agents:
 - **Context7 MCP**: library ID `/kirimatt/goncordia`. With the
   [Context7 MCP server](https://github.com/upstash/context7) installed, add
   `use context7` or `use library /kirimatt/goncordia` to your prompt.
-  Versions are indexed per release (`/kirimatt/goncordia/v2.10.1`).
+  Versions are indexed per release (`/kirimatt/goncordia/v2.11.0`).
 - **Plain text, no MCP**: [context7.com/kirimatt/goncordia/llms.txt](https://context7.com/kirimatt/goncordia/llms.txt)
   (add `?topic=EnqueueTx` to narrow it) and
   [goncordia.docs7.io/llms.txt](https://goncordia.docs7.io/llms.txt).
@@ -180,7 +180,7 @@ See [the MCP guide](https://goncordia.docs7.io/mcp).
 Requires Go 1.26 or newer.
 
 ```bash
-go get github.com/kirimatt/goncordia/v2@v2.10.1
+go get github.com/kirimatt/goncordia/v2@v2.11.0
 ```
 
 Pick a driver:
@@ -1388,7 +1388,7 @@ _ = pool.Shutdown(context.Background())
 ## Observability (OpenTelemetry)
 
 ```bash
-go get github.com/kirimatt/goncordia/otel/v2@v2.6.0
+go get github.com/kirimatt/goncordia/otel/v2@v2.7.0
 ```
 
 ```go
@@ -1442,6 +1442,25 @@ The instrumentation produces:
 Panics are recovered, converted to errors, recorded on the span, and persisted
 with their stack trace in `driver.AttemptError.Trace` before retry/discard. The
 worker pool always stays alive.
+
+### One trace from request to worker
+
+Set `ContextTags` on the client and the job carries the W3C trace context of
+its enqueue span (as `traceparent=...` and `tracestate=...` tags). The
+middleware continues that trace, so the request that enqueued the job, the
+`goncordia.enqueue` span and every `goncordia.process` attempt share one trace
+ID, on every backend and without a schema change:
+
+```go
+client := pgxdriver.NewClient(d, goncordia.ClientConfig{
+    Observer:    instrumentation,
+    ContextTags: otelgoncordia.TraceContextTags,
+})
+```
+
+The admin API and the [MCP server](https://goncordia.docs7.io/mcp) show the tags; `get_job` in the MCP
+server returns the `trace_id` directly. `otelgoncordia.ExtractTraceContext`
+reads the context back from a job's tags in your own code.
 
 ### Futures
 
