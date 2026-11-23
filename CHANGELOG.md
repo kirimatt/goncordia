@@ -11,6 +11,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [v2.10.1] — 2026-11-23
+
+### Fixed
+- A worker pool could stop draining a backlog until the next `PollInterval`
+  tick: when every job claimed by a full fetch finished before that fetch
+  pass returned, the jobs read the previous backlog state and none of them
+  woke the fetch loop. The pass now asks for the next one itself after a
+  full fetch. Seen as a CI flake of
+  `TestWorkerPoolDrainsBacklogWithoutWaitingForPoll`; covered by a
+  deterministic test.
+
+---
+
 ## [drivers mongodb, mongodbv2, cassandra, clickhouse, dynamodb, firestore v2.10.0] — 2026-11-23
 
 Found with the repository benchmarks (`bench/`), run per backend in Docker.

@@ -846,7 +846,16 @@ func (p *WorkerPool[TTx]) fetchAndDispatch(ctx context.Context) {
 	// back full or a queue was skipped at its concurrency limit. Finishing
 	// jobs then wake the loop instead of waiting for the next poll tick.
 	backlog := false
-	defer func() { p.backlog.Store(backlog) }()
+	// full records a fetch that came back full. The jobs it dispatched may
+	// all finish before this pass returns and so read the previous backlog
+	// value; the pass then asks for the next one itself.
+	full := false
+	defer func() {
+		p.backlog.Store(backlog)
+		if full {
+			p.wakeOnBacklog()
+		}
+	}()
 	for free > 0 && misses < len(p.queueSchedule) {
 		index := int(p.queueCursor.Add(1)-1) % len(p.queueSchedule)
 		queue := p.queueSchedule[index]
@@ -874,6 +883,7 @@ func (p *WorkerPool[TTx]) fetchAndDispatch(ctx context.Context) {
 		misses = 0
 		if len(rows) >= limit {
 			backlog = true
+			full = true
 		}
 		for range rows {
 			p.queueClaimed(queue)
