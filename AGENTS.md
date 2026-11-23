@@ -2,6 +2,8 @@
 
 Reference for coding agents (Codex, Claude Code, Cursor, and others) using goncordia in an application. `CLAUDE.md` imports this file.
 
+For the full, version-specific docs use the Context7 MCP server with library ID `/kirimatt/goncordia` (or fetch `https://context7.com/kirimatt/goncordia/llms.txt?topic=<topic>`). Copy this file into your application's `AGENTS.md` / `CLAUDE.md` to keep these rules in the agent's context.
+
 Job queue engine for Go. One `Driver[TTx]` interface works across Postgres, MySQL, SQLite, MongoDB, Redis, Cassandra, ClickHouse, DynamoDB, Firestore, and in-memory.
 
 ## Core concept
