@@ -11,6 +11,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [drivers gorm, bun v2.9.0] — 2026-11-23
+
+Require stdlib v2.9.0 and root v2.9.1. Both use the stdlib executor, so they
+get its fix for concurrent fetchers claiming the same job, batched start
+marks, and MySQL batch completions. Their suites now also run
+`drivertest.RunConcurrentClaims`.
+
+---
+
 ## [drivers pgxv5, stdlib, redis, mongodbv2, mongodb, cassandra, clickhouse, dynamodb, firestore v2.9.0] — 2026-11-23
 
 All require root v2.9.1, so their suites run the new conformance checks
