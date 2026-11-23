@@ -36,6 +36,10 @@ Postgres (pgx v5, database/sql, gorm, bun), MySQL, SQLite, MongoDB, Redis, Cassa
 
 Transactional inserts supported on: Postgres, MySQL, SQLite, MongoDB, Firestore (not in-memory, Redis, Cassandra, ClickHouse, DynamoDB).
 
+## Performance
+
+`bench/compare` runs the same workloads against River (Postgres) and Asynq and Machinery (Redis) on the same servers. Postgres: on par with River at a 1 ms fetch cooldown (draining 20,000 jobs: 5,801 vs 4,726 jobs/s with 10 workers, 20,610 vs 22,588 with 100), 2.8 ms idle pickup. Redis: drains 4–9× faster than Asynq and Machinery, 0.7 ms idle pickup. Tables: https://goncordia.docs7.io/benchmarks
+
 ## Documentation
 
 - [README](https://github.com/kirimatt/goncordia/blob/main/README.md): Full documentation — features, driver table, quick start per backend, benchmarks, retry policies, cron jobs, OpenTelemetry

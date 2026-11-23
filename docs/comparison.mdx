@@ -11,11 +11,44 @@ description: "goncordia next to other Go job queues"
 | Scheduled / cron jobs | ✅ | ✅ | ✅ | ✅ |
 | Unique jobs | ✅ | ✅ | ✅ | ❌ |
 | Priority queues | ✅ | ✅ | ✅ | ❌ |
-| Push notifications | ✅ LISTEN/NOTIFY, Change Streams, Pub/Sub | ✅ LISTEN/NOTIFY | ✅ Pub/Sub | ❌ polling |
+| New-job wake-up | ✅ LISTEN/NOTIFY, Change Streams, Pub/Sub; polling elsewhere | ✅ LISTEN/NOTIFY | ❌ polling (`TaskCheckInterval`, 1 s) | ✅ blocking pop on Redis (`BLPOP`); broker-dependent |
 | Web UI | ✅ embeddable | ✅ (River UI, Pro) | ✅ (asynqmon) | ❌ |
 | Await a job's typed result | ✅ `future.Func.Call` / `Await` | ❌ | stores results, no await | ✅ `AsyncResult.Get` |
 | Unit tests without Docker | ✅ in-memory driver + `gontest` | needs Postgres | needs Redis | needs a broker |
 | Workflow primitives (chains, chords) | ❌ | ❌ | ❌ | ✅ |
+
+## Performance
+
+Same workloads on the same servers, every library with its default settings
+(full method, `-tuned` variants and latency in
+[Benchmarks](/benchmarks#against-river-asynq-and-machinery);
+code in [`bench/compare`](https://github.com/kirimatt/goncordia/tree/main/bench/compare)). Jobs per second, higher is better:
+
+| Postgres | goncordia (pgxv5) | River | River, 10 ms fetch interval |
+|---|---|---|---|
+| Enqueue, one per call | **1,044** | 671 | 670 |
+| Enqueue, batches of 100 | 31,237 | 34,427 | **34,827** |
+| Drain 20,000 jobs, 10 workers | **5,801** | 99 | 4,726 |
+| Drain 20,000 jobs, 100 workers | 20,610 | 999 | **22,588** |
+| Idle pickup latency, p50 | **2.8 ms** | 100 ms | 15 ms |
+
+| Redis | goncordia (redis) | Asynq | Machinery |
+|---|---|---|---|
+| Enqueue, one per call | 3,232 | **3,669** | 1,910 |
+| Enqueue, batches of 100 | **61,826** | no batch API | no batch API |
+| Drain 20,000 jobs, 10 workers | **11,450** | 3,040 | 2,263 |
+| Drain 20,000 jobs, 100 workers | **21,205** | 3,021 | 2,243 |
+| Idle pickup latency, p50 | **0.7 ms** | 1,036 ms | 1.6 ms |
+
+On Postgres goncordia is on par with River once River's fetch interval is
+lowered (River's default 100 ms `FetchCooldown` caps a drain at about
+10 × workers jobs/s); River is ~10% ahead on batch inserts and on a drain with
+100 workers. On Redis goncordia drains 4–9× faster than Asynq and Machinery;
+Asynq is ~10% ahead on single inserts. Asynq's idle latency follows its
+`TaskCheckInterval` (1 s by default; 11 ms with 10 ms). Every drain is checked
+for exactly-once execution; no library ran a job twice. Other goncordia
+backends are not in this table because River runs only on Postgres and Asynq
+only on Redis; their own numbers are in [Benchmarks](/benchmarks).
 
 **Choose goncordia** when you want the transactional outbox pattern and don't want to introduce Redis or a dedicated Postgres instance — it works with whatever database your application already uses. It also fits when a caller needs the value a background job returns (`future.Func.Call`), or when you want unit tests of enqueue and worker code without Docker.
 

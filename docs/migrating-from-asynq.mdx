@@ -150,6 +150,12 @@ _, _ = client.EnqueueTx(ctx, tx, OrderConfirmationArgs{OrderID: orderID}, nil)
 _ = tx.Commit(ctx) // both or neither
 ```
 
+Asynq workers look for new tasks every `TaskCheckInterval` (1 s by default)
+once the queues are empty. The goncordia Redis driver wakes workers through
+Pub/Sub, so there is no counterpart to tune; `PollInterval` is only the
+fallback. On the same Redis it drains a backlog several times faster than
+Asynq ([Benchmarks](/benchmarks#against-river-asynq-and-machinery)).
+
 ## Unique tasks
 
 Asynq's `Unique(ttl)` blocks a duplicate (same type, payload, and queue) until

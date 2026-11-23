@@ -48,7 +48,7 @@ core.RegisterWorker(registry, worker, core.WorkerOpts{
 ```
 
 Running claims are fenced by worker ID and attempt number. `attempted_at` remains
-the immutable claim time and `started_at` records handler entry; active and waiting claims renew `lease_expires_at`,
+the immutable claim time and `started_at` records handler entry (written in the background while the handler runs, and always before the job's outcome); active and waiting claims renew `lease_expires_at`,
 so rescue does not duplicate healthy long-running work. `Shutdown(ctx)` stops
 new claims, keeps active heartbeats alive, and returns `ctx.Err()` if the drain
 does not finish. Cancelling the pool context yields an interrupted claim without
