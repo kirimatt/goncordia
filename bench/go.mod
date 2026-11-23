@@ -30,7 +30,10 @@ require (
 	modernc.org/sqlite v1.62.0
 )
 
-require github.com/kr/text v0.2.0 // indirect
+require (
+	github.com/go-sql-driver/mysql v1.10.2 // indirect
+	github.com/kr/text v0.2.0 // indirect
+)
 
 require (
 	cloud.google.com/go v0.123.0 // indirect

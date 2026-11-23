@@ -3,7 +3,7 @@ module github.com/kirimatt/goncordia/driver/stdlib/v2
 go 1.26.0
 
 require (
-	github.com/go-sql-driver/mysql v1.10.1
+	github.com/go-sql-driver/mysql v1.10.2
 	github.com/jackc/pgx/v5 v5.13.0
 	github.com/kirimatt/goncordia/v2 v2.9.1
 	github.com/testcontainers/testcontainers-go v0.45.0
