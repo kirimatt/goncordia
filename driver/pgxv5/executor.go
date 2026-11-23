@@ -310,18 +310,6 @@ func (t *txExecutor) ScheduleCursorAdvance(ctx context.Context, params driver.Sc
 
 // --- SQL implementations ---
 
-// insertJobSQL inserts one job; a unique-key conflict returns no row.
-const insertJobSQL = `
-INSERT INTO goncordia_jobs
-    (queue, kind, args, state, priority, run_at, created_at, max_retry, timeout_ms, unique_key, tags, pipeline_id)
-VALUES
-    ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-ON CONFLICT (unique_key) WHERE unique_key IS NOT NULL
-DO NOTHING
-RETURNING id, queue, kind, args, state, priority, run_at, created_at,
-          attempted_at, started_at, lease_expires_at, finalized_at, attempt_num, max_retry, timeout_ms,
-          unique_key, worker_id, tags, errors, pipeline_id`
-
 // insertManySQL inserts a whole batch with one statement. Rows are inserted
 // in input order (ORDER BY ord), so their BIGSERIAL ids ascend in that order;
 // jobInsertMany relies on it to map rows without a unique key back to their
@@ -946,10 +934,6 @@ func encodeError(errStr, trace *string, attempt int, clk clock.Clock) []byte {
 	}
 	b, _ := json.Marshal([]driver.AttemptError{entry})
 	return b
-}
-
-func isNoRows(err error) bool {
-	return err != nil && err.Error() == "no rows in result set"
 }
 
 var (
