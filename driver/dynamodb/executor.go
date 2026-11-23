@@ -354,8 +354,36 @@ func selectJob(ctx context.Context, svc *dynamodb.Client, id string) (*dynamoJob
 
 func jobInsertMany(ctx context.Context, svc *dynamodb.Client, clk clock.Clock, params []driver.JobInsertParams) ([]driver.JobInsertResult, error) {
 	now := clk.Now()
+	nowStr := now.UTC().Format(timeFmt)
 	results := make([]driver.JobInsertResult, len(params))
 
+	// Queue metadata rows are written once per queue, next to the job writes.
+	var wg sync.WaitGroup
+	var queueErrMu sync.Mutex
+	var queueErr error
+	seen := map[string]bool{}
+	for _, p := range params {
+		if seen[p.Queue] {
+			continue
+		}
+		seen[p.Queue] = true
+		wg.Add(1)
+		go func(queue string) {
+			defer wg.Done()
+			if err := ensureQueueRow(ctx, svc, queue, nowStr); err != nil {
+				queueErrMu.Lock()
+				queueErr = err
+				queueErrMu.Unlock()
+			}
+		}(p.Queue)
+	}
+
+	// Jobs without a unique key need no condition, so they go out with
+	// BatchWriteItem (25 per request, requests in parallel). Jobs with a key
+	// keep their transaction and run in input order, so a key repeated in
+	// the batch is taken by its first job.
+	var plain []map[string]types.AttributeValue
+	var insertErr error
 	for i, p := range params {
 		runAt := p.RunAt
 		if runAt.IsZero() {
@@ -380,7 +408,7 @@ func jobInsertMany(ctx context.Context, svc *dynamodb.Client, clk clock.Clock, p
 			QueueState: qsKey(p.Queue, string(state)),
 			Priority:   p.Priority,
 			RunAt:      runAt.UTC().Format(timeFmt),
-			CreatedAt:  now.UTC().Format(timeFmt),
+			CreatedAt:  nowStr,
 			AttemptNum: 0,
 			MaxRetry:   p.MaxRetry,
 			TimeoutMs:  p.Timeout.Milliseconds(),
@@ -393,58 +421,124 @@ func jobInsertMany(ctx context.Context, svc *dynamodb.Client, clk clock.Clock, p
 
 		item, err := attributevalue.MarshalMap(j)
 		if err != nil {
-			return nil, err
+			insertErr = err
+			break
 		}
-		if p.UniqueKey != "" {
-			_, err = svc.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{
-				TransactItems: []types.TransactWriteItem{
-					{Put: &types.Put{TableName: aws.String(tableJobs), Item: item}},
-					{Put: &types.Put{
-						TableName: aws.String(tableUniq),
-						Item: map[string]types.AttributeValue{
-							"pk": &types.AttributeValueMemberS{Value: p.UniqueKey}, "job_id": &types.AttributeValueMemberS{Value: id},
-						},
-						ConditionExpression:      aws.String("attribute_not_exists(#pk)"),
-						ExpressionAttributeNames: map[string]string{"#pk": "pk"},
-					}},
-				},
-			})
-			if err != nil {
-				var cancelled *types.TransactionCanceledException
-				if errors.As(err, &cancelled) {
-					results[i] = driver.JobInsertResult{UniqueSkip: true}
-					continue
-				}
-				return nil, fmt.Errorf("insert unique job: %w", err)
-			}
-		} else if _, err := svc.PutItem(ctx, &dynamodb.PutItemInput{
-			TableName: aws.String(tableJobs), Item: item,
-		}); err != nil {
-			return nil, fmt.Errorf("insert job: %w", err)
+		if p.UniqueKey == "" {
+			plain = append(plain, item)
+			results[i] = driver.JobInsertResult{Job: jobFromDynamo(j)}
+			continue
 		}
-
-		// Ensure queue metadata row exists.
-		nowStr := now.UTC().Format(timeFmt)
-		if _, err := svc.PutItem(ctx, &dynamodb.PutItemInput{
-			TableName: aws.String(tableQueues),
-			Item: map[string]types.AttributeValue{
-				"name":       &types.AttributeValueMemberS{Value: p.Queue},
-				"paused":     &types.AttributeValueMemberBOOL{Value: false},
-				"created_at": &types.AttributeValueMemberS{Value: nowStr},
-				"updated_at": &types.AttributeValueMemberS{Value: nowStr},
+		_, err = svc.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{
+			TransactItems: []types.TransactWriteItem{
+				{Put: &types.Put{TableName: aws.String(tableJobs), Item: item}},
+				{Put: &types.Put{
+					TableName: aws.String(tableUniq),
+					Item: map[string]types.AttributeValue{
+						"pk": &types.AttributeValueMemberS{Value: p.UniqueKey}, "job_id": &types.AttributeValueMemberS{Value: id},
+					},
+					ConditionExpression:      aws.String("attribute_not_exists(#pk)"),
+					ExpressionAttributeNames: map[string]string{"#pk": "pk"},
+				}},
 			},
-			ConditionExpression:      aws.String("attribute_not_exists(#n)"),
-			ExpressionAttributeNames: map[string]string{"#n": "name"},
-		}); err != nil {
-			var cce *types.ConditionalCheckFailedException
-			if !errors.As(err, &cce) {
-				return nil, fmt.Errorf("upsert queue: %w", err)
+		})
+		if err != nil {
+			var cancelled *types.TransactionCanceledException
+			if errors.As(err, &cancelled) {
+				results[i] = driver.JobInsertResult{UniqueSkip: true}
+				continue
 			}
+			insertErr = fmt.Errorf("insert unique job: %w", err)
+			break
 		}
-
 		results[i] = driver.JobInsertResult{Job: jobFromDynamo(j)}
 	}
+	if insertErr == nil && len(plain) > 0 {
+		insertErr = batchPutJobs(ctx, svc, clk, plain)
+	}
+	wg.Wait()
+	if insertErr != nil {
+		return nil, insertErr
+	}
+	if queueErr != nil {
+		return nil, queueErr
+	}
 	return results, nil
+}
+
+// ensureQueueRow creates the queue metadata row if it does not exist.
+func ensureQueueRow(ctx context.Context, svc *dynamodb.Client, queue, nowStr string) error {
+	_, err := svc.PutItem(ctx, &dynamodb.PutItemInput{
+		TableName: aws.String(tableQueues),
+		Item: map[string]types.AttributeValue{
+			"name":       &types.AttributeValueMemberS{Value: queue},
+			"paused":     &types.AttributeValueMemberBOOL{Value: false},
+			"created_at": &types.AttributeValueMemberS{Value: nowStr},
+			"updated_at": &types.AttributeValueMemberS{Value: nowStr},
+		},
+		ConditionExpression:      aws.String("attribute_not_exists(#n)"),
+		ExpressionAttributeNames: map[string]string{"#n": "name"},
+	})
+	var cce *types.ConditionalCheckFailedException
+	if err != nil && !errors.As(err, &cce) {
+		return fmt.Errorf("upsert queue: %w", err)
+	}
+	return nil
+}
+
+// batchWriteLimit is DynamoDB's per-request item limit for BatchWriteItem.
+const batchWriteLimit = 25
+
+// batchPutJobs writes job items with BatchWriteItem, up to 8 requests in
+// flight. Items DynamoDB leaves unprocessed (throttling) are resent with
+// exponential backoff on the driver clock.
+func batchPutJobs(ctx context.Context, svc *dynamodb.Client, clk clock.Clock, items []map[string]types.AttributeValue) error {
+	sem := make(chan struct{}, 8)
+	errs := make(chan error, (len(items)+batchWriteLimit-1)/batchWriteLimit)
+	var wg sync.WaitGroup
+	for start := 0; start < len(items); start += batchWriteLimit {
+		chunk := items[start:min(start+batchWriteLimit, len(items))]
+		wg.Add(1)
+		sem <- struct{}{}
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			reqs := make([]types.WriteRequest, len(chunk))
+			for i, item := range chunk {
+				reqs[i] = types.WriteRequest{PutRequest: &types.PutRequest{Item: item}}
+			}
+			backoff := 10 * time.Millisecond
+			for attempt := 0; len(reqs) > 0; attempt++ {
+				out, err := svc.BatchWriteItem(ctx, &dynamodb.BatchWriteItemInput{
+					RequestItems: map[string][]types.WriteRequest{tableJobs: reqs},
+				})
+				if err != nil {
+					errs <- fmt.Errorf("insert jobs: %w", err)
+					return
+				}
+				reqs = out.UnprocessedItems[tableJobs]
+				if len(reqs) == 0 {
+					return
+				}
+				if attempt == 8 {
+					errs <- fmt.Errorf("insert jobs: %d items still unprocessed after retries", len(reqs))
+					return
+				}
+				timer := clk.NewTimer(backoff)
+				select {
+				case <-ctx.Done():
+					timer.Stop()
+					errs <- ctx.Err()
+					return
+				case <-timer.C():
+				}
+				backoff *= 2
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	return <-errs // nil when the channel is empty
 }
 
 // ---- JobGetByID ----
@@ -590,14 +684,6 @@ func queueStats(ctx context.Context, svc *dynamodb.Client, queue string) (driver
 // conditional UpdateItem. Each UpdateItem checks both version and state, so
 // only one worker wins per job.
 func jobFetchBatch(ctx context.Context, svc *dynamodb.Client, clk clock.Clock, params driver.FetchParams) ([]driver.JobRow, error) {
-	paused, err := isQueuePaused(ctx, svc, params.Queue)
-	if err != nil {
-		return nil, err
-	}
-	if paused {
-		return nil, nil
-	}
-
 	now := clk.Now()
 	nowStr := now.UTC().Format(timeFmt)
 	leaseExpiresAt := ""
@@ -605,7 +691,6 @@ func jobFetchBatch(ctx context.Context, svc *dynamodb.Client, clk clock.Clock, p
 		leaseExpiresAt = now.Add(params.LeaseDuration).UTC().Format(timeFmt)
 	}
 
-	candidates := make([]dynamoJob, 0, params.Limit*6)
 	candidateLimit := params.Limit * 16
 	if candidateLimit < 64 {
 		candidateLimit = 64
@@ -613,30 +698,63 @@ func jobFetchBatch(ctx context.Context, svc *dynamodb.Client, clk clock.Clock, p
 	if candidateLimit > 1024 {
 		candidateLimit = 1024
 	}
-	for _, state := range []driver.JobState{driver.JobStateAvailable, driver.JobStateScheduled} {
-		out, queryErr := svc.Query(ctx, &dynamodb.QueryInput{
-			TableName:              aws.String(tableJobs),
-			IndexName:              aws.String(gsiQueueState),
-			KeyConditionExpression: aws.String("#qs = :qs AND run_at <= :now"),
-			ExpressionAttributeNames: map[string]string{
-				"#qs": "queue_state",
-			},
-			ExpressionAttributeValues: map[string]types.AttributeValue{
-				":qs":  &types.AttributeValueMemberS{Value: qsKey(params.Queue, string(state))},
-				":now": &types.AttributeValueMemberS{Value: nowStr},
-			},
-			Limit: aws.Int32(int32(candidateLimit)),
-		})
-		if queryErr != nil {
-			return nil, fmt.Errorf("query %s jobs: %w", state, queryErr)
-		}
-		for _, item := range out.Items {
-			var j dynamoJob
-			if err := attributevalue.UnmarshalMap(item, &j); err != nil {
-				continue
+	// The pause check and both candidate queries are reads, so they run
+	// concurrently: one round trip of latency instead of three. Nothing is
+	// claimed before all three have returned.
+	states := []driver.JobState{driver.JobStateAvailable, driver.JobStateScheduled}
+	var (
+		paused   bool
+		pauseErr error
+		found    = make([][]dynamoJob, len(states))
+		queryErr = make([]error, len(states))
+		wg       sync.WaitGroup
+	)
+	wg.Add(1 + len(states))
+	go func() {
+		defer wg.Done()
+		paused, pauseErr = isQueuePaused(ctx, svc, params.Queue)
+	}()
+	for i, state := range states {
+		go func() {
+			defer wg.Done()
+			out, err := svc.Query(ctx, &dynamodb.QueryInput{
+				TableName:              aws.String(tableJobs),
+				IndexName:              aws.String(gsiQueueState),
+				KeyConditionExpression: aws.String("#qs = :qs AND run_at <= :now"),
+				ExpressionAttributeNames: map[string]string{
+					"#qs": "queue_state",
+				},
+				ExpressionAttributeValues: map[string]types.AttributeValue{
+					":qs":  &types.AttributeValueMemberS{Value: qsKey(params.Queue, string(state))},
+					":now": &types.AttributeValueMemberS{Value: nowStr},
+				},
+				Limit: aws.Int32(int32(candidateLimit)),
+			})
+			if err != nil {
+				queryErr[i] = fmt.Errorf("query %s jobs: %w", state, err)
+				return
 			}
-			candidates = append(candidates, j)
+			for _, item := range out.Items {
+				var j dynamoJob
+				if attributevalue.UnmarshalMap(item, &j) == nil {
+					found[i] = append(found[i], j)
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	if pauseErr != nil {
+		return nil, pauseErr
+	}
+	if paused {
+		return nil, nil
+	}
+	var candidates []dynamoJob
+	for i := range states {
+		if queryErr[i] != nil {
+			return nil, queryErr[i]
 		}
+		candidates = append(candidates, found[i]...)
 	}
 
 	// Portable order: highest priority, then earliest run_at/created_at/id.

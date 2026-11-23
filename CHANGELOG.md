@@ -11,6 +11,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [drivers mongodb, mongodbv2, cassandra, clickhouse, dynamodb, firestore v2.10.0] — 2026-11-23
+
+Found with the repository benchmarks (`bench/`), run per backend in Docker.
+
+### Changed
+- mongodb, mongodbv2: `JobInsertMany` writes jobs without a unique key with
+  one `InsertMany` instead of one `InsertOne` each. A batch of 100: 180 ms →
+  4 ms.
+- dynamodb: `JobInsertMany` writes jobs without a unique key with
+  `BatchWriteItem` (25 per request, requests in parallel, unprocessed items
+  resent with backoff) and the queue row once per queue instead of once per
+  job. A batch of 100: 174 → 24 ms; end-to-end with 4 workers 122 → ~390
+  jobs/s.
+- cassandra: `JobInsertMany` creates the queue row (a lightweight
+  transaction) once per queue instead of once per job and writes job rows in
+  parallel; unique keys are still reserved in input order. A batch of 100:
+  566 → 20 ms; end-to-end with 4 workers 243 → ~520 jobs/s.
+- firestore: `JobInsertMany` writes jobs without a unique key through a
+  `BulkWriter` and the queue document once per queue. A batch of 100: 212 →
+  49 ms.
+- clickhouse: completions and start marks are written in batches
+  (`JobCompleteMany`, `JobMarkStartedMany`): one read and one multi-row
+  `INSERT` (one part) for many jobs instead of one of each per job.
+- cassandra, clickhouse, dynamodb, firestore: fetching checks the queue's
+  pause flag concurrently with the candidate read instead of before it, one
+  round trip less per fetch.
+
+### Fixed
+- `bench/`: every benchmark starts from an empty backend. Rows left by an
+  earlier benchmark made later ones slower (Firestore emulator end-to-end:
+  ~17 jobs/s after the batch benchmark, ~270 jobs/s on its own).
+
+---
+
 ## [driver pgxv5 v2.10.0] — 2026-11-23
 
 ### Changed

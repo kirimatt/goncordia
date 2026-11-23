@@ -4,72 +4,81 @@ description: "Throughput and latency by backend"
 ---
 
 ```
-go test ./bench/... -bench=. -benchmem -benchtime=5s -timeout=15m
+cd bench && go test . -run '^$' -bench . -benchmem -benchtime=5s -timeout 90m
 ```
 
-Apple M5, single process. Memory/SQLite are in-process (no network); Postgres/MongoDB/Redis run in Docker on localhost.
+v2.10.0 drivers, Ryzen 5 5600X, WSL2, single process. Memory and SQLite run
+in-process; every other backend runs in Docker on localhost (testcontainers;
+DynamoDB Local and the Firestore emulator stand in for the cloud services).
+Each benchmark starts from an empty backend. Loopback through WSL2 adds about
+0.2 ms per round trip, so network-bound numbers are higher than on a native
+Linux host.
 
 **Enqueue — single job**
 
-| Backend | ns/op | Notes |
+| Backend | per job | Notes |
 |---|---|---|
-| Memory | 0.57 µs | in-process mutex, no I/O |
-| SQLite | 27 µs | WAL mode, single connection |
-| Redis | 109 µs | ZADD over localhost |
-| Postgres (pgx v5) | 129 µs | INSERT over localhost |
-| MongoDB | 338 µs | insertOne over localhost |
-| DynamoDB | 632 µs | PutItem over localhost |
-| Firestore | 1 195 µs | RunTransaction + Create over emulator |
-| ClickHouse | 1 378 µs | INSERT + new data part over localhost |
-| Cassandra | 7 216 µs | LWT requires Paxos quorum (3 round trips) |
+| Memory | 1.5 µs | in-process mutex, no I/O |
+| SQLite | 67 µs | WAL mode, single connection |
+| Redis | 328 µs | one script call |
+| Postgres (pgx v5) | 392 µs | INSERT |
+| DynamoDB | 1.4 ms | PutItem + queue row |
+| MongoDB | 1.6 ms | insertOne |
+| Firestore | 2.3 ms | Create on the emulator |
+| ClickHouse | 6.8 ms | INSERT, one new data part |
+| Cassandra | 7.2 ms | lightweight transactions (Paxos) |
 
 **EnqueueBatch(100) — 100 jobs per call**
 
-| Backend | ms/batch | jobs/s |
+| Backend | per batch | jobs/s |
 |---|---|---|
-| Memory | 0.06 ms | ~1 775 000 |
-| SQLite | 2.8 ms | ~35 300 |
-| Redis | 10.9 ms | ~9 200 |
-| Postgres (pgx v5) | 12.8 ms | ~7 800 |
-| MongoDB | 34.9 ms | ~2 900 |
-| DynamoDB | 62.9 ms | ~1 590 |
-| Firestore | 93.5 ms | ~1 070 |
-| ClickHouse | 150 ms | ~665 |
-| Cassandra | 708 ms | ~141 |
+| Memory | 0.13 ms | ~800 000 |
+| Redis | 1.9 ms | ~54 000 |
+| Postgres (pgx v5) | 2.0 ms | ~49 000 |
+| MongoDB | 4.3 ms | ~23 000 |
+| SQLite | 6.6 ms | ~15 000 |
+| ClickHouse | 7.4 ms | ~13 500 |
+| Cassandra | 19.9 ms | ~5 000 |
+| DynamoDB | 28.0 ms | ~3 600 |
+| Firestore | 47.4 ms | ~2 100 |
 
-**FetchAndComplete — hot worker loop path**
+**FetchAndComplete — claim one job and complete it, one at a time**
 
-| Backend | µs/op | Notes |
+| Backend | per job | Notes |
 |---|---|---|
-| SQLite | 53 µs | indexed; faster than memory at scale |
-| Memory | 520 µs | O(N) linear scan |
-| Redis | 729 µs | Lua ZPOPMIN + HSET |
-| DynamoDB | 1 731 µs | Query GSI + conditional UpdateItem |
-| MongoDB | 2 475 µs | findAndModify + updateOne |
-| Postgres (pgx v5) | 12 190 µs | SELECT SKIP LOCKED + UPDATE |
-| ClickHouse | 14 416 µs | SELECT FINAL + INSERT new version |
-| Cassandra | 18 813 µs | SELECT avail + LWT UPDATE per job |
-| Firestore | 140 943 µs | Query + per-job RunTransaction on emulator |
+| SQLite | 0.23 ms | |
+| Redis | 0.74 ms | claim and complete scripts |
+| Memory | 0.94 ms | linear scan over b.N jobs |
+| Postgres (pgx v5) | 1.0 ms | UPDATE … SKIP LOCKED + UPDATE |
+| MongoDB | 6.1 ms | find + claim + complete |
+| DynamoDB | 8.8 ms | GSI query + conditional updates |
+| Cassandra | 19.5 ms | lightweight transactions per claim |
+| ClickHouse | 27.1 ms | SELECT … FINAL + new row version |
+| Firestore | 36.6 ms | query + transaction on the emulator |
 
-**End-to-end — full WorkerPool**
+**End-to-end — full WorkerPool, 1 000 jobs enqueued with `EnqueueMany` and processed**
 
-| Backend | workload | concurrency | jobs/s | Notes |
-|---|---|---|---|---|
-| Memory | 1 000 | c=10 | ~2 020 | |
-| Redis | 1 000 | c=4 | ~1 084 | Pub/Sub notifications |
-| SQLite | 1 000 | c=4 | ~800 | |
-| DynamoDB | 1 000 | c=4 | ~780 | polling; GSI query overhead |
-| MongoDB | 1 000 | c=4 | ~452 | Change Streams |
-| Postgres (pgx v5) | 1 000 | c=4 | ~179 | LISTEN/NOTIFY |
-| Cassandra | 1 000 | c=4 | ~153 | polling; LWT overhead |
-| ClickHouse | 1 000 | c=4 | ~148 | polling; SELECT FINAL overhead |
-| Firestore | 200 | c=4 | ~14 | polling; per-job RunTransaction on emulator |
+| Backend | concurrency | jobs/s | Wake-up |
+|---|---|---|---|
+| Redis | c=4 | ~6 200 | Pub/Sub |
+| Memory | c=10 | ~4 900 | in-process |
+| SQLite | c=4 | ~4 700 | polling |
+| Postgres (pgx v5) | c=4 | ~4 300 | LISTEN/NOTIFY |
+| MongoDB | c=4 | ~870 | Change Streams |
+| Cassandra | c=4 | ~655 | polling |
+| DynamoDB | c=4 | ~430 | polling |
+| ClickHouse | c=4 | ~310 | polling |
+| Firestore | c=4 | ~230 | polling, emulator |
 
-End-to-end throughput is bounded by the 5 ms poll interval used in the benchmark. In production the pgxv5 driver uses LISTEN/NOTIFY and the Redis driver uses Pub/Sub, eliminating poll latency entirely — real throughput matches the FetchAndComplete numbers above.
+The end-to-end time includes enqueueing the 1 000 jobs. The pool polls every
+5 ms; a backlog is fetched again as soon as slots free up, so the poll
+interval matters only when the queue is empty. With 1 worker: Memory ~820,
+SQLite ~2 100 jobs/s. For Postgres and Redis against river, asynq and
+machinery under heavier load, see the comparison below.
 
-> **v2.8.0–v2.10.0 changed the hot path; the per-backend tables above predate them** (the comparison with river, asynq and machinery below is from v2.10.0). v2.8.0: on Postgres the fetch query reads a partial index in fetch order instead of sorting the backlog, `EnqueueMany` sends one pgx batch, the pool claims several jobs per query, and completions are written in batches. v2.9.0: a pool with a backlog keeps fetching instead of waiting for the next poll (with the default 1 s poll a backlog used to drain at ~40 jobs/s per process), the handler slot is freed before the state write, `started_at` writes are batched, Redis fetches and completes with one script call, and MongoDB, Cassandra, DynamoDB and Firestore claim a batch in a few round trips instead of one chain per job. Measured on another machine (pgxv5, embedded Postgres 18, Windows, localhost; v2.8.0 and v2.9.0 in the same run, so compare ratios only), 5 000 jobs: 32 workers with a 5 ms poll ~9 300 → ~15 500 jobs/s; 4 workers ~2 600 → ~4 200 jobs/s; 10 workers with the default 1 s poll 42 → ~8 700 jobs/s. Before v2.8.0 the 32-worker run did ~880 jobs/s. v2.10.0: the handler no longer waits for the `started_at` write, and pgxv5 `EnqueueMany` is one statement per batch.
+> **History.** v2.8.0 made Postgres fetch from a partial index in fetch order, batched pgx inserts, claimed several jobs per query and batched completions (32 workers: ~880 → ~9 300 jobs/s on embedded Postgres 18). v2.9.0 kept fetching while a backlog lasts (with the default 1 s poll a backlog used to drain at ~40 jobs/s per process), freed the handler slot before the state write, batched `started_at` writes, and claimed batches in a few round trips on Redis, MongoDB, Cassandra, DynamoDB and Firestore. v2.10.0 stopped making the handler wait for `started_at`, made pgxv5 `EnqueueMany` one statement, made batch inserts single or parallel requests on MongoDB, DynamoDB, Cassandra and Firestore (100 jobs: 180 → 4 ms, 174 → 28 ms, 566 → 20 ms, 212 → 47 ms), and batched ClickHouse completions.
 
-Cassandra's high per-operation latency comes from Lightweight Transaction consensus (Paxos, ~3 network round trips per claim). ClickHouse's overhead comes from `SELECT … FINAL` deduplication at query time. DynamoDB's per-operation cost is dominated by HTTP/JSON round trips to the service — measured against DynamoDB Local on localhost, so real AWS numbers include additional network latency. Firestore's per-job `RunTransaction` for claiming is the primary bottleneck on the emulator; production GCP Firestore will be faster due to lower round-trip latency, but the sequential-per-job claiming model inherently limits throughput. All four backends are best suited for workloads where horizontal scale matters more than raw per-job latency.
+Cassandra's per-operation latency comes from lightweight-transaction consensus (Paxos, about three round trips per claim); batches hide it by running jobs in parallel. ClickHouse pays for `SELECT … FINAL` deduplication and a new row version per state change, which is why completions and start marks are written in batches. DynamoDB and Firestore costs are HTTP round trips, measured here against DynamoDB Local and the Firestore emulator; the emulators scan where the services use indexes, so the cloud services are faster per call but add network latency. These four backends fit workloads where horizontal scale matters more than per-job latency.
 
 ### Against river, asynq and machinery
 
