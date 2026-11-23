@@ -16,7 +16,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `get_metrics`; `WithWriteTools()` adds `retry_job`, `reschedule_job`,
   `cancel_job`, `delete_job`, `pause_queue`, `resume_queue`. Served over
   Streamable HTTP (`Handler`) or stdio. Payloads, unique keys and panic traces
-  are hidden by default, as in `admin`.
+  are hidden by default, as in `admin`. `get_job` returns the job's
+  `trace_id` when it carries a `traceparent` tag.
 
 ---
 

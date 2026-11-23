@@ -87,6 +87,15 @@ claude mcp add goncordia -- go run ./cmd/goncordia-mcp
 - **Authentication is yours.** `Handler` does no auth itself; wrap it the way
   you wrap the admin handler.
 
+## Traces
+
+When the client carries the trace context into jobs
+(`ClientConfig.ContextTags: otelgoncordia.TraceContextTags`, see
+[Observability](/observability)), `get_job` returns the job's `trace_id`. The
+agent can then look up the whole trace (request, enqueue, every attempt) in
+Jaeger, Tempo or Honeycomb, or through their own MCP servers. goncordia does
+not store spans itself.
+
 ## Metrics
 
 `get_metrics` returns per-queue counts. Add the futures and retention

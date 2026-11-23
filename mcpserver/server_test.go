@@ -334,3 +334,28 @@ func TestStreamableHTTPHandler(t *testing.T) {
 		t.Fatalf("queues = %+v", out.Queues)
 	}
 }
+
+func TestGetJobTraceID(t *testing.T) {
+	f := newFixture(t)
+	const tid = "4bf92f3577b34da6a3ce929d0e0e4736"
+	res, err := f.client.Enqueue(context.Background(), emailArgs{To: "a"}, &core.InsertOpts{
+		Tags: []string{"user", "traceparent=00-" + tid + "-00f067aa0ba902b7-01"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	plain := f.enqueue(t, "default", "b")
+	bad, err := f.client.Enqueue(context.Background(), emailArgs{To: "c"}, &core.InsertOpts{Tags: []string{"traceparent=00-zz-00f067aa0ba902b7-01"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cs := connect(t, mcpserver.New(f.d))
+	if got := call[mcpserver.JobInfo](t, cs, "get_job", map[string]any{"id": res.Job.ID}).TraceID; got != tid {
+		t.Fatalf("trace_id = %q, want %q", got, tid)
+	}
+	for _, id := range []string{plain, bad.Job.ID} {
+		if got := call[mcpserver.JobInfo](t, cs, "get_job", map[string]any{"id": id}).TraceID; got != "" {
+			t.Fatalf("trace_id = %q for job without a valid traceparent", got)
+		}
+	}
+}

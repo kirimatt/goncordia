@@ -282,6 +282,7 @@ type JobInfo struct {
 	FinalizedAt *time.Time         `json:"finalized_at,omitempty"`
 	Timeout     string             `json:"timeout,omitempty"`
 	Tags        []string           `json:"tags,omitempty"`
+	TraceID     string             `json:"trace_id,omitempty" jsonschema:"OpenTelemetry trace id of the enqueue, when the client set ContextTags to otelgoncordia.TraceContextTags; search it in your tracing backend"`
 	WorkerID    string             `json:"worker_id,omitempty"`
 	Args        string             `json:"args,omitempty" jsonschema:"JSON arguments, hidden unless the redactor exposes them"`
 	UniqueKey   string             `json:"unique_key,omitempty"`
@@ -485,6 +486,7 @@ func jobInfo(row driver.JobRow) JobInfo {
 		AttemptedAt: utc(row.AttemptedAt), FinalizedAt: utc(row.FinalizedAt),
 		Tags: row.Tags, WorkerID: row.WorkerID, UniqueKey: row.UniqueKey,
 	}
+	info.TraceID = traceID(row.Tags)
 	if row.Timeout > 0 {
 		info.Timeout = row.Timeout.String()
 	}
@@ -495,6 +497,31 @@ func jobInfo(row driver.JobRow) JobInfo {
 		info.Errors = append(info.Errors, AttemptErrorInfo{Attempt: e.Attempt, At: e.At.UTC(), Error: e.Error, Trace: e.Trace})
 	}
 	return info
+}
+
+// traceID returns the trace id of a "traceparent=00-<trace id>-<span id>-<flags>"
+// job tag, or "".
+func traceID(tags []string) string {
+	for _, tag := range tags {
+		value, ok := strings.CutPrefix(tag, "traceparent=")
+		if !ok {
+			continue
+		}
+		parts := strings.Split(value, "-")
+		if len(parts) == 4 && len(parts[1]) == 32 && isHex(parts[1]) && strings.Trim(parts[1], "0") != "" {
+			return parts[1]
+		}
+	}
+	return ""
+}
+
+func isHex(s string) bool {
+	for _, r := range s {
+		if !(r >= '0' && r <= '9' || r >= 'a' && r <= 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 func defaultJobRedactor(row driver.JobRow) driver.JobRow {
