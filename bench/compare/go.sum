@@ -234,12 +234,12 @@ github.com/jstemmer/go-junit-report v0.9.1 h1:6QPYqodiu3GuPL+7mfx+NwDdp2eTkp9IfE
 github.com/jstemmer/go-junit-report v0.9.1/go.mod h1:Brl9GWCQeLvo8nXZwPNNblvFj/XSXhF0NWZEnDohbsk=
 github.com/kelseyhightower/envconfig v1.4.0 h1:Im6hONhd3pLkfDFsbRgu68RDNkGF1r3dvMUtDTo2cv8=
 github.com/kelseyhightower/envconfig v1.4.0/go.mod h1:cccZRl6mQpaq41TPp5QxidR+Sa3axMbJDNb//FQX6Gg=
-github.com/kirimatt/goncordia/driver/pgxv5/v2 v2.9.0 h1:gQ2nmqT2oQ7hidDg3OPV8zg6NAAlfys8Q4be2U/0IRs=
-github.com/kirimatt/goncordia/driver/pgxv5/v2 v2.9.0/go.mod h1:8f3J2kyM63RPW/pBOkbTPuMXQSvcyAajHhJiJSWMHT0=
+github.com/kirimatt/goncordia/driver/pgxv5/v2 v2.10.0 h1:huTGcP0yQQ5zSrfX7TQ7axuk0Pbzm18AU/qPtZs4VCc=
+github.com/kirimatt/goncordia/driver/pgxv5/v2 v2.10.0/go.mod h1:8f3J2kyM63RPW/pBOkbTPuMXQSvcyAajHhJiJSWMHT0=
 github.com/kirimatt/goncordia/driver/redis/v2 v2.9.0 h1:5OcbLKOO0r68um5Pb6tiGzLsluS1s5PVYmhOYDIrvO0=
 github.com/kirimatt/goncordia/driver/redis/v2 v2.9.0/go.mod h1:ai4mQDCGVDfcP0+9f4aimlgOL00ds6xTzxaFDnfZSE4=
-github.com/kirimatt/goncordia/v2 v2.9.1 h1:+oCCDwHcZUv6h50JAunfN4FHkdsomfE7upNTUZJ0hdU=
-github.com/kirimatt/goncordia/v2 v2.9.1/go.mod h1:9DGFKBiqNXbjvUB4SmCxZZOyBZ5gvFx1BvOT6ETkTRs=
+github.com/kirimatt/goncordia/v2 v2.10.0 h1:NCHISrGBLubFm6cDmBH0V/xzKUo49D6QMi+6oocb9Po=
+github.com/kirimatt/goncordia/v2 v2.10.0/go.mod h1:9DGFKBiqNXbjvUB4SmCxZZOyBZ5gvFx1BvOT6ETkTRs=
 github.com/kisielk/gotool v1.0.0/go.mod h1:XhKaO+MFFWcvkIS/tQcRk01m1F5IRFswLeQ+oQHNcck=
 github.com/klauspost/compress v1.20.4 h1:dD0v/bvxtjCBqQu6sx1TNWkalEY5lNTIe+HY9w8TeNI=
 github.com/klauspost/compress v1.20.4/go.mod h1:LUdAzn7YLVvxLpc7y3V1m40wESHTgc1422pwwBSKYuI=
