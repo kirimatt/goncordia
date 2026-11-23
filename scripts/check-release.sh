@@ -20,3 +20,9 @@ if ! grep -Fq "github.com/kirimatt/goncordia/v2@$tag" README.md; then
   echo "README.md installation version does not match $tag" >&2
   exit 1
 fi
+# context7.json previousVersions is the source of truth for Context7: a
+# version added only through the Context7 API is dropped on the next refresh.
+if ! grep -Fq "\"tag\": \"$tag\"" context7.json; then
+  echo "context7.json previousVersions does not list $tag" >&2
+  exit 1
+fi
