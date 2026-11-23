@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Worker pool: the handler no longer waits for the `started_at` write. It
+  runs in the background and the job's state write waits for it, so
+  `started_at` still lands before the outcome. Drain at concurrency 10 on
+  Postgres rose from ~4,000 to ~5,700 jobs/s (`bench/compare`).
+- pgxv5: `JobInsertMany` inserts the whole batch with one
+  `INSERT ... SELECT FROM unnest(...)` statement instead of one statement per
+  job in a pgx batch: ~19,000 → ~32,000 jobs/s for batches of 100.
+
+### Added
+- `bench/compare`: the same workloads (single and batch enqueue, drain at
+  concurrency 10 and 100 with an exactly-once check, idle pickup latency)
+  against river on Postgres and asynq and machinery on Redis.
+
 ---
 
 ## [drivers gorm, bun v2.9.0] — 2026-11-23

@@ -1,10 +1,12 @@
 package pgxv5
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strconv"
 	"time"
 
@@ -320,17 +322,43 @@ RETURNING id, queue, kind, args, state, priority, run_at, created_at,
           attempted_at, started_at, lease_expires_at, finalized_at, attempt_num, max_retry, timeout_ms,
           unique_key, worker_id, tags, errors, pipeline_id`
 
-// jobInsertMany sends all inserts in one pgx batch (a single network round
-// trip) instead of one round trip per job. Statements still run one by one
-// in order, so ON CONFLICT and duplicate keys inside the batch behave exactly
-// as with separate inserts.
+// insertManySQL inserts a whole batch with one statement. Rows are inserted
+// in input order (ORDER BY ord), so their BIGSERIAL ids ascend in that order;
+// jobInsertMany relies on it to map rows without a unique key back to their
+// inputs. Tags travel as JSON text because unnest flattens nested arrays.
+const insertManySQL = `
+INSERT INTO goncordia_jobs
+    (queue, kind, args, state, priority, run_at, created_at, max_retry, timeout_ms, unique_key, tags, pipeline_id)
+SELECT t.queue, t.kind, t.args::jsonb, t.state, t.priority, t.run_at, $12, t.max_retry, t.timeout_ms, t.unique_key,
+       ARRAY(SELECT jsonb_array_elements_text(t.tags::jsonb)), t.pipeline_id
+FROM unnest($1::text[], $2::text[], $3::text[], $4::text[], $5::smallint[], $6::timestamptz[],
+            $7::smallint[], $8::bigint[], $9::text[], $10::text[], $11::text[])
+     WITH ORDINALITY AS t(queue, kind, args, state, priority, run_at, max_retry, timeout_ms, unique_key, tags, pipeline_id, ord)
+ORDER BY t.ord
+ON CONFLICT (unique_key) WHERE unique_key IS NOT NULL
+DO NOTHING
+RETURNING id, queue, kind, args, state, priority, run_at, created_at,
+          attempted_at, started_at, lease_expires_at, finalized_at, attempt_num, max_retry, timeout_ms,
+          unique_key, worker_id, tags, errors, pipeline_id`
+
+// jobInsertMany inserts all jobs with one statement (one round trip, one
+// plan) instead of one INSERT per job. A row with a unique key is matched
+// back by that key: the first input holding a key gets the inserted row and
+// later inputs with the same key, or a key already taken, are duplicates.
+// Rows without a key are always inserted and matched by ascending id.
 func jobInsertMany(ctx context.Context, q querier, clk clock.Clock, params []driver.JobInsertParams) ([]driver.JobInsertResult, error) {
 	if len(params) == 0 {
 		return []driver.JobInsertResult{}, nil
 	}
 	now := clk.Now()
-	batch := &pgx.Batch{}
-	for _, p := range params {
+	n := len(params)
+	queues, kinds, args, states := make([]string, n), make([]string, n), make([]string, n), make([]string, n)
+	priorities, maxRetries := make([]int16, n), make([]int16, n)
+	runAts := make([]time.Time, n)
+	timeouts := make([]int64, n)
+	uniqueKeys := make([]*string, n)
+	tags, pipelines := make([]string, n), make([]string, n)
+	for i, p := range params {
 		runAt := p.RunAt
 		if runAt.IsZero() {
 			runAt = now
@@ -339,41 +367,75 @@ func jobInsertMany(ctx context.Context, q querier, clk clock.Clock, params []dri
 		if runAt.After(now) {
 			state = driver.JobStateScheduled
 		}
-
-		tags := p.Tags
-		if tags == nil {
-			tags = []string{}
+		t := p.Tags
+		if t == nil {
+			t = []string{}
 		}
-
-		var uniqueKey *string
-		if p.UniqueKey != "" {
-			uniqueKey = &p.UniqueKey
-		}
-
-		batch.Queue(insertJobSQL,
-			p.Queue, p.Kind, p.Args, string(state), p.Priority, runAt, now,
-			p.MaxRetry, p.Timeout.Milliseconds(),
-			uniqueKey, tags, p.PipelineID,
-		)
-	}
-
-	results := make([]driver.JobInsertResult, len(params))
-	var skipped []int
-	br := q.SendBatch(ctx, batch)
-	for i := range params {
-		jobRow, err := scanJobRow(br.QueryRow())
+		tagJSON, err := json.Marshal(t)
 		if err != nil {
-			if isNoRows(err) {
-				skipped = append(skipped, i)
-				continue
-			}
-			_ = br.Close()
-			return nil, fmt.Errorf("insert job: %w", err)
+			return nil, fmt.Errorf("encode tags: %w", err)
 		}
-		results[i] = driver.JobInsertResult{Job: jobRow}
+		jobArgs := p.Args
+		if len(jobArgs) == 0 {
+			jobArgs = []byte("{}")
+		}
+		queues[i], kinds[i], args[i], states[i] = p.Queue, p.Kind, string(jobArgs), string(state)
+		priorities[i], maxRetries[i] = int16(p.Priority), int16(p.MaxRetry)
+		runAts[i], timeouts[i] = runAt, p.Timeout.Milliseconds()
+		if p.UniqueKey != "" {
+			key := p.UniqueKey
+			uniqueKeys[i] = &key
+		}
+		tags[i], pipelines[i] = string(tagJSON), p.PipelineID
 	}
-	if err := br.Close(); err != nil {
-		return nil, fmt.Errorf("insert job: %w", err)
+
+	rows, err := q.Query(ctx, insertManySQL,
+		queues, kinds, args, states, priorities, runAts, maxRetries, timeouts, uniqueKeys, tags, pipelines, now)
+	if err != nil {
+		return nil, fmt.Errorf("insert jobs: %w", err)
+	}
+	var plain []*driver.JobRow
+	byKey := map[string]*driver.JobRow{}
+	for rows.Next() {
+		row, err := scanJobRow(rows)
+		if err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("insert jobs: %w", err)
+		}
+		if row.UniqueKey != "" {
+			byKey[row.UniqueKey] = row
+		} else {
+			plain = append(plain, row)
+		}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("insert jobs: %w", err)
+	}
+	slices.SortFunc(plain, func(a, b *driver.JobRow) int {
+		ai, _ := strconv.ParseInt(a.ID, 10, 64)
+		bi, _ := strconv.ParseInt(b.ID, 10, 64)
+		return cmp.Compare(ai, bi)
+	})
+
+	results := make([]driver.JobInsertResult, n)
+	var skipped []int
+	next := 0
+	for i, p := range params {
+		if p.UniqueKey == "" {
+			if next >= len(plain) {
+				return nil, fmt.Errorf("insert jobs: %d rows without a unique key returned for more inputs", len(plain))
+			}
+			results[i] = driver.JobInsertResult{Job: plain[next]}
+			next++
+			continue
+		}
+		if row, ok := byKey[p.UniqueKey]; ok {
+			results[i] = driver.JobInsertResult{Job: row}
+			delete(byKey, p.UniqueKey) // later inputs with this key are duplicates
+			continue
+		}
+		skipped = append(skipped, i)
 	}
 
 	// Duplicates: look up the job that already holds the unique key.

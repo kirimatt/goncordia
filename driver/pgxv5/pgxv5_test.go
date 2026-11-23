@@ -437,3 +437,47 @@ func TestPgxv5_JobCompleteMany(t *testing.T) {
 		}
 	}
 }
+
+// JobInsertMany maps every result to its input: rows without a unique key by
+// insertion order, rows with one by key; repeated or taken keys are skips.
+func TestPgxv5_JobInsertManyMapsResultsToInputs(t *testing.T) {
+	skipIfNoDocker(t)
+	pool, cleanup := newTestPool(t)
+	defer cleanup()
+	ctx := context.Background()
+	d := pgxdriver.New(pool)
+	if err := d.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	exec := d.Executor()
+	if _, err := exec.JobInsertMany(ctx, []driver.JobInsertParams{
+		{Queue: "q", Kind: "k", Args: []byte(`{"n":0}`), UniqueKey: "taken"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	params := []driver.JobInsertParams{
+		{Queue: "q", Kind: "k", Args: []byte(`{"n":1}`), Tags: []string{"a", "b,c"}},
+		{Queue: "q", Kind: "k", Args: []byte(`{"n":2}`), UniqueKey: "k1"},
+		{Queue: "q", Kind: "k", Args: []byte(`{"n":3}`), Priority: 5},
+		{Queue: "q", Kind: "k", Args: []byte(`{"n":4}`), UniqueKey: "k1"},
+		{Queue: "q", Kind: "k", Args: []byte(`{"n":5}`), UniqueKey: "taken"},
+		{Queue: "q", Kind: "k", Args: []byte(`{"n":6}`), RunAt: time.Now().Add(time.Hour)},
+	}
+	res, err := exec.JobInsertMany(ctx, params)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantSkip := []bool{false, false, false, true, true, false}
+	wantArgs := []string{`{"n": 1}`, `{"n": 2}`, `{"n": 3}`, `{"n": 2}`, `{"n": 0}`, `{"n": 6}`}
+	for i, r := range res {
+		if r.UniqueSkip != wantSkip[i] || r.Job == nil || string(r.Job.Args) != wantArgs[i] {
+			t.Fatalf("result %d: skip=%v job=%+v, want skip=%v args %s", i, r.UniqueSkip, r.Job, wantSkip[i], wantArgs[i])
+		}
+	}
+	if got := res[0].Job.Tags; len(got) != 2 || got[0] != "a" || got[1] != "b,c" {
+		t.Fatalf("tags=%q", got)
+	}
+	if res[2].Job.Priority != 5 || res[5].Job.State != driver.JobStateScheduled {
+		t.Fatalf("priority=%d state=%s", res[2].Job.Priority, res[5].Job.State)
+	}
+}
