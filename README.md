@@ -89,11 +89,44 @@ tx.Commit(ctx)  // job and order appear atomically
 | Scheduled / cron jobs | ✅ | ✅ | ✅ | ✅ |
 | Unique jobs | ✅ | ✅ | ✅ | ❌ |
 | Priority queues | ✅ | ✅ | ✅ | ❌ |
-| Push notifications | ✅ LISTEN/NOTIFY, Change Streams, Pub/Sub | ✅ LISTEN/NOTIFY | ✅ Pub/Sub | ❌ polling |
+| New-job wake-up | ✅ LISTEN/NOTIFY, Change Streams, Pub/Sub; polling elsewhere | ✅ LISTEN/NOTIFY | ❌ polling (`TaskCheckInterval`, 1 s) | ✅ blocking pop on Redis (`BLPOP`); broker-dependent |
 | Web UI | ✅ embeddable | ✅ (River UI, Pro) | ✅ (asynqmon) | ❌ |
 | Await a job's typed result | ✅ `future.Func.Call` / `Await` | ❌ | stores results, no await | ✅ `AsyncResult.Get` |
 | Unit tests without Docker | ✅ in-memory driver + `gontest` | needs Postgres | needs Redis | needs a broker |
 | Workflow primitives (chains, chords) | ❌ | ❌ | ❌ | ✅ |
+
+### Performance
+
+Same workloads on the same servers, every library with its default settings
+(full method, `-tuned` variants and latency in
+[Against river, asynq and machinery](#against-river-asynq-and-machinery);
+code in [`bench/compare`](bench/compare)). Jobs per second, higher is better:
+
+| Postgres | goncordia (pgxv5) | River | River, 10 ms fetch interval |
+|---|---|---|---|
+| Enqueue, one per call | **1,044** | 671 | 670 |
+| Enqueue, batches of 100 | 31,237 | 34,427 | **34,827** |
+| Drain 20,000 jobs, 10 workers | **5,801** | 99 | 4,726 |
+| Drain 20,000 jobs, 100 workers | 20,610 | 999 | **22,588** |
+| Idle pickup latency, p50 | **2.8 ms** | 100 ms | 15 ms |
+
+| Redis | goncordia (redis) | Asynq | Machinery |
+|---|---|---|---|
+| Enqueue, one per call | 3,232 | **3,669** | 1,910 |
+| Enqueue, batches of 100 | **61,826** | no batch API | no batch API |
+| Drain 20,000 jobs, 10 workers | **11,450** | 3,040 | 2,263 |
+| Drain 20,000 jobs, 100 workers | **21,205** | 3,021 | 2,243 |
+| Idle pickup latency, p50 | **0.7 ms** | 1,036 ms | 1.6 ms |
+
+On Postgres goncordia is on par with River once River's fetch interval is
+lowered (River's default 100 ms `FetchCooldown` caps a drain at about
+10 × workers jobs/s); River is ~10% ahead on batch inserts and on a drain with
+100 workers. On Redis goncordia drains 4–9× faster than Asynq and Machinery;
+Asynq is ~10% ahead on single inserts. Asynq's idle latency follows its
+`TaskCheckInterval` (1 s by default; 11 ms with 10 ms). Every drain is checked
+for exactly-once execution; no library ran a job twice. Other goncordia
+backends are not in this table because River runs only on Postgres and Asynq
+only on Redis; their own numbers are in [Benchmarks](#benchmarks).
 
 **Choose goncordia** when you want the transactional outbox pattern and don't want to introduce Redis or a dedicated Postgres instance — it works with whatever database your application already uses. It also fits when a caller needs the value a background job returns (`future.Func.Call`), or when you want unit tests of enqueue and worker code without Docker.
 
@@ -1163,7 +1196,7 @@ Apple M5, single process. Memory/SQLite are in-process (no network); Postgres/Mo
 
 End-to-end throughput is bounded by the 5 ms poll interval used in the benchmark. In production the pgxv5 driver uses LISTEN/NOTIFY and the Redis driver uses Pub/Sub, eliminating poll latency entirely — real throughput matches the FetchAndComplete numbers above.
 
-> **v2.8.0 and v2.9.0 changed the hot path; the tables above predate them.** v2.8.0: on Postgres the fetch query reads a partial index in fetch order instead of sorting the backlog, `EnqueueMany` sends one pgx batch, the pool claims several jobs per query, and completions are written in batches. v2.9.0: a pool with a backlog keeps fetching instead of waiting for the next poll (with the default 1 s poll a backlog used to drain at ~40 jobs/s per process), the handler slot is freed before the state write, `started_at` writes are batched, Redis fetches and completes with one script call, and MongoDB, Cassandra, DynamoDB and Firestore claim a batch in a few round trips instead of one chain per job. Measured on another machine (pgxv5, embedded Postgres 18, Windows, localhost; v2.8.0 and v2.9.0 in the same run, so compare ratios only), 5 000 jobs: 32 workers with a 5 ms poll ~9 300 → ~15 500 jobs/s; 4 workers ~2 600 → ~4 200 jobs/s; 10 workers with the default 1 s poll 42 → ~8 700 jobs/s. Before v2.8.0 the 32-worker run did ~880 jobs/s.
+> **v2.8.0–v2.10.0 changed the hot path; the per-backend tables above predate them** (the comparison with river, asynq and machinery below is from v2.10.0). v2.8.0: on Postgres the fetch query reads a partial index in fetch order instead of sorting the backlog, `EnqueueMany` sends one pgx batch, the pool claims several jobs per query, and completions are written in batches. v2.9.0: a pool with a backlog keeps fetching instead of waiting for the next poll (with the default 1 s poll a backlog used to drain at ~40 jobs/s per process), the handler slot is freed before the state write, `started_at` writes are batched, Redis fetches and completes with one script call, and MongoDB, Cassandra, DynamoDB and Firestore claim a batch in a few round trips instead of one chain per job. Measured on another machine (pgxv5, embedded Postgres 18, Windows, localhost; v2.8.0 and v2.9.0 in the same run, so compare ratios only), 5 000 jobs: 32 workers with a 5 ms poll ~9 300 → ~15 500 jobs/s; 4 workers ~2 600 → ~4 200 jobs/s; 10 workers with the default 1 s poll 42 → ~8 700 jobs/s. Before v2.8.0 the 32-worker run did ~880 jobs/s. v2.10.0: the handler no longer waits for the `started_at` write, and pgxv5 `EnqueueMany` is one statement per batch.
 
 Cassandra's high per-operation latency comes from Lightweight Transaction consensus (Paxos, ~3 network round trips per claim). ClickHouse's overhead comes from `SELECT … FINAL` deduplication at query time. DynamoDB's per-operation cost is dominated by HTTP/JSON round trips to the service — measured against DynamoDB Local on localhost, so real AWS numbers include additional network latency. Firestore's per-job `RunTransaction` for claiming is the primary bottleneck on the emulator; production GCP Firestore will be faster due to lower round-trip latency, but the sequential-per-job claiming model inherently limits throughput. All four backends are best suited for workloads where horizontal scale matters more than raw per-job latency.
 

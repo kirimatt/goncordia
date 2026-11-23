@@ -184,6 +184,13 @@ goncordia has no workflow engine. Common replacements:
 If chains and chords are central to your design, Machinery may still fit
 better, or you may want a workflow engine.
 
+## Throughput
+
+On the same Redis, with Machinery's Redis broker and result backend, goncordia
+drains a backlog 5–9× faster and inserts batches with one call
+(`EnqueueMany`); Machinery sends tasks one by one
+([Benchmarks](/benchmarks#against-river-asynq-and-machinery)).
+
 ## Switching over
 
 goncordia does not read Machinery's broker queues, so run both for a while:

@@ -224,6 +224,11 @@ Run a worker directly with `gontest.RequireWork(t, ctx, worker, args)`. See
   or forever with `Forever: true`.
 - **Push notifications** use LISTEN/NOTIFY on pgx, as in River. The stdlib
   driver on Postgres polls.
+- **No fetch cooldown.** River waits `FetchCooldown` (100 ms) between fetches,
+  so a backlog drains at about 10 × `MaxWorkers` jobs/s unless you lower it.
+  goncordia keeps fetching while a backlog lasts; there is no setting to port.
+  On the same Postgres, goncordia and River with a 1 ms cooldown drain at
+  similar rates ([Benchmarks](/benchmarks#against-river-asynq-and-machinery)).
 
 ## Switching over
 
