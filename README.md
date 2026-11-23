@@ -149,7 +149,7 @@ and other agents:
 - **Context7 MCP**: library ID `/kirimatt/goncordia`. With the
   [Context7 MCP server](https://github.com/upstash/context7) installed, add
   `use context7` or `use library /kirimatt/goncordia` to your prompt.
-  Versions are indexed per release (`/kirimatt/goncordia/v2.10.1`).
+  Versions are indexed per release (`/kirimatt/goncordia/v2.11.0`).
 - **Plain text, no MCP**: [context7.com/kirimatt/goncordia/llms.txt](https://context7.com/kirimatt/goncordia/llms.txt)
   (add `?topic=EnqueueTx` to narrow it) and
   [goncordia.docs7.io/llms.txt](https://goncordia.docs7.io/llms.txt).
@@ -162,7 +162,7 @@ and other agents:
 Requires Go 1.26 or newer.
 
 ```bash
-go get github.com/kirimatt/goncordia/v2@v2.10.1
+go get github.com/kirimatt/goncordia/v2@v2.11.0
 ```
 
 Pick a driver:
