@@ -164,22 +164,22 @@ go get github.com/kirimatt/goncordia/driver/gorm/v2@v2.9.0
 go get github.com/kirimatt/goncordia/driver/bun/v2@v2.9.0
 
 # MongoDB (replica set required)
-go get github.com/kirimatt/goncordia/driver/mongodbv2/v2@v2.9.0
+go get github.com/kirimatt/goncordia/driver/mongodbv2/v2@v2.10.0
 
 # Redis
 go get github.com/kirimatt/goncordia/driver/redis/v2@v2.9.0
 
 # Cassandra / ScyllaDB
-go get github.com/kirimatt/goncordia/driver/cassandra/v2@v2.9.0
+go get github.com/kirimatt/goncordia/driver/cassandra/v2@v2.10.0
 
 # ClickHouse
-go get github.com/kirimatt/goncordia/driver/clickhouse/v2@v2.9.0
+go get github.com/kirimatt/goncordia/driver/clickhouse/v2@v2.10.0
 
 # Amazon DynamoDB
-go get github.com/kirimatt/goncordia/driver/dynamodb/v2@v2.9.0
+go get github.com/kirimatt/goncordia/driver/dynamodb/v2@v2.10.0
 
 # Cloud Firestore
-go get github.com/kirimatt/goncordia/driver/firestore/v2@v2.9.0
+go get github.com/kirimatt/goncordia/driver/firestore/v2@v2.10.0
 ```
 
 The root v1 module intentionally does not download every database SDK. Driver,
