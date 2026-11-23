@@ -241,6 +241,8 @@ func jobInsertMany(ctx context.Context, db *mongo.Database, clk clock.Clock, par
 	col := db.Collection(jobsCollection)
 	now := clk.Now()
 	results := make([]driver.JobInsertResult, len(params))
+	var plain []any // mongo-driver v1 InsertMany takes []interface{}
+	var plainIdx []int
 
 	for i, p := range params {
 		runAt := p.RunAt
@@ -290,14 +292,23 @@ func jobInsertMany(ctx context.Context, db *mongo.Database, clk clock.Clock, par
 			oid := res.UpsertedID.(primitive.ObjectID)
 			doc.ID = oid
 		} else {
-			res, err := col.InsertOne(ctx, doc)
-			if err != nil {
-				return nil, fmt.Errorf("insert job %d: %w", i, err)
-			}
-			doc.ID = res.InsertedID.(primitive.ObjectID)
+			// Jobs without a unique key go in one InsertMany below; the id
+			// is assigned here so the result is known before the write.
+			doc.ID = primitive.NewObjectID()
+			plain = append(plain, doc)
+			plainIdx = append(plainIdx, i)
+			continue
 		}
 
 		results[i] = driver.JobInsertResult{Job: docToRow(doc)}
+	}
+	if len(plain) > 0 {
+		if _, err := col.InsertMany(ctx, plain); err != nil {
+			return nil, fmt.Errorf("insert jobs: %w", err)
+		}
+		for k, doc := range plain {
+			results[plainIdx[k]] = driver.JobInsertResult{Job: docToRow(doc.(jobDoc))}
+		}
 	}
 	return results, nil
 }

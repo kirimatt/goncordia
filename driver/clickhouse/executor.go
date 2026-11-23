@@ -475,13 +475,17 @@ func queueStats(ctx context.Context, conn chdriver.Conn, queue string) (driver.Q
 // JobFetchBatch finds available jobs and attempts to claim them by inserting a
 // higher-version row. It then re-reads with FINAL to confirm ownership.
 func jobFetchBatch(ctx context.Context, conn chdriver.Conn, clk clock.Clock, params driver.FetchParams) ([]driver.JobRow, error) {
-	paused, err := isQueuePaused(ctx, conn, params.Queue)
-	if err != nil {
-		return nil, err
-	}
-	if paused {
-		return nil, nil
-	}
+	// The pause check runs next to the candidate read (both are reads; the
+	// claim waits for both), saving a round trip per fetch.
+	var (
+		paused    bool
+		pauseErr  error
+		pauseDone = make(chan struct{})
+	)
+	go func() {
+		defer close(pauseDone)
+		paused, pauseErr = isQueuePaused(ctx, conn, params.Queue)
+	}()
 
 	now := clk.Now()
 
@@ -494,8 +498,13 @@ func jobFetchBatch(ctx context.Context, conn chdriver.Conn, clk clock.Clock, par
 		 LIMIT ?`,
 		params.Queue, now, params.Limit,
 	)
+	<-pauseDone
 	if err != nil {
 		return nil, fmt.Errorf("fetch candidates: %w", err)
+	}
+	if pauseErr != nil || paused {
+		rows.Close()
+		return nil, pauseErr
 	}
 
 	var candidates []chJob

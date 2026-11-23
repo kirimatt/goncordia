@@ -364,6 +364,28 @@ func jobInsertMany(ctx context.Context, session *gocql.Session, clk clock.Clock,
 	now := clk.Now()
 	results := make([]driver.JobInsertResult, len(params))
 
+	// Queue metadata: one lightweight transaction per queue, not per job.
+	seen := map[string]bool{}
+	for _, p := range params {
+		if seen[p.Queue] {
+			continue
+		}
+		seen[p.Queue] = true
+		if err := session.Query(
+			`INSERT INTO goncordia_queues (name, paused, created_at, updated_at) VALUES (?, false, ?, ?) IF NOT EXISTS`,
+			p.Queue, now, now,
+		).WithContext(ctx).Exec(); err != nil {
+			return nil, fmt.Errorf("upsert queue: %w", err)
+		}
+	}
+
+	// Unique keys are reserved in input order, so a key repeated in the
+	// batch goes to its first job. The job rows are then written in parallel.
+	type pending struct {
+		i int
+		j cassandraJob
+	}
+	var accepted []pending
 	for i, p := range params {
 		runAt := p.RunAt
 		if runAt.IsZero() {
@@ -380,7 +402,6 @@ func jobInsertMany(ctx context.Context, session *gocql.Session, clk clock.Clock,
 			tags = []string{}
 		}
 
-		// Unique-key check: INSERT IF NOT EXISTS into the uniq table.
 		if p.UniqueKey != "" {
 			m := map[string]interface{}{}
 			applied, err := session.Query(
@@ -388,6 +409,7 @@ func jobInsertMany(ctx context.Context, session *gocql.Session, clk clock.Clock,
 				p.UniqueKey, id,
 			).WithContext(ctx).MapScanCAS(m)
 			if err != nil {
+				releaseUniqueKeys(ctx, session, params, accepted, func(x pending) int { return x.i })
 				return nil, fmt.Errorf("unique key check: %w", err)
 			}
 			if !applied {
@@ -396,7 +418,7 @@ func jobInsertMany(ctx context.Context, session *gocql.Session, clk clock.Clock,
 			}
 		}
 
-		j := cassandraJob{
+		accepted = append(accepted, pending{i: i, j: cassandraJob{
 			ID:         id,
 			Queue:      p.Queue,
 			Kind:       p.Kind,
@@ -412,48 +434,77 @@ func jobInsertMany(ctx context.Context, session *gocql.Session, clk clock.Clock,
 			ErrorsJSON: "[]",
 			Version:    1,
 			PipelineID: p.PipelineID,
-		}
+		}})
+	}
 
-		if err := session.Query(
-			`INSERT INTO goncordia_jobs
-			(id,queue,kind,args,state,priority,run_at,created_at,
-			 attempt_num,max_retry,timeout_ms,unique_key,worker_id,tags,errors_json,version,pipeline_id)
-			VALUES (?,?,?,?,?,?,?,?,0,?,?,?,?,?,?,1,?)`,
-			j.ID, j.Queue, j.Kind, j.Args, j.State, j.Priority, j.RunAt, j.CreatedAt,
-			j.MaxRetry, j.TimeoutMs, j.UniqueKey, j.WorkerID, j.Tags, j.ErrorsJSON, j.PipelineID,
-		).WithContext(ctx).Exec(); err != nil {
-			if p.UniqueKey != "" {
-				_ = session.Query(`DELETE FROM goncordia_uniq_v2 WHERE ukey=?`, p.UniqueKey).WithContext(ctx).Exec()
+	errs := make([]error, len(accepted))
+	sem := make(chan struct{}, 16)
+	var wg sync.WaitGroup
+	for k, a := range accepted {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			errs[k] = insertJobRows(ctx, session, a.j)
+		}()
+	}
+	wg.Wait()
+	var firstErr error
+	for k, a := range accepted {
+		if errs[k] != nil {
+			if firstErr == nil {
+				firstErr = errs[k]
 			}
-			return nil, fmt.Errorf("insert job: %w", err)
+			continue
 		}
-
-		// The lookup contains both immediately available and scheduled jobs;
-		// run_at <= now makes scheduled rows visible without a promotion scan.
-		if state == driver.JobStateAvailable || state == driver.JobStateScheduled {
-			if err := session.Query(
-				`INSERT INTO goncordia_jobs_avail (queue, run_at, priority, id) VALUES (?, ?, ?, ?)`,
-				j.Queue, j.RunAt, j.Priority, j.ID,
-			).WithContext(ctx).Exec(); err != nil {
-				_ = session.Query(`DELETE FROM goncordia_jobs WHERE id=?`, j.ID).WithContext(ctx).Exec()
-				if p.UniqueKey != "" {
-					_ = session.Query(`DELETE FROM goncordia_uniq_v2 WHERE ukey=?`, p.UniqueKey).WithContext(ctx).Exec()
-				}
-				return nil, fmt.Errorf("insert avail: %w", err)
-			}
-		}
-
-		// Ensure queue metadata exists.
-		if err := session.Query(
-			`INSERT INTO goncordia_queues (name, paused, created_at, updated_at) VALUES (?, false, ?, ?) IF NOT EXISTS`,
-			p.Queue, now, now,
-		).WithContext(ctx).Exec(); err != nil {
-			return nil, fmt.Errorf("upsert queue: %w", err)
-		}
-
-		results[i] = driver.JobInsertResult{Job: jobToRow(j)}
+		results[a.i] = driver.JobInsertResult{Job: jobToRow(a.j)}
+	}
+	if firstErr != nil {
+		return nil, firstErr
 	}
 	return results, nil
+}
+
+// insertJobRows writes a job row and its lookup row. On failure it removes
+// what it wrote, including the job's unique key reservation.
+func insertJobRows(ctx context.Context, session *gocql.Session, j cassandraJob) error {
+	if err := session.Query(
+		`INSERT INTO goncordia_jobs
+		(id,queue,kind,args,state,priority,run_at,created_at,
+		 attempt_num,max_retry,timeout_ms,unique_key,worker_id,tags,errors_json,version,pipeline_id)
+		VALUES (?,?,?,?,?,?,?,?,0,?,?,?,?,?,?,1,?)`,
+		j.ID, j.Queue, j.Kind, j.Args, j.State, j.Priority, j.RunAt, j.CreatedAt,
+		j.MaxRetry, j.TimeoutMs, j.UniqueKey, j.WorkerID, j.Tags, j.ErrorsJSON, j.PipelineID,
+	).WithContext(ctx).Exec(); err != nil {
+		if j.UniqueKey != "" {
+			_ = session.Query(`DELETE FROM goncordia_uniq_v2 WHERE ukey=?`, j.UniqueKey).WithContext(ctx).Exec()
+		}
+		return fmt.Errorf("insert job: %w", err)
+	}
+	// The lookup contains both immediately available and scheduled jobs;
+	// run_at <= now makes scheduled rows visible without a promotion scan.
+	if err := session.Query(
+		`INSERT INTO goncordia_jobs_avail (queue, run_at, priority, id) VALUES (?, ?, ?, ?)`,
+		j.Queue, j.RunAt, j.Priority, j.ID,
+	).WithContext(ctx).Exec(); err != nil {
+		_ = session.Query(`DELETE FROM goncordia_jobs WHERE id=?`, j.ID).WithContext(ctx).Exec()
+		if j.UniqueKey != "" {
+			_ = session.Query(`DELETE FROM goncordia_uniq_v2 WHERE ukey=?`, j.UniqueKey).WithContext(ctx).Exec()
+		}
+		return fmt.Errorf("insert avail: %w", err)
+	}
+	return nil
+}
+
+// releaseUniqueKeys drops the reservations made for accepted jobs when the
+// batch fails before any job row was written.
+func releaseUniqueKeys[T any](ctx context.Context, session *gocql.Session, params []driver.JobInsertParams, accepted []T, index func(T) int) {
+	for _, a := range accepted {
+		if key := params[index(a)].UniqueKey; key != "" {
+			_ = session.Query(`DELETE FROM goncordia_uniq_v2 WHERE ukey=?`, key).WithContext(ctx).Exec()
+		}
+	}
 }
 
 // ---- JobGetByID ----
@@ -475,13 +526,17 @@ func jobGetByID(ctx context.Context, session *gocql.Session, id string) (*driver
 // It uses Cassandra lightweight transactions to ensure
 // each job is claimed by exactly one worker.
 func jobFetchBatch(ctx context.Context, session *gocql.Session, clk clock.Clock, params driver.FetchParams) ([]driver.JobRow, error) {
-	paused, err := isQueuePaused(ctx, session, params.Queue)
-	if err != nil {
-		return nil, err
-	}
-	if paused {
-		return nil, nil
-	}
+	// The pause check runs next to the candidate read (both are reads; no
+	// claim starts before both return), saving a round trip per fetch.
+	var (
+		paused    bool
+		pauseErr  error
+		pauseDone = make(chan struct{})
+	)
+	go func() {
+		defer close(pauseDone)
+		paused, pauseErr = isQueuePaused(ctx, session, params.Queue)
+	}()
 
 	now := clk.Now()
 	var leaseExpiresAt time.Time
@@ -508,8 +563,16 @@ func jobFetchBatch(ctx context.Context, session *gocql.Session, clk clock.Clock,
 	for iter.Scan(&cid, &cRunAt, &cPriority) {
 		candidates = append(candidates, candidate{id: cid, runAt: cRunAt, priority: cPriority})
 	}
-	if err := iter.Close(); err != nil {
-		return nil, fmt.Errorf("scan avail: %w", err)
+	iterErr := iter.Close()
+	<-pauseDone
+	if pauseErr != nil {
+		return nil, pauseErr
+	}
+	if paused {
+		return nil, nil
+	}
+	if iterErr != nil {
+		return nil, fmt.Errorf("scan avail: %w", iterErr)
 	}
 	sort.Slice(candidates, func(i, j int) bool {
 		if candidates[i].priority != candidates[j].priority {

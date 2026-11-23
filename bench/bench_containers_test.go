@@ -3,6 +3,7 @@ package bench_test
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"os"
 	"strings"
 	"testing"
@@ -48,6 +49,21 @@ var (
 	benchDynamoDBDriver   driver.Driver[dynamodbdriver.NoTx]
 	benchFirestoreDriver  driver.Driver[*firestore.Transaction]
 )
+
+// benchResets empties each backend so every benchmark starts from an empty
+// store: rows left by an earlier benchmark would slow scans in the next one
+// (the Firestore emulator and DynamoDB Local scan, so leftovers distort the
+// numbers by an order of magnitude).
+var benchResets = map[string]func() error{}
+
+func resetBackend(b *testing.B, name string) {
+	b.Helper()
+	if reset := benchResets[name]; reset != nil {
+		if err := reset(); err != nil {
+			b.Fatalf("reset %s: %v", name, err)
+		}
+	}
+}
 
 func TestMain(m *testing.M) {
 	ctx := context.Background()
@@ -121,6 +137,10 @@ func startPostgres(ctx context.Context) (driver.Driver[pgx.Tx], func()) {
 		ctr.Terminate(ctx) //nolint:errcheck
 		return nil, nil
 	}
+	benchResets["postgres"] = func() error {
+		_, err := pool.Exec(ctx, `TRUNCATE goncordia_jobs CASCADE`)
+		return err
+	}
 	return d, func() {
 		pool.Close()
 		ctr.Terminate(ctx) //nolint:errcheck
@@ -159,6 +179,12 @@ func startMongo(ctx context.Context) (driver.Driver[*mongo.Session], func()) {
 		ctr.Terminate(ctx)     //nolint:errcheck
 		return nil, nil
 	}
+	benchResets["mongodb"] = func() error {
+		if err := client.Database("bench").Drop(ctx); err != nil {
+			return err
+		}
+		return d.Migrate(ctx)
+	}
 	return d, func() {
 		client.Disconnect(ctx) //nolint:errcheck
 		ctr.Terminate(ctx)     //nolint:errcheck
@@ -182,6 +208,12 @@ func startRedis(ctx context.Context) (driver.Driver[redisdriver.NoTx], func()) {
 		rdb.Close()        //nolint:errcheck
 		ctr.Terminate(ctx) //nolint:errcheck
 		return nil, nil
+	}
+	benchResets["redis"] = func() error {
+		if err := rdb.FlushAll(ctx).Err(); err != nil {
+			return err
+		}
+		return d.Migrate(ctx)
 	}
 	return d, func() {
 		rdb.Close()        //nolint:errcheck
@@ -232,6 +264,23 @@ func startCassandra(ctx context.Context) (driver.Driver[cassandradriver.NoTx], f
 		ctr.Terminate(ctx) //nolint:errcheck
 		return nil, nil
 	}
+	benchResets["cassandra"] = func() error {
+		iter := session.Query(`SELECT table_name FROM system_schema.tables WHERE keyspace_name = 'goncordia_bench'`).Iter()
+		var name string
+		var tables []string
+		for iter.Scan(&name) {
+			tables = append(tables, name)
+		}
+		if err := iter.Close(); err != nil {
+			return err
+		}
+		for _, t := range tables {
+			if err := session.Query(`TRUNCATE ` + t).Exec(); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
 	return d, func() {
 		session.Close()
 		ctr.Terminate(ctx) //nolint:errcheck
@@ -264,6 +313,28 @@ func startClickHouse(ctx context.Context) (driver.Driver[clickhousedriver.NoTx],
 		conn.Close()
 		ctr.Terminate(ctx) //nolint:errcheck
 		return nil, nil
+	}
+	benchResets["clickhouse"] = func() error {
+		rows, err := conn.Query(ctx, `SELECT name FROM system.tables WHERE database = currentDatabase() AND engine NOT LIKE '%View%'`)
+		if err != nil {
+			return err
+		}
+		var tables []string
+		for rows.Next() {
+			var name string
+			if err := rows.Scan(&name); err != nil {
+				rows.Close()
+				return err
+			}
+			tables = append(tables, name)
+		}
+		rows.Close()
+		for _, t := range tables {
+			if err := conn.Exec(ctx, "TRUNCATE TABLE "+t); err != nil {
+				return err
+			}
+		}
+		return nil
 	}
 	return d, func() {
 		conn.Close()
@@ -310,6 +381,18 @@ func startDynamoDB(ctx context.Context) (driver.Driver[dynamodbdriver.NoTx], fun
 		ctr.Terminate(ctx) //nolint:errcheck
 		return nil, nil
 	}
+	benchResets["dynamodb"] = func() error {
+		tables, err := svc.ListTables(ctx, &awsdynamodb.ListTablesInput{})
+		if err != nil {
+			return err
+		}
+		for _, t := range tables.TableNames {
+			if _, err := svc.DeleteTable(ctx, &awsdynamodb.DeleteTableInput{TableName: aws.String(t)}); err != nil {
+				return err
+			}
+		}
+		return d.Migrate(ctx)
+	}
 	return d, func() { ctr.Terminate(ctx) } //nolint:errcheck
 }
 
@@ -345,6 +428,22 @@ func startFirestore(ctx context.Context) (driver.Driver[*firestore.Transaction],
 		ctr.Terminate(ctx)                     //nolint:errcheck
 		return nil, nil
 	}
+	benchResets["firestore"] = func() error {
+		req, err := http.NewRequestWithContext(ctx, http.MethodDelete,
+			"http://"+addr+"/emulator/v1/projects/bench/databases/(default)/documents", nil)
+		if err != nil {
+			return err
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			return err
+		}
+		resp.Body.Close() //nolint:errcheck
+		if resp.StatusCode != http.StatusOK {
+			return fmt.Errorf("clear firestore emulator: %s", resp.Status)
+		}
+		return nil
+	}
 	d := firestoredriver.New(client)
 	return d, func() {
 		client.Close()                         //nolint:errcheck
@@ -359,6 +458,7 @@ func BenchmarkEnqueue_Postgres(b *testing.B) {
 	if benchPgxDriver == nil {
 		b.Skip("postgres not available")
 	}
+	resetBackend(b, "postgres")
 	benchmarkEnqueue(b, benchPgxDriver)
 }
 
@@ -366,6 +466,7 @@ func BenchmarkEnqueue_MongoDB(b *testing.B) {
 	if benchMongoDriver == nil {
 		b.Skip("mongodb not available")
 	}
+	resetBackend(b, "mongodb")
 	benchmarkEnqueue(b, benchMongoDriver)
 }
 
@@ -373,6 +474,7 @@ func BenchmarkEnqueue_Redis(b *testing.B) {
 	if benchRedisDriver == nil {
 		b.Skip("redis not available")
 	}
+	resetBackend(b, "redis")
 	benchmarkEnqueue(b, benchRedisDriver)
 }
 
@@ -380,6 +482,7 @@ func BenchmarkEnqueue_Cassandra(b *testing.B) {
 	if benchCassandraDriver == nil {
 		b.Skip("cassandra not available")
 	}
+	resetBackend(b, "cassandra")
 	benchmarkEnqueue(b, benchCassandraDriver)
 }
 
@@ -387,6 +490,7 @@ func BenchmarkEnqueue_ClickHouse(b *testing.B) {
 	if benchClickHouseDriver == nil {
 		b.Skip("clickhouse not available")
 	}
+	resetBackend(b, "clickhouse")
 	benchmarkEnqueue(b, benchClickHouseDriver)
 }
 
@@ -394,6 +498,7 @@ func BenchmarkEnqueue_DynamoDB(b *testing.B) {
 	if benchDynamoDBDriver == nil {
 		b.Skip("dynamodb not available")
 	}
+	resetBackend(b, "dynamodb")
 	benchmarkEnqueue(b, benchDynamoDBDriver)
 }
 
@@ -401,6 +506,7 @@ func BenchmarkEnqueue_Firestore(b *testing.B) {
 	if benchFirestoreDriver == nil {
 		b.Skip("firestore not available")
 	}
+	resetBackend(b, "firestore")
 	benchmarkEnqueue(b, benchFirestoreDriver)
 }
 
@@ -410,6 +516,7 @@ func BenchmarkEnqueueBatch100_Postgres(b *testing.B) {
 	if benchPgxDriver == nil {
 		b.Skip("postgres not available")
 	}
+	resetBackend(b, "postgres")
 	benchmarkEnqueueBatch(b, benchPgxDriver, 100)
 }
 
@@ -417,6 +524,7 @@ func BenchmarkEnqueueBatch100_MongoDB(b *testing.B) {
 	if benchMongoDriver == nil {
 		b.Skip("mongodb not available")
 	}
+	resetBackend(b, "mongodb")
 	benchmarkEnqueueBatch(b, benchMongoDriver, 100)
 }
 
@@ -424,6 +532,7 @@ func BenchmarkEnqueueBatch100_Redis(b *testing.B) {
 	if benchRedisDriver == nil {
 		b.Skip("redis not available")
 	}
+	resetBackend(b, "redis")
 	benchmarkEnqueueBatch(b, benchRedisDriver, 100)
 }
 
@@ -431,6 +540,7 @@ func BenchmarkEnqueueBatch100_Cassandra(b *testing.B) {
 	if benchCassandraDriver == nil {
 		b.Skip("cassandra not available")
 	}
+	resetBackend(b, "cassandra")
 	benchmarkEnqueueBatch(b, benchCassandraDriver, 100)
 }
 
@@ -438,6 +548,7 @@ func BenchmarkEnqueueBatch100_ClickHouse(b *testing.B) {
 	if benchClickHouseDriver == nil {
 		b.Skip("clickhouse not available")
 	}
+	resetBackend(b, "clickhouse")
 	benchmarkEnqueueBatch(b, benchClickHouseDriver, 100)
 }
 
@@ -445,6 +556,7 @@ func BenchmarkEnqueueBatch100_DynamoDB(b *testing.B) {
 	if benchDynamoDBDriver == nil {
 		b.Skip("dynamodb not available")
 	}
+	resetBackend(b, "dynamodb")
 	benchmarkEnqueueBatch(b, benchDynamoDBDriver, 100)
 }
 
@@ -452,6 +564,7 @@ func BenchmarkEnqueueBatch100_Firestore(b *testing.B) {
 	if benchFirestoreDriver == nil {
 		b.Skip("firestore not available")
 	}
+	resetBackend(b, "firestore")
 	benchmarkEnqueueBatch(b, benchFirestoreDriver, 100)
 }
 
@@ -461,6 +574,7 @@ func BenchmarkFetchAndComplete_Postgres(b *testing.B) {
 	if benchPgxDriver == nil {
 		b.Skip("postgres not available")
 	}
+	resetBackend(b, "postgres")
 	benchmarkFetchAndComplete(b, benchPgxDriver)
 }
 
@@ -468,6 +582,7 @@ func BenchmarkFetchAndComplete_MongoDB(b *testing.B) {
 	if benchMongoDriver == nil {
 		b.Skip("mongodb not available")
 	}
+	resetBackend(b, "mongodb")
 	benchmarkFetchAndComplete(b, benchMongoDriver)
 }
 
@@ -475,6 +590,7 @@ func BenchmarkFetchAndComplete_Redis(b *testing.B) {
 	if benchRedisDriver == nil {
 		b.Skip("redis not available")
 	}
+	resetBackend(b, "redis")
 	benchmarkFetchAndComplete(b, benchRedisDriver)
 }
 
@@ -482,6 +598,7 @@ func BenchmarkFetchAndComplete_Cassandra(b *testing.B) {
 	if benchCassandraDriver == nil {
 		b.Skip("cassandra not available")
 	}
+	resetBackend(b, "cassandra")
 	benchmarkFetchAndComplete(b, benchCassandraDriver)
 }
 
@@ -489,6 +606,7 @@ func BenchmarkFetchAndComplete_ClickHouse(b *testing.B) {
 	if benchClickHouseDriver == nil {
 		b.Skip("clickhouse not available")
 	}
+	resetBackend(b, "clickhouse")
 	benchmarkFetchAndComplete(b, benchClickHouseDriver)
 }
 
@@ -496,6 +614,7 @@ func BenchmarkFetchAndComplete_DynamoDB(b *testing.B) {
 	if benchDynamoDBDriver == nil {
 		b.Skip("dynamodb not available")
 	}
+	resetBackend(b, "dynamodb")
 	benchmarkFetchAndComplete(b, benchDynamoDBDriver)
 }
 
@@ -503,6 +622,7 @@ func BenchmarkFetchAndComplete_Firestore(b *testing.B) {
 	if benchFirestoreDriver == nil {
 		b.Skip("firestore not available")
 	}
+	resetBackend(b, "firestore")
 	benchmarkFetchAndComplete(b, benchFirestoreDriver)
 }
 
@@ -512,6 +632,7 @@ func BenchmarkEndToEnd_Postgres_c4(b *testing.B) {
 	if benchPgxDriver == nil {
 		b.Skip("postgres not available")
 	}
+	resetBackend(b, "postgres")
 	benchmarkEndToEnd(b, benchPgxDriver, 4)
 }
 
@@ -519,6 +640,7 @@ func BenchmarkEndToEnd_MongoDB_c4(b *testing.B) {
 	if benchMongoDriver == nil {
 		b.Skip("mongodb not available")
 	}
+	resetBackend(b, "mongodb")
 	benchmarkEndToEnd(b, benchMongoDriver, 4)
 }
 
@@ -526,6 +648,7 @@ func BenchmarkEndToEnd_Redis_c4(b *testing.B) {
 	if benchRedisDriver == nil {
 		b.Skip("redis not available")
 	}
+	resetBackend(b, "redis")
 	benchmarkEndToEnd(b, benchRedisDriver, 4)
 }
 
@@ -533,6 +656,7 @@ func BenchmarkEndToEnd_Cassandra_c4(b *testing.B) {
 	if benchCassandraDriver == nil {
 		b.Skip("cassandra not available")
 	}
+	resetBackend(b, "cassandra")
 	benchmarkEndToEnd(b, benchCassandraDriver, 4)
 }
 
@@ -540,6 +664,7 @@ func BenchmarkEndToEnd_ClickHouse_c4(b *testing.B) {
 	if benchClickHouseDriver == nil {
 		b.Skip("clickhouse not available")
 	}
+	resetBackend(b, "clickhouse")
 	benchmarkEndToEnd(b, benchClickHouseDriver, 4)
 }
 
@@ -547,6 +672,7 @@ func BenchmarkEndToEnd_DynamoDB_c4(b *testing.B) {
 	if benchDynamoDBDriver == nil {
 		b.Skip("dynamodb not available")
 	}
+	resetBackend(b, "dynamodb")
 	benchmarkEndToEnd(b, benchDynamoDBDriver, 4)
 }
 
@@ -554,5 +680,6 @@ func BenchmarkEndToEnd_Firestore_c4(b *testing.B) {
 	if benchFirestoreDriver == nil {
 		b.Skip("firestore not available")
 	}
+	resetBackend(b, "firestore")
 	benchmarkEndToEndN(b, benchFirestoreDriver, 4, 200)
 }

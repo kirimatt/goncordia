@@ -236,6 +236,7 @@ func (t *txExecutor) ScheduleCursorAdvance(ctx context.Context, params driver.Sc
 func jobInsertMany(ctx context.Context, client *firestore.Client, clk clock.Clock, params []driver.JobInsertParams) ([]driver.JobInsertResult, error) {
 	now := clk.Now()
 	results := make([]driver.JobInsertResult, len(params))
+	var plain []plainJob
 
 	for i, p := range params {
 		runAt := p.RunAt
@@ -297,14 +298,43 @@ func jobInsertMany(ctx context.Context, client *firestore.Client, clk clock.Cloc
 				continue
 			}
 		} else {
-			if _, err := jobRef.Create(ctx, doc); err != nil {
-				return nil, fmt.Errorf("insert job %d: %w", i, err)
-			}
+			// Jobs without a unique key need no read, so they are sent
+			// together through a BulkWriter below.
+			plain = append(plain, plainJob{i: i, ref: jobRef, doc: doc})
+			continue
 		}
 
-		// Ensure queue metadata row exists (ignore if already created).
-		qRef := client.Collection(colQueues).Doc(p.Queue)
-		if _, err := qRef.Create(ctx, queueDoc{
+		results[i] = driver.JobInsertResult{Job: docToRow(doc)}
+	}
+
+	if len(plain) > 0 {
+		bw := client.BulkWriter(ctx)
+		jobs := make([]*firestore.BulkWriterJob, len(plain))
+		for k, pj := range plain {
+			job, err := bw.Create(pj.ref, pj.doc)
+			if err != nil {
+				bw.End()
+				return nil, fmt.Errorf("insert job %d: %w", pj.i, err)
+			}
+			jobs[k] = job
+		}
+		bw.End()
+		for k, pj := range plain {
+			if _, err := jobs[k].Results(); err != nil {
+				return nil, fmt.Errorf("insert job %d: %w", pj.i, err)
+			}
+			results[pj.i] = driver.JobInsertResult{Job: docToRow(pj.doc)}
+		}
+	}
+
+	// Queue metadata rows: one create per queue (an existing row is fine).
+	seen := map[string]bool{}
+	for _, p := range params {
+		if seen[p.Queue] {
+			continue
+		}
+		seen[p.Queue] = true
+		if _, err := client.Collection(colQueues).Doc(p.Queue).Create(ctx, queueDoc{
 			Name:      p.Queue,
 			Paused:    false,
 			CreatedAt: now.UTC(),
@@ -312,10 +342,15 @@ func jobInsertMany(ctx context.Context, client *firestore.Client, clk clock.Cloc
 		}); err != nil && status.Code(err) != codes.AlreadyExists {
 			return nil, fmt.Errorf("upsert queue: %w", err)
 		}
-
-		results[i] = driver.JobInsertResult{Job: docToRow(doc)}
 	}
 	return results, nil
+}
+
+// plainJob is a job without a unique key waiting for the bulk write.
+type plainJob struct {
+	i   int
+	ref *firestore.DocumentRef
+	doc jobDoc
 }
 
 // ---- JobInsertMany (transactional — all reads before all writes) ----
@@ -502,15 +537,19 @@ func queueStats(ctx context.Context, client *firestore.Client, queue string) (dr
 // via a per-job transaction. Firestore's optimistic concurrency ensures only
 // one worker wins per job.
 func jobFetchBatch(ctx context.Context, client *firestore.Client, clk clock.Clock, params driver.FetchParams) ([]driver.JobRow, error) {
-	// Check if queue is paused.
-	qSnap, err := client.Collection(colQueues).Doc(params.Queue).Get(ctx)
-	if err == nil && qSnap.Exists() {
-		var q queueDoc
-		qSnap.DataTo(&q) //nolint:errcheck
-		if q.Paused {
-			return nil, nil
+	// The pause check runs next to the candidate query (both are reads; no
+	// claim starts before both return), saving a round trip per fetch.
+	paused := make(chan bool, 1)
+	go func() {
+		qSnap, err := client.Collection(colQueues).Doc(params.Queue).Get(ctx)
+		if err == nil && qSnap.Exists() {
+			var q queueDoc
+			qSnap.DataTo(&q) //nolint:errcheck
+			paused <- q.Paused
+			return
 		}
-	}
+		paused <- false
+	}()
 
 	now := clk.Now()
 	candidateLimit := params.Limit * 16
@@ -528,6 +567,9 @@ func jobFetchBatch(ctx context.Context, client *firestore.Client, clk clock.Cloc
 		OrderBy("run_at", firestore.Asc).
 		Limit(candidateLimit).
 		Documents(ctx).GetAll()
+	if <-paused {
+		return nil, nil
+	}
 	if err != nil {
 		return nil, fmt.Errorf("query available jobs: %w", err)
 	}
