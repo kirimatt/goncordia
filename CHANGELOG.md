@@ -11,6 +11,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [otel v2.7.0] — 2026-11-23
+
+Requires root v2.11.0.
+
+### Added
+- `TraceContextTags` (set as `ClientConfig.ContextTags`) stores the W3C trace
+  context of the enqueue span on the job, and `NewMiddleware` continues it, so
+  the request that enqueued a job, the enqueue and every attempt share one
+  trace. `ExtractTraceContext` reads it back from a job's tags.
+
 ## [v2.11.0] — 2026-11-23
 
 ### Added
