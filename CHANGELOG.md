@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `mcpserver` module (`github.com/kirimatt/goncordia/mcpserver/v2`): an MCP
+  server so AI agents (Claude Code, Cursor, others) can inspect and operate
+  the queue. Read-only tools `list_queues`, `list_jobs`, `get_job`,
+  `get_metrics`; `WithWriteTools()` adds `retry_job`, `reschedule_job`,
+  `cancel_job`, `delete_job`, `pause_queue`, `resume_queue`. Served over
+  Streamable HTTP (`Handler`) or stdio. Payloads, unique keys and panic traces
+  are hidden by default, as in `admin`.
+
 ---
 
 ## [v2.10.1] — 2026-11-23

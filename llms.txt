@@ -30,6 +30,10 @@ total, err := sum.Call(ctx, SumArgs{A: 2, B: 3}) // deletes its job after return
 
 Worker pools prune by default on every driver, under a shared leader lease: completed and cancelled jobs after 24h, discarded after 7 days, future results after 1h. Tune with `WorkerConfig.Retention` (`goncordia.KeepForever` keeps a state) or disable with a negative `RetentionInterval`.
 
+## MCP server
+
+`github.com/kirimatt/goncordia/mcpserver/v2` lets AI agents inspect and operate the queue over MCP: `mcpserver.New(d)` serves read-only `list_queues`, `list_jobs`, `get_job`, `get_metrics`; `mcpserver.WithWriteTools()` adds `retry_job`, `reschedule_job`, `cancel_job`, `delete_job`, `pause_queue`, `resume_queue`. Serve with `mcpserver.Handler(srv)` (Streamable HTTP, behind your auth) or `srv.Run(ctx, &mcp.StdioTransport{})`. Docs: https://goncordia.docs7.io/mcp
+
 ## Supported backends
 
 Postgres (pgx v5, database/sql, gorm, bun), MySQL, SQLite, MongoDB, Redis, Cassandra, ClickHouse, Amazon DynamoDB, Cloud Firestore, in-memory.

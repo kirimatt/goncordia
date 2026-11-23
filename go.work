@@ -15,5 +15,6 @@ use (
 	./driver/redis
 	./driver/stdlib
 	./gontest
+	./mcpserver
 	./otel
 )

@@ -157,6 +157,24 @@ and other agents:
   your own `AGENTS.md` / `CLAUDE.md` / `.cursor/rules`, so the agent uses
   `EnqueueTx`, the `/v2` import paths and the in-memory test driver.
 
+### Let the agent operate your queue (MCP server)
+
+The [`mcpserver`](mcpserver) module serves your queues and jobs over MCP, so an
+agent can find failed jobs, read their errors and retry them, without you
+opening the dashboard:
+
+```go
+import "github.com/kirimatt/goncordia/mcpserver/v2"
+
+srv := mcpserver.New(d)                                  // read-only tools
+mux.Handle("/mcp", requireAdmin(mcpserver.Handler(srv))) // or srv.Run(ctx, &mcp.StdioTransport{})
+```
+
+Tools: `list_queues`, `list_jobs`, `get_job`, `get_metrics`, and with
+`mcpserver.WithWriteTools()` also `retry_job`, `reschedule_job`, `cancel_job`,
+`delete_job`, `pause_queue`, `resume_queue`. Payloads are hidden by default.
+See [the MCP guide](https://goncordia.docs7.io/mcp).
+
 ## Installation
 
 Requires Go 1.26 or newer.
