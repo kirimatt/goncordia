@@ -29,6 +29,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"reflect"
+	"slices"
 	"time"
 
 	"github.com/kirimatt/goncordia/v2/clock"
@@ -56,6 +57,12 @@ type ClientConfig struct {
 	// queue-depth admission is advisory because the check and insert are not one
 	// atomic backend operation.
 	Admission AdmissionController
+	// ContextTags, when set, returns tags to attach to every job enqueued with
+	// ctx. It runs after Observer.StartEnqueue, so it sees the enqueue span.
+	// otelgoncordia.TraceContextTags uses it to carry the W3C trace context
+	// to the worker; any function of the context works, for example a
+	// request or tenant ID.
+	ContextTags func(ctx context.Context) []string
 }
 
 // InsertRequest allows each item in a batch to have independent options.
@@ -78,15 +85,17 @@ func NewClient[TTx any](d driver.Driver[TTx], cfg ClientConfig) *Client[TTx] {
 // Enqueue inserts a single job without a transaction (at-least-once semantics).
 // Safe to call for all backends; for SQL/MongoDB backends prefer EnqueueTx for atomicity.
 func (c *Client[TTx]) Enqueue(ctx context.Context, args core.JobArgs, opts *core.InsertOpts) (*driver.JobInsertResult, error) {
-	params, err := c.buildInsertParams(args, opts)
+	param, err := c.buildInsertParams(args, opts)
 	if err != nil {
 		return nil, err
 	}
-	if err := c.admit(ctx, []driver.JobInsertParams{params}, false); err != nil {
+	params := []driver.JobInsertParams{param}
+	if err := c.admit(ctx, params, false); err != nil {
 		return nil, err
 	}
-	ctx, finish := c.startEnqueue(ctx, []driver.JobInsertParams{params}, false)
-	results, err := c.driver.Executor().JobInsertMany(ctx, []driver.JobInsertParams{params})
+	ctx, finish := c.startEnqueue(ctx, params, false)
+	c.addContextTags(ctx, params)
+	results, err := c.driver.Executor().JobInsertMany(ctx, params)
 	if err != nil {
 		finish(results, err)
 		return nil, err
@@ -107,16 +116,18 @@ func (c *Client[TTx]) EnqueueTx(ctx context.Context, tx TTx, args core.JobArgs, 
 	if !c.driver.Capabilities().NativeTx {
 		return nil, fmt.Errorf("%w: driver %q does not support transactional inserts", driver.ErrUnsupported, c.driver.Name())
 	}
-	params, err := c.buildInsertParams(args, opts)
+	param, err := c.buildInsertParams(args, opts)
 	if err != nil {
 		return nil, err
 	}
-	if err := c.admit(ctx, []driver.JobInsertParams{params}, true); err != nil {
+	params := []driver.JobInsertParams{param}
+	if err := c.admit(ctx, params, true); err != nil {
 		return nil, err
 	}
 	etx := c.driver.UnwrapTx(tx)
-	ctx, finish := c.startEnqueue(ctx, []driver.JobInsertParams{params}, true)
-	results, err := etx.JobInsertMany(ctx, []driver.JobInsertParams{params})
+	ctx, finish := c.startEnqueue(ctx, params, true)
+	c.addContextTags(ctx, params)
+	results, err := etx.JobInsertMany(ctx, params)
 	if err != nil {
 		finish(results, err)
 		return nil, err
@@ -144,6 +155,7 @@ func (c *Client[TTx]) EnqueueBatch(ctx context.Context, requests []InsertRequest
 		return nil, err
 	}
 	ctx, finish := c.startEnqueue(ctx, params, false)
+	c.addContextTags(ctx, params)
 	results, err := c.driver.Executor().JobInsertMany(ctx, params)
 	finish(results, err)
 	return results, err
@@ -166,6 +178,7 @@ func (c *Client[TTx]) EnqueueBatchTx(ctx context.Context, tx TTx, requests []Ins
 		return nil, err
 	}
 	ctx, finish := c.startEnqueue(ctx, params, true)
+	c.addContextTags(ctx, params)
 	results, err := c.driver.UnwrapTx(tx).JobInsertMany(ctx, params)
 	finish(results, err)
 	return results, err
@@ -185,6 +198,7 @@ func (c *Client[TTx]) EnqueueMany(ctx context.Context, args []core.JobArgs, opts
 		return nil, err
 	}
 	ctx, finish := c.startEnqueue(ctx, params, false)
+	c.addContextTags(ctx, params)
 	results, err := c.driver.Executor().JobInsertMany(ctx, params)
 	finish(results, err)
 	return results, err
@@ -208,9 +222,26 @@ func (c *Client[TTx]) EnqueueManyTx(ctx context.Context, tx TTx, args []core.Job
 	}
 	etx := c.driver.UnwrapTx(tx)
 	ctx, finish := c.startEnqueue(ctx, params, true)
+	c.addContextTags(ctx, params)
 	results, err := etx.JobInsertMany(ctx, params)
 	finish(results, err)
 	return results, err
+}
+
+// addContextTags appends ClientConfig.ContextTags to each job. Tags may be
+// shared between jobs (EnqueueMany) and with the caller's InsertOpts, so the
+// slice is copied before appending.
+func (c *Client[TTx]) addContextTags(ctx context.Context, params []driver.JobInsertParams) {
+	if c.config.ContextTags == nil || len(params) == 0 {
+		return
+	}
+	extra := c.config.ContextTags(ctx)
+	if len(extra) == 0 {
+		return
+	}
+	for i := range params {
+		params[i].Tags = append(slices.Clip(params[i].Tags), extra...)
+	}
 }
 
 func (c *Client[TTx]) admit(ctx context.Context, params []driver.JobInsertParams, transactional bool) error {
