@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+---
+
+## [v2.10.0, driver pgxv5 v2.10.0] — 2026-11-23
+
 ### Changed
 - Worker pool: the handler no longer waits for the `started_at` write. It
   runs in the background and the job's state write waits for it, so

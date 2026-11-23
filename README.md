@@ -112,14 +112,14 @@ Moving over from one of them? Migration guides: [Asynq](https://goncordia.docs7.
 Requires Go 1.26 or newer.
 
 ```bash
-go get github.com/kirimatt/goncordia/v2@v2.9.1
+go get github.com/kirimatt/goncordia/v2@v2.10.0
 ```
 
 Pick a driver:
 
 ```bash
 # PostgreSQL via pgx v5
-go get github.com/kirimatt/goncordia/driver/pgxv5/v2@v2.9.0
+go get github.com/kirimatt/goncordia/driver/pgxv5/v2@v2.10.0
 
 # PostgreSQL / MySQL / MariaDB / SQLite via database/sql
 go get github.com/kirimatt/goncordia/driver/stdlib/v2@v2.9.0
