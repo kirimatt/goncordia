@@ -6,9 +6,9 @@ require (
 	github.com/RichardKnop/machinery/v2 v2.0.16
 	github.com/hibiken/asynq v0.26.0
 	github.com/jackc/pgx/v5 v5.13.0
-	github.com/kirimatt/goncordia/driver/pgxv5/v2 v2.9.0
+	github.com/kirimatt/goncordia/driver/pgxv5/v2 v2.10.0
 	github.com/kirimatt/goncordia/driver/redis/v2 v2.9.0
-	github.com/kirimatt/goncordia/v2 v2.9.1
+	github.com/kirimatt/goncordia/v2 v2.10.0
 	github.com/redis/go-redis/v9 v9.23.0
 	github.com/riverqueue/river v0.51.2
 	github.com/riverqueue/river/riverdriver/riverpgxv5 v0.51.2
