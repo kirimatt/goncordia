@@ -70,3 +70,43 @@ End-to-end throughput is bounded by the 5 ms poll interval used in the benchmark
 > **v2.8.0 and v2.9.0 changed the hot path; the tables above predate them.** v2.8.0: on Postgres the fetch query reads a partial index in fetch order instead of sorting the backlog, `EnqueueMany` sends one pgx batch, the pool claims several jobs per query, and completions are written in batches. v2.9.0: a pool with a backlog keeps fetching instead of waiting for the next poll (with the default 1 s poll a backlog used to drain at ~40 jobs/s per process), the handler slot is freed before the state write, `started_at` writes are batched, Redis fetches and completes with one script call, and MongoDB, Cassandra, DynamoDB and Firestore claim a batch in a few round trips instead of one chain per job. Measured on another machine (pgxv5, embedded Postgres 18, Windows, localhost; v2.8.0 and v2.9.0 in the same run, so compare ratios only), 5 000 jobs: 32 workers with a 5 ms poll ~9 300 → ~15 500 jobs/s; 4 workers ~2 600 → ~4 200 jobs/s; 10 workers with the default 1 s poll 42 → ~8 700 jobs/s. Before v2.8.0 the 32-worker run did ~880 jobs/s.
 
 Cassandra's high per-operation latency comes from Lightweight Transaction consensus (Paxos, ~3 network round trips per claim). ClickHouse's overhead comes from `SELECT … FINAL` deduplication at query time. DynamoDB's per-operation cost is dominated by HTTP/JSON round trips to the service — measured against DynamoDB Local on localhost, so real AWS numbers include additional network latency. Firestore's per-job `RunTransaction` for claiming is the primary bottleneck on the emulator; production GCP Firestore will be faster due to lower round-trip latency, but the sequential-per-job claiming model inherently limits throughput. All four backends are best suited for workloads where horizontal scale matters more than raw per-job latency.
+
+### Against river, asynq and machinery
+
+`bench/compare` runs the same workloads against each library on the same
+servers (Postgres 17 and Redis 7 in Docker, WSL2, Ryzen 5 5600X, all in one
+run). Every library keeps its default settings; only the worker concurrency
+is set. `-tuned` rows lower the fetch interval (river: `FetchCooldown` 1 ms,
+`FetchPollInterval` 10 ms; asynq: `TaskCheckInterval` 10 ms). Drain runs
+check that every job ran exactly once; none ran twice.
+
+```
+cd bench/compare
+go run . -pg postgres://... -redis localhost:6379 -systems all
+```
+
+Postgres, jobs/s:
+
+| | goncordia (pgxv5) | river | river-tuned |
+|---|---|---|---|
+| enqueue, one per call | 1,044 | 671 | 670 |
+| enqueue, batches of 100 | 31,237 | 34,427 | 34,827 |
+| drain 20,000 jobs, 10 workers | 5,801 | 99 | 4,726 |
+| drain 20,000 jobs, 100 workers | 20,610 | 999 | 22,588 |
+| idle pickup latency p50 / p99 | 2.8 / 6.0 ms | 100 / 991 ms | 15 / 20.5 ms |
+
+Redis, jobs/s:
+
+| | goncordia (redis) | asynq | asynq-tuned | machinery |
+|---|---|---|---|---|
+| enqueue, one per call | 3,232 | 3,669 | 3,548 | 1,910 |
+| enqueue, batches of 100 | 61,826 | no batch API | no batch API | no batch API |
+| drain 20,000 jobs, 10 workers | 11,450 | 3,040 | 3,050 | 2,263 |
+| drain 20,000 jobs, 100 workers | 21,205 | 3,021 | 3,044 | 2,243 |
+| idle pickup latency p50 / p99 | 0.7 / 1.1 ms | 1,036 / 1,495 ms | 11.1 / 16.4 ms | 1.6 / 2.4 ms |
+
+With defaults, river's drain is bounded by `FetchCooldown` (100 ms between
+fetches, at most one fetch's worth of free slots each time) and asynq's idle
+latency by `TaskCheckInterval` (1 s). goncordia wakes on LISTEN/NOTIFY
+(pgxv5) or Pub/Sub (Redis) and keeps fetching while a backlog lasts.
+

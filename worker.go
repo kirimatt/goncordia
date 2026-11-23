@@ -973,23 +973,13 @@ func (p *WorkerPool[TTx]) fetchAndDispatch(ctx context.Context) {
 				// reserved every configured rate permit.
 				releaseRateGate()
 				startedAt := p.config.Clock.Now()
-				markParams := driver.JobMarkStartedParams{
-					ID: row.ID, WorkerID: row.WorkerID, Attempt: row.AttemptNum, At: startedAt,
-				}
-				if p.starter != nil {
-					marked, err := p.starter.mark(markParams)
-					if err != nil {
-						p.reportError(fmt.Errorf("persist handler start for job %s: %w", row.ID, err))
-					} else if marked {
-						row.StartedAt = &startedAt
-					}
-				} else if marker, ok := exec.(driver.JobStartMarker); ok {
-					marked, err := marker.JobMarkStarted(claimCtx, markParams)
-					if err != nil {
-						p.reportError(fmt.Errorf("persist handler start for job %s: %w", row.ID, err))
-					} else if marked {
-						row.StartedAt = &startedAt
-					}
+				// started_at is written in the background so the handler does not
+				// wait for it; the job's state write waits for it instead (see
+				// handlerDone), so started_at still lands before the outcome.
+				markDone := p.markStarted(claimCtx, exec, &row, startedAt)
+				handlerDone := func() {
+					releaseSlot()
+					<-markDone
 				}
 				if observer := p.config.Observer; observer != nil {
 					claimWait := time.Duration(0)
@@ -998,7 +988,7 @@ func (p *WorkerPool[TTx]) fetchAndDispatch(ctx context.Context) {
 					}
 					observer.JobStarted(claimCtx, JobStartedEvent{Job: row, StartedAt: startedAt, ClaimWait: claimWait})
 				}
-				state, jobErr := p.processRow(claimCtx, exec, row, releaseSlot)
+				state, jobErr := p.processRow(claimCtx, exec, row, handlerDone)
 				if observer := p.config.Observer; observer != nil {
 					observer.JobFinished(claimCtx, JobFinishedEvent{
 						Job: row, State: state, Err: jobErr, StartedAt: startedAt, FinishedAt: p.config.Clock.Now(),
@@ -1007,6 +997,33 @@ func (p *WorkerPool[TTx]) fetchAndDispatch(ctx context.Context) {
 			}()
 		}
 	}
+}
+
+// markStarted persists the handler start instant without blocking the
+// caller. The returned channel closes once the write finished (or at once
+// when the driver does not record start instants). row.StartedAt is set
+// here, before the handler runs, when the driver records it.
+func (p *WorkerPool[TTx]) markStarted(ctx context.Context, exec driver.Executor, row *driver.JobRow, startedAt time.Time) <-chan struct{} {
+	done := make(chan struct{})
+	params := driver.JobMarkStartedParams{ID: row.ID, WorkerID: row.WorkerID, Attempt: row.AttemptNum, At: startedAt}
+	var mark func() (bool, error)
+	switch marker, ok := exec.(driver.JobStartMarker); {
+	case p.starter != nil:
+		mark = func() (bool, error) { return p.starter.mark(params) }
+	case ok:
+		mark = func() (bool, error) { return marker.JobMarkStarted(ctx, params) }
+	default:
+		close(done)
+		return done
+	}
+	row.StartedAt = &startedAt
+	go func() {
+		defer close(done)
+		if _, err := mark(); err != nil {
+			p.reportError(fmt.Errorf("persist handler start for job %s: %w", params.ID, err))
+		}
+	}()
+	return done
 }
 
 // queueClaimLimit returns how many more jobs the queue may claim under its
