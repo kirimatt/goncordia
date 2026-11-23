@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `ClientConfig.ContextTags`: a function of the enqueue context whose tags are
+  attached to every job the client enqueues. It runs after
+  `Observer.StartEnqueue`, so it sees the enqueue span; the `otel` module uses
+  it to carry the W3C trace context from the producer to the worker. The
+  caller's `InsertOpts.Tags` are copied, never modified.
+
 ---
 
 ## [v2.10.1] — 2026-11-23
