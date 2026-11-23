@@ -1,0 +1,110 @@
+---
+title: "MCP server for AI agents"
+description: "Let Claude Code, Cursor and other agents inspect and operate your job queue"
+---
+
+The `mcpserver` module exposes your queues and jobs over the
+[Model Context Protocol](https://modelcontextprotocol.io). An AI agent connected
+to it can answer "why did the email jobs fail last night?" by itself: it lists
+queues with their counts, finds discarded jobs, reads their errors and, if you
+allow it, retries them.
+
+```sh
+go get github.com/kirimatt/goncordia/mcpserver/v2@v2.11.0
+```
+
+It is a separate module, so the MCP SDK is not a dependency of the core library.
+
+## Tools
+
+Read-only, always registered:
+
+| Tool | What it does |
+|---|---|
+| `list_queues` | Queues with their paused flag and job counts by state |
+| `list_jobs` | Jobs newest first, filtered by `queue`, `state`, `kind`; paged with `next_cursor` |
+| `get_job` | One job: state, attempts, schedule, the error of every failed attempt |
+| `get_metrics` | Job counts by queue and state, plus metrics from `WithMetrics` |
+
+Registered only with `mcpserver.WithWriteTools()`:
+
+| Tool | What it does |
+|---|---|
+| `retry_job` | Make a job due now |
+| `reschedule_job` | Move a job to `run_at` |
+| `cancel_job` | Cancel a job that is waiting to run |
+| `delete_job` | Delete a job permanently |
+| `pause_queue` / `resume_queue` | Stop and restart fetching from a queue |
+
+Every tool declares MCP annotations (`readOnlyHint`, `destructiveHint`), so
+clients can ask for confirmation before `cancel_job` and `delete_job`.
+
+## Serve over HTTP
+
+Mount it next to the [admin dashboard](/admin), behind the same authentication:
+
+```go
+import "github.com/kirimatt/goncordia/mcpserver/v2"
+
+srv := mcpserver.New(d, mcpserver.WithName("goncordia-staging"))
+mux.Handle("/mcp", requireAdmin(mcpserver.Handler(srv)))
+```
+
+Then add it to the agent, for example in Claude Code:
+
+```sh
+claude mcp add --transport http goncordia https://staging.example.com/mcp \
+  --header "Authorization: Bearer $TOKEN"
+```
+
+## Serve over stdio
+
+For a local database, build a small command and let the agent start it:
+
+```go
+func main() {
+    pool, _ := pgxpool.New(ctx, os.Getenv("DATABASE_URL"))
+    d := pgxdriver.New(pool)
+    srv := mcpserver.New(d, mcpserver.WithWriteTools())
+    if err := srv.Run(ctx, &mcp.StdioTransport{}); err != nil {
+        log.Fatal(err)
+    }
+}
+```
+
+```sh
+claude mcp add goncordia -- go run ./cmd/goncordia-mcp
+```
+
+## Safety
+
+- **Read-only by default.** Nothing changes jobs or queues unless you pass
+  `WithWriteTools()`. Give production agents the read-only server.
+- **Payloads stay hidden.** As in the admin API, job arguments, unique keys and
+  panic stack traces are removed. Pass
+  `WithJobRedactor(func(r driver.JobRow) driver.JobRow { return r })` to show
+  them, or a function that masks only sensitive fields.
+- **Authentication is yours.** `Handler` does no auth itself; wrap it the way
+  you wrap the admin handler.
+
+## Traces
+
+When the client carries the trace context into jobs
+(`ClientConfig.ContextTags: otelgoncordia.TraceContextTags`, see
+[Observability](/observability)), `get_job` returns the job's `trace_id`. The
+agent can then look up the whole trace (request, enqueue, every attempt) in
+Jaeger, Tempo or Honeycomb, or through their own MCP servers. goncordia does
+not store spans itself.
+
+## Metrics
+
+`get_metrics` returns per-queue counts. Add the futures and retention
+metrics the same way as for the admin `/metrics` endpoint:
+
+```go
+srv := mcpserver.New(d, mcpserver.WithMetrics(futureMetrics, retentionMetrics))
+```
+
+Listing jobs uses the driver's admin queries, so the same notes apply as for
+the admin dashboard: Cassandra and Firestore scan records and suit occasional
+use, not tight polling loops.

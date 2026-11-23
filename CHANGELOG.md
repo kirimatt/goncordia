@@ -11,6 +11,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [mcpserver v2.11.0] — 2026-11-23
+
+First release. Requires root v2.10.1 or newer.
+
+### Added
+- New module `github.com/kirimatt/goncordia/mcpserver/v2`: an MCP server so
+  AI agents (Claude Code, Cursor, others) can inspect and operate the queue. Read-only tools `list_queues`, `list_jobs`, `get_job`,
+  `get_metrics`; `WithWriteTools()` adds `retry_job`, `reschedule_job`,
+  `cancel_job`, `delete_job`, `pause_queue`, `resume_queue`. Served over
+  Streamable HTTP (`Handler`) or stdio. Payloads, unique keys and panic traces
+  are hidden by default, as in `admin`. `get_job` returns the job's
+  `trace_id` when it carries a `traceparent` tag.
+
+---
+
 ## [otel v2.7.0] — 2026-11-23
 
 Requires root v2.11.0.
@@ -20,6 +35,8 @@ Requires root v2.11.0.
   context of the enqueue span on the job, and `NewMiddleware` continues it, so
   the request that enqueued a job, the enqueue and every attempt share one
   trace. `ExtractTraceContext` reads it back from a job's tags.
+
+---
 
 ## [v2.11.0] — 2026-11-23
 

@@ -13,7 +13,7 @@ case "$group" in
     module_dirs=(
       driver/stdlib driver/pgxv5 driver/mongodb driver/mongodbv2 driver/redis
       driver/cassandra driver/clickhouse driver/dynamodb driver/firestore
-      otel gontest
+      otel gontest mcpserver
     )
     ;;
   integrations)

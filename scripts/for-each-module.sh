@@ -21,6 +21,7 @@ module_dirs=(
   driver/bun
   otel
   gontest
+  mcpserver
   bench
 )
 

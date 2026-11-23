@@ -211,6 +211,16 @@ Workers on these backends must be **idempotent** — a job may be executed more 
 - **SQLite**: set `db.SetMaxOpenConns(1)` — SQLite allows only one writer.
 - **Firestore**: `Migrate` is a no-op; create the composite indexes manually in Firebase console: collection `goncordia_jobs`, fields `queue ASC, state ASC, run_at ASC` (fetching) and `state ASC, finalized_at ASC` (retention).
 
+## MCP server for the agent itself
+
+`github.com/kirimatt/goncordia/mcpserver/v2` exposes the queue to MCP clients:
+`mcpserver.New(d)` (read-only: `list_queues`, `list_jobs`, `get_job`,
+`get_metrics`), `mcpserver.WithWriteTools()` adds `retry_job`,
+`reschedule_job`, `cancel_job`, `delete_job`, `pause_queue`, `resume_queue`.
+Serve with `mcpserver.Handler(srv)` behind auth, or
+`srv.Run(ctx, &mcp.StdioTransport{})`. Job args, unique keys and panic traces
+are hidden unless `mcpserver.WithJobRedactor` exposes them.
+
 ## Injected time
 
 Use `github.com/kirimatt/goncordia/v2/clock`. Pass the same `clock.Manual` to the

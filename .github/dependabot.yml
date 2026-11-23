@@ -19,6 +19,7 @@ updates:
       - /driver/redis
       - /driver/stdlib
       - /gontest
+      - /mcpserver
       - /otel
     schedule:
       interval: weekly
