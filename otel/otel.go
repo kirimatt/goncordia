@@ -286,7 +286,9 @@ var _ goncordia.WorkerObserver = (*Instrumentation)(nil)
 var _ goncordia.RetentionObserver = (*Instrumentation)(nil)
 
 // NewMiddleware returns a JobMiddleware that:
-//   - creates a span for each job execution named "goncordia.process"
+//   - creates a span for each job execution named "goncordia.process",
+//     a child of the enqueuing span when the job carries a trace context
+//     (see TraceContextTags)
 //   - records goncordia.job.duration (histogram, seconds) and
 //     goncordia.job.count (counter) with attributes kind, queue, status
 func NewMiddleware(opts ...Option) goncordia.JobMiddleware {
@@ -340,6 +342,12 @@ func NewMiddleware(opts ...Option) goncordia.JobMiddleware {
 			attrs = append(attrs, attribute.String(attrWorker, job.WorkerID))
 		}
 
+		// Continue the producer's trace when the job carries one
+		// (ClientConfig.ContextTags = TraceContextTags) and the worker
+		// context has no span of its own.
+		if !trace.SpanContextFromContext(ctx).IsValid() {
+			ctx = ExtractTraceContext(ctx, job.Tags)
+		}
 		ctx, span := tracer.Start(ctx, spanName,
 			trace.WithAttributes(attrs...),
 			trace.WithSpanKind(trace.SpanKindConsumer),
