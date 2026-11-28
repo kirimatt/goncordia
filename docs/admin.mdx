@@ -4,7 +4,12 @@ description: "Dashboard, JSON API, health probes, and Prometheus metrics"
 ---
 
 ```go
-import "github.com/kirimatt/goncordia/v2/admin"
+import (
+    "errors"
+    "net/http"
+
+    "github.com/kirimatt/goncordia/v2/admin"
+)
 
 handler := admin.New(d,
     admin.WithReadOnly(false),
@@ -18,6 +23,11 @@ handler := admin.New(d,
         return nil
     }),
 )
+```
+
+For the standard library's default mux, register the handler under `/jobs/`.
+
+```go
 http.Handle("/jobs/", http.StripPrefix("/jobs", handler))
 ```
 
@@ -27,6 +37,8 @@ reschedule, queue pause/resume, and per-state queue counts. Redis uses a migrate
 created-at index and DynamoDB uses its queue/state GSI for scoped reads. Unscoped
 DynamoDB reads and Cassandra/Firestore administrative paths still scan records
 and are intended for moderate operational use rather than high-frequency scraping.
+The embedded dashboard serves script and style assets separately under a strict
+Content Security Policy.
 
 The default JSON representation removes job arguments, unique keys, and panic
 stack traces. Use `admin.WithJobRedactor` only when an application has a safe,
@@ -34,6 +46,59 @@ explicit policy for exposing or replacing those fields. `admin.WithReadOnly(true
 disables every mutation while retaining inspection and metrics. The authorization
 hook receives separate dashboard, read, mutate, metrics, and health operations;
 return `admin.ErrUnauthenticated` for HTTP 401 and any other error for HTTP 403.
+
+## Mounting on a router
+
+Use the same `handler` configured with `admin.WithAuthorizer` above. Wrap it in a
+small mux that redirects `/jobs` to `/jobs/` and strips the `/jobs` prefix when
+forwarding requests to the admin handler. The trailing slash keeps the dashboard's
+relative asset and API URLs under `/jobs/`.
+
+```go
+mount := http.NewServeMux()
+mount.Handle("/jobs/", http.StripPrefix("/jobs", handler))
+```
+
+In each snippet, `requireSession` is your application's authentication middleware
+for that router. It rejects requests without a valid session before they reach the
+mux. Keep checks for individual operations, such as permission to mutate jobs, in
+`admin.WithAuthorizer`. The routes forward both dashboard and API reads (GET) and
+API mutations (POST).
+
+### chi
+
+```go
+import "github.com/go-chi/chi/v5"
+
+r := chi.NewRouter()
+r.With(requireSession).Mount("/jobs", mount)
+```
+
+### Echo
+
+```go
+import "github.com/labstack/echo/v5"
+
+e := echo.New()
+jobs := echo.WrapHandler(mount)
+e.Any("/jobs", jobs, requireSession)
+e.Any("/jobs/*", jobs, requireSession)
+```
+
+For Echo v4, use the `github.com/labstack/echo/v4` import and your v4 middleware.
+
+### Gin
+
+```go
+import "github.com/gin-gonic/gin"
+
+r := gin.New()
+jobs := gin.WrapH(mount)
+r.Any("/jobs", requireSession, jobs)
+r.Any("/jobs/*path", requireSession, jobs)
+```
+
+## Health and metrics
 
 `/healthz` is a process liveness probe and does not touch storage. `/readyz`
 checks that the backing driver can answer a query and returns HTTP 503 when it
@@ -65,8 +130,8 @@ These values describe the process that runs the `Manager`: awaits are counted
 where producers wait, stores where workers run. Expose the admin handler in
 each instance and let Prometheus aggregate. Queue gauges, by contrast, come
 from storage and are the same in every instance.
-The embedded dashboard serves script and style assets separately under a strict
-Content Security Policy.
+
+## JSON API
 
 Every mutation requires `X-Goncordia-Confirm` to exactly match the action name
 (`pause`, `resume`, `cancel`, `delete`, `retry`, or `reschedule`). This is an
